@@ -1,0 +1,316 @@
+import SwiftUI
+
+/// A single channel row inside the `AddToMultiviewSheet` picker.
+///
+/// Visual (post-v1.6.12, info parity with Live TV List rows):
+/// ```
+/// 101  [logo]  CHANNEL NAME              [✓ / +]
+///              Currently airing program · 18 min left
+///              ▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░
+/// ```
+///
+/// Tapping fires `onTap`. When `isAlreadyAdded == true` the row
+/// shows a green check (still tappable, the parent dispatches
+/// tap-while-added as a removal). `isDisabled == true` (hard cap
+/// reached AND not already added) grays the row and blocks tap;
+/// rows that are already added remain tappable even at the cap so
+/// the user can deselect to make room.
+///
+/// **Current-program source** (matches `ChannelRow` in
+/// `ChannelListView` post-v1.6.10): prefers the lightweight per-item
+/// `currentProgram*` fields when populated (Xtream short-EPG,
+/// Dispatcharr current-programs cache when fresh) and falls back to
+/// `GuideStore.programs[item.id].first(where: \.isLive)` when
+/// they're not. Without the fallback, Dispatcharr users would see
+/// the picker rows showing only the channel name with no program
+/// info, exactly the same bug the Live TV List had before
+/// v1.6.10.
+///
+/// Platform-agnostic, same layout on iPadOS and tvOS, with
+/// platform-specific size constants. On tvOS the outer Button
+/// becomes focusable via `TVNoHighlightButtonStyle`; no custom
+/// focus ring needed.
+struct CompactChannelRow: View {
+    @Environment(\.astralTextScale) private var textScale
+    let item: ChannelDisplayItem
+    let isAlreadyAdded: Bool
+    let isDisabled: Bool
+    /// Picker toggles "Show Subtitles" / "Show Descriptions"
+    /// (`multiviewPickerShowSubtitles` / `multiviewPickerShowDescriptions`).
+    /// Subtitle carries "Team 1 vs Team 2" for Teamarr channels.
+    var showSubtitle: Bool = false
+    var showDescription: Bool = false
+    /// Single tap action, parent decides whether to add or remove
+    /// based on `isAlreadyAdded`. Was `onAdd` pre-v1.6.12; renamed
+    /// to keep callers honest about the semantic.
+    let onTap: () -> Void
+
+    /// Observe this channel's now/next cell so the row can fall back to
+    /// the guide dataset when the item-level current-program payload is
+    /// empty. The cell publishes only when this channel's pair changes,
+    /// not on every write to the whole guide map.
+    @StateObject private var nowNext = GuideNowNextWatch()
+
+    /// Currently-airing program for this row, picking the best
+    /// available source. Mirrors `ChannelRow.liveProgram` so both
+    /// surfaces converge on the same render path.
+    private var liveProgram: (title: String, subtitle: String?, description: String?, start: Date, end: Date)? {
+        let guideLive = nowNext.live(for: item.id)
+        if let title = item.currentProgram, !title.isEmpty,
+           let start = item.currentProgramStart,
+           let end = item.currentProgramEnd,
+           end > Date() {
+            // The item-level snapshot has no subtitle; borrow it from the
+            // guide's live cell when that cell is the same program.
+            let sameProgram = guideLive.map { $0.title == title || $0.start == start } ?? false
+            let desc = (item.currentProgramDescription?.isEmpty == false)
+                ? item.currentProgramDescription
+                : (sameProgram ? guideLive?.description : nil)
+            return (title, sameProgram ? guideLive?.subTitle : nil, desc, start, end)
+        }
+        // GH #96: the item-level snapshot is written at load and goes stale
+        // at the program boundary; an ended one falls through to the
+        // guide's live now/next cell instead of showing a finished event.
+        if let p = guideLive {
+            return (p.title, p.subTitle, p.description, p.start, p.end)
+        }
+        return nil
+    }
+
+    var body: some View {
+        let _ = nowNext.bind(item.id)
+        Button(action: onTap) {
+            HStack(alignment: .center, spacing: rowSpacing) {
+                // Channel number, monospaced, matches Live TV List
+                // visual. Hidden if empty so M3U-only sources without
+                // numbers don't get a phantom whitespace column.
+                if !item.number.isEmpty {
+                    Text(item.number)
+                        .scaledFont(.system(size: numberFontSize, weight: .bold, design: .monospaced))
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                        .frame(width: TextScale.grow(numberWidth, textScale), alignment: .trailing)
+                }
+
+                logo
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(verbatim: item.name)
+                        .scaledFont(titleFont)
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+
+                    if let prog = liveProgram {
+                        // Title + time-remaining on the same line.
+                        // The remaining-minutes label is only shown
+                        // when there's a positive value left;
+                        // already-finished or future-start programs
+                        // omit it (the program shouldn't appear at
+                        // all in those cases, but be defensive).
+                        HStack(spacing: 6) {
+                            Text(verbatim: prog.title)
+                                .scaledFont(subtitleFont)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            if let remaining = remainingLabel(end: prog.end) {
+                                Text(verbatim: "· \(remaining)")
+                                    .scaledFont(subtitleFont)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        if showSubtitle, let sub = prog.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines), !sub.isEmpty {
+                            Text(verbatim: sub)
+                                .scaledFont(subtitleFont)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        if showDescription, let desc = prog.description?.trimmingCharacters(in: .whitespacesAndNewlines), !desc.isEmpty {
+                            Text(verbatim: desc)
+                                .scaledFont(subtitleFont)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(2)
+                                .truncationMode(.tail)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        // Thin progress bar indicating how far through
+                        // the program we are. Same visual treatment
+                        // as `nowPlayingProgressBar` in `ChannelRow`,
+                        // just rendered inline so it ships with the
+                        // picker without needing to extract that
+                        // helper.
+                        ProgressView(value: progressFraction(start: prog.start, end: prog.end))
+                            .tint(Color.accentPrimary.opacity(0.85))
+                            .frame(height: 2)
+                    }
+                }
+
+                Spacer(minLength: 8)
+                trailing
+            }
+            .padding(.vertical, rowVPadding)
+            .padding(.horizontal, rowHPadding)
+            .contentShape(Rectangle())
+            .opacity(rowOpacity)
+        }
+        .buttonStyle(.plain)
+        // v1.6.12: rows for already-added channels stay tappable so
+        // the user can deselect (parent removes the tile). Only the
+        // genuine "max tiles reached" state for not-yet-added rows
+        // disables interaction.
+        .disabled(isDisabled && !isAlreadyAdded)
+        .accessibilityLabel(a11yLabel)
+        .accessibilityHint(a11yHint)
+    }
+
+    // MARK: - Program-time helpers
+
+    /// "18 min left" / "32 sec left" style remaining-time label.
+    /// Returns nil for programs that have already ended, are still in
+    /// the future, or where end ≤ now+0 (avoids "0 sec left" jitter).
+    private func remainingLabel(end: Date) -> String? {
+        let now = Date()
+        let remaining = end.timeIntervalSince(now)
+        guard remaining > 0 else { return nil }
+        if remaining < 60 {
+            return "\(Int(remaining)) sec left"
+        }
+        let minutes = Int(remaining / 60)
+        if minutes < 60 {
+            return "\(minutes) min left"
+        }
+        let hours = minutes / 60
+        let mins  = minutes % 60
+        return mins == 0 ? "\(hours) hr left" : "\(hours) hr \(mins) min left"
+    }
+
+    /// Fraction `[0.0…1.0]` of the program elapsed. Clamped both ends
+    /// so an out-of-range value (e.g. clock skew) doesn't render an
+    /// invalid `ProgressView`.
+    private func progressFraction(start: Date, end: Date) -> Double {
+        let total = end.timeIntervalSince(start)
+        guard total > 0 else { return 0 }
+        let elapsed = Date().timeIntervalSince(start)
+        return max(0, min(1, elapsed / total))
+    }
+
+    // MARK: - Platform sizing
+
+    /// tvOS uses significantly larger rows (read from a couch, D-pad
+    /// nav), bigger logo, larger type, more padding. iPad stays
+    /// compact so the sheet's detent heights don't explode.
+    private var logoSize: CGFloat {
+        return 42
+    }
+
+    private var numberWidth: CGFloat {
+        return 36
+    }
+
+    private var numberFontSize: CGFloat {
+        return 13
+    }
+
+    private var rowSpacing: CGFloat {
+        return 12
+    }
+
+    private var rowVPadding: CGFloat {
+        return 8
+    }
+
+    private var rowHPadding: CGFloat {
+        return 12
+    }
+
+    private var titleFont: AstralFont {
+        return .headline
+    }
+
+    private var subtitleFont: AstralFont {
+        return .caption
+    }
+
+    private var trailingIconSize: CGFloat {
+        return 22
+    }
+
+    // MARK: - Subviews
+
+    @ViewBuilder
+    private var logo: some View {
+        if item.logoURL != nil {
+            // v1.6.23: route through CachedLogoImage so the active
+            // server's auth headers are applied (fixes Dispatcharr-API
+            // logo 401 → placeholder regression).
+            // The logo tile and its placeholder share an 8pt shape; that
+            // tile is this logo's container.
+            CachedLogoImage(url: item.logoURL, width: logoSize, height: logoSize,
+                            containerRadius: 8)
+        } else {
+            logoPlaceholder
+                .frame(width: logoSize, height: logoSize)
+        }
+    }
+
+    @Environment(\.astralRoundedLogoCorners) private var roundedLogoCorners
+
+    private var logoPlaceholder: some View {
+        RoundedRectangle(cornerRadius: LogoCorners.radius(container: 8,
+                                                          imageShorterSide: logoSize,
+                                                          // The placeholder plate is opaque
+                                                          // to its corners: a tile.
+                                                          isTile: true,
+                                                          enabled: roundedLogoCorners),
+                         style: .continuous)
+            .fill(Color.secondary.opacity(0.15))
+            .overlay(
+                Image(systemName: "tv")
+                    .foregroundStyle(.secondary)
+            )
+    }
+
+    @ViewBuilder
+    private var trailing: some View {
+        if isAlreadyAdded {
+            Image(systemName: "checkmark.circle.fill")
+                .scaledFont(.system(size: trailingIconSize))
+                .foregroundStyle(.green)
+                .accessibilityLabel("Already added")
+        } else if isDisabled {
+            Image(systemName: "hand.raised.slash")
+                .scaledFont(.system(size: trailingIconSize))
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Cannot add, limit reached")
+        } else {
+            Image(systemName: "plus.circle")
+                .scaledFont(.system(size: trailingIconSize))
+                .foregroundStyle(Color.accentPrimary)
+        }
+    }
+
+    private var rowOpacity: Double {
+        if isAlreadyAdded { return 0.55 }
+        if isDisabled { return 0.4 }
+        return 1
+    }
+
+    private var a11yLabel: String {
+        let progFragment: String = {
+            guard let prog = liveProgram else { return "" }
+            return ", airing \(prog.title)"
+        }()
+        if isAlreadyAdded { return "\(item.name)\(progFragment), added" }
+        if isDisabled { return "\(item.name)\(progFragment), cannot add, limit reached" }
+        return "\(item.name)\(progFragment)"
+    }
+
+    /// Tells VoiceOver what tapping this row will do. Without this
+    /// hint, an "added" row reads as just "added" with no signal
+    /// that activating it removes the tile.
+    private var a11yHint: String {
+        if isAlreadyAdded { return "Double tap to remove from multiview" }
+        if isDisabled { return "" }
+        return "Double tap to add to multiview"
+    }
+}

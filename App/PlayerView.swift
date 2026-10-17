@@ -1,0 +1,6888 @@
+import SwiftUI
+import AVFoundation
+import AVKit
+import Combine
+import MediaPlayer
+import UIKit
+
+// MARK: - Attempt Log Store
+// @unchecked Sendable: all mutations are dispatched to the main queue manually.
+// Uses a non-published backing array to avoid SwiftUI re-renders on every state change.
+// Only publishes when explicitly requested (e.g., on error display).
+final class AttemptLogStore: ObservableObject, @unchecked Sendable {
+    @Published var lines: [String] = []
+    private var _pending: [String] = []
+
+    /// Append silently, does NOT trigger SwiftUI update.
+    func append(_ line: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?._pending.append(line)
+        }
+    }
+
+    /// Flush pending entries to @Published (triggers SwiftUI update).
+    /// Call this only when the log needs to be displayed (e.g., error screen).
+    func flush() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self._pending.isEmpty else { return }
+            self.lines.append(contentsOf: self._pending)
+            self._pending.removeAll()
+        }
+    }
+
+    var entries: [String] { lines + _pending }
+
+    func reset() {
+        DispatchQueue.main.async { [weak self] in
+            self?.lines.removeAll()
+            self?._pending.removeAll()
+        }
+    }
+}
+
+// MARK: - Media Track (audio/subtitle)
+
+struct MediaTrack: Identifiable, Equatable {
+    let id: Int
+    let type: String     // "audio" or "sub"
+    let title: String
+    let lang: String
+    let codec: String
+    let isDefault: Bool
+
+    var displayName: String {
+        if !title.isEmpty { return title }
+        if !lang.isEmpty { return Locale.current.localizedString(forLanguageCode: lang) ?? lang.uppercased() }
+        return "\(type == "audio" ? "Audio" : "Subtitle") \(id)"
+    }
+}
+
+// MARK: - Stream Info
+
+struct StreamInfo: Equatable {
+    var videoCodec: String = ""
+    /// DISPLAY dimensions (aspect-corrected), not the coded ones: mpv's
+    /// `dwidth`/`dheight` and AVPlayer's `presentationSize`. An anamorphic
+    /// 1440x1080 source therefore reads 1920x1080, which is what the user
+    /// sees (2026-09-11 audit).
+    var width: Int = 0
+    var height: Int = 0
+    /// FRAME rate, never the field rate: for an interlaced broadcast this
+    /// is 29.97, not the 59.94 a deinterlacer outputs (2026-09-11 audit).
+    var fps: Double = 0
+    /// True for an interlaced source, so the readouts can say 1080i.
+    var isInterlaced: Bool = false
+    /// What the player actually PRESENTED over the last window. Never the
+    /// stream's rate (it drops during buffering); panel-only, and labeled
+    /// as presented (Logan 2026-09-11).
+    var presentedFps: Double = 0
+    var pixelFormat: String = ""
+    var hwdec: String = ""
+    var audioCodec: String = ""
+    var sampleRate: Int = 0
+    var channels: Int = 0
+    var cacheDuration: Double = 0
+    var bitrate: Double = 0       // bytes/sec from demuxer
+    var droppedFrames: Int = 0
+    var avsync: Double = 0
+}
+
+/// Standalone Stream Info card used by both `PlayerView` (legacy
+/// single-stream path) and `MultiviewContainerView` (unified path).
+/// v1.6.15.x: extracted from PlayerView's private `streamInfoOverlay`
+/// because the unified path's `MultiviewContainerView` had its
+/// `showStreamInfo` toggle wired but no actual overlay mount,
+/// toggling the row in Options did nothing visible. Sharing one card
+/// view keeps the visual treatment identical across both paths.
+///
+/// v1.6.19: reverted the v1.6.18 Dispatcharr server-side stats path
+/// and the 5-field redesign. The card now renders the original
+/// 6-row layout (VIDEO / AUDIO / CACHE / SYNC) sourced exclusively
+/// from mpv on every server type. Rationale: Dispatcharr's
+/// `stream_stats` describe what the SERVER is doing, not what's
+/// arriving at the device. Users care about what their player is
+/// actually decoding, which mpv reports authoritatively across
+/// every server type. Same numbers everywhere = consistent UX,
+/// fewer "why is the resolution different on Apple TV vs iPhone"
+/// questions, less plumbing to maintain.
+struct StreamInfoCardView: View {
+    let info: StreamInfo
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            row(label: "VIDEO", value: "\(info.videoCodec)  \(info.width)×\(info.height)\(info.height > 0 ? (info.isInterlaced ? "i" : "p") : "")")
+            row(label: "", value: "\(String(format: "%.2f", info.fps))fps  \(info.pixelFormat)")
+            if info.presentedFps > 0 {
+                row(label: "", value: "\(String(format: "%.2f", info.presentedFps))fps presented")
+            }
+            row(label: "", value: "hwdec: \(info.hwdec)")
+            row(label: "AUDIO", value: "\(info.audioCodec)  \(info.sampleRate)Hz  \(info.channels)ch")
+            row(label: "CACHE", value: "\(String(format: "%.1f", info.cacheDuration))s  \(StreamInfoCardView.formatBitrate(info.bitrate))")
+            row(label: "SYNC", value: "\(String(format: "%.3f", info.avsync))s  drops: \(info.droppedFrames)")
+        }
+        .padding(12)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+    }
+
+    @ViewBuilder
+    private func row(label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            if !label.isEmpty {
+                Text(label)
+                    .scaledFont(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(Color.accentPrimary)
+                    .frame(width: 46, alignment: .trailing)
+            } else {
+                Color.clear.frame(width: 46, height: 1)
+            }
+            Text(value)
+                .scaledFont(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(.white.opacity(0.9))
+        }
+    }
+
+    static func formatBitrate(_ bytesPerSec: Double) -> String {
+        let mbps = bytesPerSec * 8.0 / 1_000_000.0
+        if mbps >= 1.0 {
+            return String(format: "%.1f Mbps", mbps)
+        } else {
+            return String(format: "%.0f kbps", mbps * 1000)
+        }
+    }
+}
+
+// MARK: - Video Aspect Mode (issue #26)
+
+/// How the decoded video is sized inside the player, applied to the
+/// `AVSampleBufferDisplayLayer`'s `videoGravity`. `fit` is the default
+/// (letterbox, whole frame visible); `fill` crops to fill the screen
+/// while preserving aspect; `stretch` fills the screen ignoring aspect.
+enum VideoAspectMode: String, CaseIterable, Identifiable {
+    case fit
+    case fill
+    case stretch
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .fit:     return "Fit"
+        case .fill:    return "Fill"
+        case .stretch: return "Stretch"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .fit:     return "rectangle.arrowtriangle.2.inward"
+        case .fill:    return "rectangle.arrowtriangle.2.outward"
+        case .stretch: return "arrow.up.left.and.arrow.down.right"
+        }
+    }
+
+    var videoGravity: AVLayerVideoGravity {
+        switch self {
+        case .fit:     return .resizeAspect
+        case .fill:    return .resizeAspectFill
+        case .stretch: return .resize
+        }
+    }
+
+    /// Next value in the single "Video Scale" cycle: Fit -> Fill -> Stretch.
+    var next: VideoAspectMode {
+        switch self {
+        case .fit:     return .fill
+        case .fill:    return .stretch
+        case .stretch: return .fit
+        }
+    }
+
+    /// Persisted globally (unsynced), the one stored value for the
+    /// player's Video Scale control and the Cast/companion aspect command.
+    static let defaultsKey = "player.aspectMode"
+
+    static func persist(_ mode: VideoAspectMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: defaultsKey)
+    }
+}
+
+/// Pinch-to-scale on the player video (iPhone and iPad): pinch out
+/// past 1.15 sets Fill, pinch in below 0.85 sets Fit, with a brief
+/// centered "Fill" / "Fit" label. Ignored while Fill is not eligible
+/// (multiview with 2 or more tiles, PiP).
+struct VideoScalePinch: ViewModifier {
+    @ObservedObject var progressStore: PlayerProgressStore
+    @State private var toast: VideoAspectMode?
+    @State private var toastTask: Task<Void, Never>?
+
+    func body(content: Content) -> some View {
+        content
+            .simultaneousGesture(
+                MagnifyGesture(minimumScaleDelta: 0.05)
+                    .onEnded { value in commit(value.magnification) }
+            )
+            .overlay(alignment: .center) {
+                if let toast {
+                    Text(toast.label)
+                        .scaledFont(.title3.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 12)
+                        .background(Color.black.opacity(0.55),
+                                    in: Capsule())
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .onDisappear {
+                toastTask?.cancel()
+                toastTask = nil
+            }
+    }
+
+    private func commit(_ magnification: CGFloat) {
+        guard progressStore.allowsVideoFill, !progressStore.isPiPActive else { return }
+        let target: VideoAspectMode
+        if magnification > 1.15 {
+            target = .fill
+        } else if magnification < 0.85 {
+            // Pinch in always lands on Fit, including from Stretch.
+            target = .fit
+        } else {
+            return
+        }
+        if progressStore.aspectMode != target {
+            progressStore.setVideoScale(target)
+        }
+        show(target)
+    }
+
+    /// Flash the mode name for about a second.
+    private func show(_ mode: VideoAspectMode) {
+        toastTask?.cancel()
+        withAnimation(.easeOut(duration: 0.15)) { toast = mode }
+        toastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.2)) { toast = nil }
+        }
+    }
+}
+
+// MARK: - In-Player Gestures: edge slide for brightness / volume
+
+/// Settings → App Behaviors → In-Player Gestures (Logan 2026-09-16).
+///
+/// A vertical finger slide along ONE screen edge of the fullscreen player
+/// adjusts screen brightness; the other edge adjusts system volume. Touch
+/// only (iPhone / iPad); tvOS has no equivalent and is untouched.
+///
+/// Both toggles default OFF so nothing changes for existing users. The
+/// recognizer is deliberately narrow and conservative so it cannot steal
+/// the gestures that already live on the player:
+///   - the top-strip swipe down (PiP / minimize) is excluded outright,
+///     because an edge slide must START below `PlayerTopStripSwipe`'s strip
+///   - the channel flip needs 40pt of travel, this engages at 12pt inside
+///     a band that is at most 64pt wide, so the two never see the same drag
+///   - the seek scrubber is its own gesture on the timeline bar, which sits
+///     well inside the band on every layout
+enum InPlayerEdgeGestures {
+    static let brightnessKey = "appBehaviorsEdgeBrightnessGesture"
+    static let volumeKey = "appBehaviorsEdgeVolumeGesture"
+    /// "left" or "right": which edge owns BRIGHTNESS. Volume takes the other.
+    static let brightnessEdgeKey = "appBehaviorsBrightnessEdge"
+    static let defaultBrightnessEdge = "left"
+
+    /// Band width: a slim ribbon at each edge, scaled a little for iPad.
+    static func bandWidth(for width: CGFloat) -> CGFloat {
+        min(64, max(28, width * 0.08))
+    }
+
+    /// Travel that walks the value from 0 to 1.
+    static func fullTravel(for height: CGFloat) -> CGFloat {
+        max(180, height * 0.6)
+    }
+
+    enum Kind { case brightness, volume }
+
+    /// Which adjustment (if any) a drag starting at `start` owns.
+    static func kind(startX: CGFloat,
+                     startY: CGFloat,
+                     width: CGFloat,
+                     height: CGFloat,
+                     brightnessEnabled: Bool,
+                     volumeEnabled: Bool,
+                     brightnessOnLeft: Bool) -> Kind? {
+        guard width > 0, height > 0 else { return nil }
+        // Never compete with the PiP / minimize strip.
+        guard !PlayerTopStripSwipe.startsInStrip(startY, height: height) else { return nil }
+        let band = bandWidth(for: width)
+        let onLeft: Bool
+        if startX <= band {
+            onLeft = true
+        } else if startX >= width - band {
+            onLeft = false
+        } else {
+            return nil
+        }
+        let wanted: Kind = (onLeft == brightnessOnLeft) ? .brightness : .volume
+        switch wanted {
+        case .brightness: return brightnessEnabled ? .brightness : nil
+        case .volume: return volumeEnabled ? .volume : nil
+        }
+    }
+}
+
+/// System volume, driven the only way iOS sanctions: the hidden slider
+/// inside an `MPVolumeView` that is mounted (offscreen) in the window.
+/// Reads come from `AVAudioSession.outputVolume`, which is always live.
+@MainActor
+final class SystemVolumeBridge {
+    static let shared = SystemVolumeBridge()
+    private init() {}
+
+    /// Registered by `SystemVolumeHost` while the player is on screen.
+    weak var slider: UISlider?
+
+    var level: Float {
+        AVAudioSession.sharedInstance().outputVolume
+    }
+
+    func set(_ value: Float) {
+        guard let slider else { return }
+        let clamped = min(1, max(0, value))
+        // setValue(_:animated:) alone does not notify the system route;
+        // sendActions is what actually moves the hardware volume.
+        slider.setValue(clamped, animated: false)
+        slider.sendActions(for: .valueChanged)
+    }
+}
+
+/// 1x1 offscreen `MPVolumeView` host. Mirrors the offscreen
+/// `AVRoutePickerView` pattern already used by the AirPlay button: the view
+/// has to be in the hierarchy for its slider to control the hardware.
+struct SystemVolumeHost: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let v = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
+        v.isHidden = false
+        v.alpha = 0.001
+        v.isUserInteractionEnabled = false
+        return v
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {
+        bind(uiView)
+        // The slider is not always a subview on the first layout pass.
+        if SystemVolumeBridge.shared.slider == nil {
+            DispatchQueue.main.async { bind(uiView) }
+        }
+    }
+
+    private func bind(_ v: MPVolumeView) {
+        if let s = v.subviews.compactMap({ $0 as? UISlider }).first {
+            SystemVolumeBridge.shared.slider = s
+        }
+    }
+}
+
+/// Live flag for "an edge slide currently owns the touch". The edge
+/// recognizer is attached with `.simultaneousGesture` on the unified
+/// (multiview) and native-HLS hosts, so the gestures that sit beside it,
+/// the channel flip above all, read this to stand down. Cleared a beat
+/// after the finger lifts, because SwiftUI does not order the `onEnded`
+/// callbacks of simultaneous gestures.
+@MainActor
+final class EdgeAdjustState: ObservableObject {
+    static let shared = EdgeAdjustState()
+    private init() {}
+    @Published private(set) var isEngaged = false
+
+    private var clearTask: Task<Void, Never>?
+
+    func engage() {
+        clearTask?.cancel()
+        clearTask = nil
+        if !isEngaged { isEngaged = true }
+    }
+
+    func release() {
+        clearTask?.cancel()
+        clearTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            isEngaged = false
+        }
+    }
+}
+
+/// The edge-slide recognizer, HUD and volume plumbing as one modifier so
+/// every fullscreen touch host carries identical behavior (Logan
+/// 2026-09-16 device pass: the iPhone live player is the unified
+/// single-tile multiview host, NOT the legacy `PlayerRootView` chrome, so
+/// the gesture has to live on all of them).
+struct InPlayerEdgeGestureModifier: ViewModifier {
+    /// Host-side gate: only recognize while the surface is really playable.
+    let isEnabled: Bool
+    /// Named in the engage log so the device log says which host fired.
+    let host: String
+
+    @AppStorage(InPlayerEdgeGestures.brightnessKey)
+    private var edgeBrightnessGesture = false
+    @AppStorage(InPlayerEdgeGestures.volumeKey)
+    private var edgeVolumeGesture = false
+    @AppStorage(InPlayerEdgeGestures.brightnessEdgeKey)
+    private var brightnessEdge = InPlayerEdgeGestures.defaultBrightnessEdge
+
+    @State private var hostSize: CGSize = .zero
+    @State private var kind: InPlayerEdgeGestures.Kind?
+    @State private var base: Double = 0
+    @State private var value: Double = 0
+    @State private var hudVisible = false
+    /// Held apart from `kind` so the HUD keeps its icon while it lingers.
+    @State private var hudKind: InPlayerEdgeGestures.Kind = .brightness
+    @State private var hideTask: Task<Void, Never>?
+
+    private var gesturesOn: Bool { edgeBrightnessGesture || edgeVolumeGesture }
+    private var active: Bool { gesturesOn && isEnabled }
+
+    /// Fall back to the key window when the host has not measured yet.
+    private var measured: CGSize {
+        if hostSize.width > 0, hostSize.height > 0 { return hostSize }
+        let frame = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }?
+            .frame ?? UIScreen.main.bounds
+        return frame.size
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { hostSize = $0 }
+            // The offscreen MPVolumeView only needs to exist while the
+            // volume slide is switched on.
+            .background {
+                if edgeVolumeGesture {
+                    SystemVolumeHost().frame(width: 1, height: 1).allowsHitTesting(false)
+                }
+            }
+            .overlay(alignment: .center) {
+                if hudVisible, gesturesOn {
+                    EdgeAdjustHUD(kind: hudKind, value: value)
+                }
+            }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in _ = handleChanged(v) }
+                    .onEnded { _ in end() },
+                including: active ? .all : .subviews
+            )
+            .onDisappear {
+                hideTask?.cancel()
+                hideTask = nil
+                if kind != nil { end() }
+            }
+    }
+
+    private func currentValue(_ k: InPlayerEdgeGestures.Kind) -> Double {
+        switch k {
+        case .brightness: return Double(UIScreen.main.brightness)
+        case .volume: return Double(SystemVolumeBridge.shared.level)
+        }
+    }
+
+    /// Returns true once the slide owns this drag.
+    @discardableResult
+    private func handleChanged(_ v: DragGesture.Value) -> Bool {
+        guard active else { return false }
+        let dy = v.translation.height
+        let dx = abs(v.translation.width)
+        let size = measured
+
+        if kind == nil {
+            // Engage early (12pt) and only on a clearly vertical drag, so a
+            // horizontal swipe from the bezel still reaches its owner.
+            guard abs(dy) > 12, abs(dy) > dx * 1.5 else { return false }
+            guard let k = InPlayerEdgeGestures.kind(
+                startX: v.startLocation.x,
+                startY: v.startLocation.y,
+                width: size.width,
+                height: size.height,
+                brightnessEnabled: edgeBrightnessGesture,
+                volumeEnabled: edgeVolumeGesture,
+                brightnessOnLeft: brightnessEdge != "right"
+            ) else { return false }
+            kind = k
+            hudKind = k
+            base = currentValue(k)
+            EdgeAdjustState.shared.engage()
+            hideTask?.cancel()
+            withAnimation(.easeOut(duration: 0.12)) { hudVisible = true }
+            debugLog("[GESTURE] edge slide \(k == .brightness ? "brightness" : "volume") engaged host=\(host) band=\(Int(InPlayerEdgeGestures.bandWidth(for: size.width))) startX=\(Int(v.startLocation.x)) base=\(String(format: "%.2f", base))")
+        }
+        guard let k = kind else { return false }
+
+        // Up = more. Travel is measured against the host height.
+        let travel = InPlayerEdgeGestures.fullTravel(for: size.height)
+        let next = min(1, max(0, base - Double(dy) / Double(travel)))
+        value = next
+        switch k {
+        case .brightness: UIScreen.main.brightness = CGFloat(next)
+        case .volume: SystemVolumeBridge.shared.set(Float(next))
+        }
+        return true
+    }
+
+    private func end() {
+        guard kind != nil else { return }
+        kind = nil
+        EdgeAdjustState.shared.release()
+        hideTask?.cancel()
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.2)) { hudVisible = false }
+        }
+    }
+}
+
+extension View {
+    /// Attach the In-Player Gestures edge slides to a fullscreen touch host.
+    func inPlayerEdgeGestures(isEnabled: Bool, host: String) -> some View {
+        modifier(InPlayerEdgeGestureModifier(isEnabled: isEnabled, host: host))
+    }
+}
+
+/// Transient readout shown while an edge slide is adjusting. Styled to
+/// match the Video Scale toast (centered capsule, no hit testing).
+struct EdgeAdjustHUD: View {
+    let kind: InPlayerEdgeGestures.Kind
+    let value: Double
+
+    private var icon: String {
+        switch kind {
+        case .brightness:
+            return value < 0.5 ? "sun.min.fill" : "sun.max.fill"
+        case .volume:
+            if value <= 0.001 { return "speaker.slash.fill" }
+            return value < 0.5 ? "speaker.wave.1.fill" : "speaker.wave.3.fill"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .scaledFont(.title3.weight(.semibold))
+                .frame(width: 26)
+            Capsule()
+                .fill(Color.white.opacity(0.25))
+                .frame(width: 110, height: 6)
+                .overlay(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.white)
+                        .frame(width: max(0, min(110, 110 * value)), height: 6)
+                }
+            Text("\(Int((value * 100).rounded()))%")
+                .scaledFont(.subheadline.weight(.semibold))
+                .monospacedDigit()
+                .frame(width: 46, alignment: .trailing)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 12)
+        .background(Color.black.opacity(0.55), in: Capsule())
+        .allowsHitTesting(false)
+        .transition(.opacity)
+    }
+}
+
+extension View {
+    /// Applies the Video Scale pinch gesture on iPhone / iPad; a no-op
+    /// on tvOS, where the Options panel owns the setting.
+    @ViewBuilder func videoScalePinch(_ progressStore: PlayerProgressStore) -> some View {
+        modifier(VideoScalePinch(progressStore: progressStore))
+    }
+}
+
+// MARK: - Top-strip swipe down (foreground PiP / minimize)
+
+/// Shared rules for the iOS player top-strip swipe down (Logan 2026-09-14):
+/// a downward swipe that STARTS in the close-button row starts system PiP
+/// on iPhone (docked-bar minimize when PiP can't run) and minimizes to the
+/// corner mini on iPad. The same strip is excluded from the channel flip.
+enum PlayerTopStripSwipe {
+    /// Fraction of the player height that counts as the top strip.
+    static let heightFraction: CGFloat = 0.15
+    /// Downward travel (or predicted travel) that commits the action.
+    static let commitDistance: CGFloat = 80
+    static let commitPredicted: CGFloat = 180
+    /// Visual follow: the content moves at this fraction of the finger,
+    /// capped, so it reads as "pulling" rather than dragging the page.
+    static let followFactor: CGFloat = 0.5
+    static let followCap: CGFloat = 140
+
+    static func startsInStrip(_ startY: CGFloat, height: CGFloat) -> Bool {
+        height > 0 && startY <= height * heightFraction
+    }
+
+    static func followOffset(_ translation: CGSize) -> CGFloat {
+        guard translation.height > 0 else { return 0 }
+        return min(followCap, translation.height * followFactor)
+    }
+
+    static func commits(_ value: DragGesture.Value) -> Bool {
+        let dy = value.translation.height
+        guard dy > abs(value.translation.width) else { return false }
+        return dy > commitDistance || value.predictedEndTranslation.height > commitPredicted
+    }
+}
+
+/// Foreground Picture in Picture: the ONLY iPhone minimize (Logan
+/// 2026-09-14, the docked bottom bar is gone). Both engines' solo PiP
+/// controllers (AVPlayerLayerView and the mpv sample-buffer layer) register
+/// here; NowPlayingManager.minimize() on iPhone calls `request()`.
+///
+/// The fullscreen host is hidden the moment the request lands (`hidesHost`:
+/// opacity 0, no hit-testing, still mounted so the layer stays in the window
+/// for PiP). If the controller isn't armed or PiP isn't possible yet, the
+/// request polls for up to `armWait`; still impossible, or a start failure,
+/// springs the player back to fullscreen. Restore expands; closing the
+/// window ends the session with the host kept hidden until it is gone.
+@MainActor
+final class ForegroundPiPBridge: ObservableObject {
+    static let shared = ForegroundPiPBridge()
+
+    /// How long a request waits for the controller to arm / become possible
+    /// (a swipe a few seconds into a tune lands before `controller armed`).
+    static let armWait: TimeInterval = 2.0
+
+    private weak var controller: AVPictureInPictureController?
+    /// True from a request until PiP restores, closes, fails or is dismissed.
+    private(set) var isActive = false
+    /// The iPhone player host renders invisible and non-interactive while
+    /// this is set. Outlives `isActive` on the close path so the host can't
+    /// flash back while the session tears down.
+    @Published private(set) var hidesHost = false
+    /// Set while the window's X is ending the session, so the session-exit
+    /// hook below does not un-hide the host mid-teardown.
+    private var closing = false
+    private var waitTask: Task<Void, Never>?
+    /// Set while PiP moves to a new session (channel change, another VOD,
+    /// recording or catch-up started while PiP was up). The tile rebuilds
+    /// its layer and PiP controller on every retune, so the window can't be
+    /// re-pointed: the old window is stopped, the host stays hidden, and PiP
+    /// restarts on the new session's controller once it is possible.
+    private(set) var isHandingOff = false
+    private var handoffTask: Task<Void, Never>?
+    /// A handoff waits far longer than a swipe: the new stream has to tune
+    /// (remux warm-up) before its layer can go into PiP.
+    static let handoffWait: TimeInterval = 20.0
+
+    func register(_ pip: AVPictureInPictureController) {
+        controller = pip
+    }
+
+    func unregister(_ pip: AVPictureInPictureController) {
+        guard controller === pip else { return }
+        controller = nil
+    }
+
+    /// iPhone minimize. Hides the host now, then starts PiP as soon as the
+    /// controller allows it.
+    func request(wait: TimeInterval = ForegroundPiPBridge.armWait) {
+        guard !isActive else { return }
+        isActive = true
+        closing = false
+        hidesHost = true
+        NowPlayingManager.shared.applyMinimized()
+        debugLog("[PIP-FG] request: host hidden, waiting up to \(wait)s for PiP (controller=\(controller != nil) possible=\(controller?.isPictureInPicturePossible == true))")
+        waitTask?.cancel()
+        let deadline = Date().addingTimeInterval(wait)
+        waitTask = Task { @MainActor [weak self] in
+            while let self, self.isActive, !Task.isCancelled {
+                if AVPictureInPictureController.isPictureInPictureSupported(),
+                   let pip = self.controller,
+                   pip.isPictureInPicturePossible {
+                    if !pip.isPictureInPictureActive {
+                        pip.startPictureInPicture()
+                        debugLog("[PIP-FG] start requested")
+                    }
+                    return
+                }
+                if Date() >= deadline {
+                    debugLog("[PIP-FG] start unavailable after \(wait)s (controller=\(self.controller != nil)); back to fullscreen")
+                    self.springBack()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    /// PiP can't run: the player comes back fullscreen (no docked bar).
+    private func springBack() {
+        isActive = false
+        waitTask?.cancel()
+        waitTask = nil
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            hidesHost = false
+            NowPlayingManager.shared.expand()
+        }
+    }
+
+    // Delegate hooks take the controller's ObjectIdentifier, not the
+    // controller: the PiP delegates are nonisolated and Swift 6 refuses to
+    // send the non-Sendable controller into a main-actor closure.
+
+    /// Delegate hook: PiP refused to start.
+    func handleFailedToStart(_ pipID: ObjectIdentifier) {
+        guard isActive else { return }
+        debugLog("[PIP-FG] failed to start; back to fullscreen")
+        springBack()
+    }
+
+    /// Delegate hook: diagnostic only (the host was hidden at request).
+    func handleDidStart(_ pipID: ObjectIdentifier) {
+        guard isActive else { return }
+        debugLog("[PIP-FG] window up")
+    }
+
+    /// The player is coming back fullscreen by another route (a new tune
+    /// from the guide, expand): close the window so the video isn't in two
+    /// places. `isActive` is cleared FIRST so the resulting didStop does not
+    /// stop playback.
+    func dismissForExpand() {
+        waitTask?.cancel()
+        waitTask = nil
+        handoffTask?.cancel()
+        handoffTask = nil
+        isHandingOff = false
+        closing = false
+        if hidesHost { hidesHost = false }
+        guard isActive else { return }
+        isActive = false
+        debugLog("[PIP-FG] expanded elsewhere -> stopping PiP window")
+        controller?.stopPictureInPicture()
+    }
+
+    /// PlayerSession.exit hook: a session ended by something else (VOD
+    /// opened, recording played) takes the window down with it and leaves
+    /// nothing hidden for the next session. The X path is exempt.
+    func sessionEnding() {
+        guard !closing else { return }
+        if isActive || isHandingOff {
+            beginHandoff()
+        } else {
+            dismissForExpand()
+        }
+    }
+
+    /// PiP is up (or requested) and its session is being replaced. Saves
+    /// the outgoing VOD/DVR position, stops the old window without ending
+    /// playback, and forgets the old controller so the restart can't grab
+    /// the dying layer. If no new session follows within a beat, this was
+    /// a plain exit: un-hide and stand down.
+    func beginHandoff() {
+        guard !closing else { return }
+        if isActive {
+            MultiviewStore.shared.saveVODProgressNow()
+            isActive = false
+            waitTask?.cancel()
+            waitTask = nil
+            debugLog("[PIP-FG] handoff: stopping old window, host stays hidden")
+            let old = controller
+            controller = nil
+            old?.stopPictureInPicture()
+        }
+        isHandingOff = true
+        hidesHost = true
+        handoffTask?.cancel()
+        handoffTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard let self, !Task.isCancelled, self.isHandingOff else { return }
+            self.isHandingOff = false
+            self.handoffTask = nil
+            if PlayerSession.shared.mode != .idle || NowPlayingManager.shared.playingItem != nil {
+                debugLog("[PIP-FG] handoff: new session up, restarting PiP")
+                self.request(wait: Self.handoffWait)
+            } else {
+                debugLog("[PIP-FG] handoff: no new session, standing down")
+                self.hidesHost = false
+            }
+        }
+    }
+
+    /// Delegate hook: the PiP restore button. Reopens the fullscreen player;
+    /// returns true when this bridge owned the PiP session.
+    @discardableResult
+    func handleRestore(_ pipID: ObjectIdentifier) -> Bool {
+        // Same stale-controller rule as handleDidStop: a late restore from
+        // the window a handoff just stopped must not expand the new session.
+        guard isActive, controller.map(ObjectIdentifier.init) == pipID else { return false }
+        isActive = false
+        waitTask?.cancel()
+        waitTask = nil
+        hidesHost = false
+        debugLog("[PIP-FG] restore -> expand")
+        NowPlayingManager.shared.expand()
+        return true
+    }
+
+    /// Delegate hook: PiP ended. Still active here means no restore ran,
+    /// i.e. the user closed the window: end the session with the host kept
+    /// hidden until it has unmounted. A controller that is no longer the
+    /// registered one (the tile was swapped by a retune) never stops the
+    /// new session.
+    func handleDidStop(_ pipID: ObjectIdentifier) {
+        guard isActive else { return }
+        // A stop from any controller other than the registered one is the
+        // previous session's window winding down after a handoff (the tile
+        // rebuilt its layer): ignore it, the pending request owns the new
+        // window and its own timeout.
+        guard controller.map(ObjectIdentifier.init) == pipID else {
+            debugLog("[PIP-FG] stale controller stopped; ignored")
+            return
+        }
+        isActive = false
+        waitTask?.cancel()
+        waitTask = nil
+        debugLog("[PIP-FG] closed without restore -> exit session")
+        // VOD / recording resume point before the tile goes away.
+        MultiviewStore.shared.saveVODProgressNow()
+        closing = true
+        PlayerSession.shared.exit()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard let self, self.closing else { return }
+            self.closing = false
+            self.hidesHost = false
+        }
+    }
+}
+
+
+// MARK: - Player Progress Store
+// @unchecked Sendable: all @Published mutations dispatched to main queue manually.
+/// The player's failed-stream wording, shared by the player overlay, the
+/// Multiview tile card and the Radio Mode card, sheet, banner, and lock
+/// screen so every surface says the same thing (Android parity).
+enum PlaybackFailureCopy {
+    static let title = "Channel Unavailable"
+    static let retryNow = "Retry Now"
+    static let reconnecting = "Reconnecting\u{2026}"
+    /// Flat auto-retry cadence of the failure card, in seconds.
+    static let retryInterval = 5
+    static func retrying(_ seconds: Int) -> String { "Retrying in \(seconds)s" }
+}
+
+final class PlayerProgressStore: ObservableObject, @unchecked Sendable {
+    /// The USER paused this tile (chrome Pause, Play/Pause, lock screen).
+    /// Not @Published (no re-render). Every automatic play (stall nudge,
+    /// rejoin, reconnect, background resume, the post-switch return to
+    /// live) checks it and leaves the player paused; ingest and buffering
+    /// carry on. Cleared by a user resume and by a new tune.
+    /// Apple TV 2026-10-13 (SXM Alt Nation): pauses "resumed on their own".
+    var userPaused = false
+    /// When the user last resumed (any control). The live stall overlay
+    /// starts its frozen clock here and holds Reconnecting for a moment
+    /// while the buffer is healthy (Apple TV 2026-10-13: a resume after a
+    /// long pause flashed Reconnecting for 0.5 s with 254 s loaded ahead).
+    var userResumedAt: Date?
+
+    /// User Play / Pause from any control. While the tile is between
+    /// pipelines (reconnecting: no driver, so no togglePauseAction) a paused
+    /// tile can still be resumed: the flag clears and the pending pipeline
+    /// start plays when the reconnect lands (Apple TV 2026-10-13: Select on
+    /// Play did nothing while "Reconnecting").
+    func userTogglePause() {
+        if let toggle = togglePauseAction {
+            toggle()
+            return
+        }
+        if userPaused {
+            userPaused = false
+            userResumedAt = Date()
+            debugLog(String(format: "[PLAYER] user resume at %.1fs (during reconnect)", Double(currentMs) / 1000))
+            if isPaused { isPaused = false }
+        }
+    }
+
+    /// Record a user pause / resume with the position.
+    func noteUserPause(_ paused: Bool, positionSeconds: Double) {
+        userPaused = paused
+        if !paused { userResumedAt = Date() }
+        debugLog(String(format: "[PLAYER] user %@ at %.1fs", paused ? "pause" : "resume",
+                        positionSeconds.isFinite ? positionSeconds : 0))
+    }
+
+    /// Current playback position in milliseconds (live-timeline relative).
+    @Published var currentMs: Int32 = 0
+    /// Total stream duration in ms (0 for live streams without a static file).
+    @Published var durationMs: Int32 = 0
+    /// True when player is paused.
+    @Published var isPaused: Bool = false
+    /// Current playback speed (1.0 = normal).
+    @Published var speed: Double = 1.0
+    /// Available audio and subtitle tracks (populated on playback-restart).
+    @Published var audioTracks: [MediaTrack] = []
+    @Published var subtitleTracks: [MediaTrack] = []
+    @Published var currentAudioTrackID: Int = 0
+    @Published var currentSubtitleTrackID: Int = 0
+    /// True when a non-live VOD file has played all the way to its end.
+    /// Set by the Coordinator's `handleEndFile` VOD branch and cleared
+    /// whenever a fresh file starts loading or the user replays from 0.
+    /// Multiview reads this (per-tile) to show a "Finished" overlay and
+    /// to hand audio off to another tile; the legacy single PlayerView
+    /// ignores it (it has its own end handling), so adding it here is a
+    /// no-op for that path. Never set for live or DVR live-edge EOF.
+    @Published var reachedEOF: Bool = false
+    /// True while a live stream is unavailable (terminal error, awaiting
+    /// auto-reconnect). The container-level chrome reads this off the audio
+    /// tile's store to show a focusable Retry cell in the standard controls
+    /// while the "Channel Unavailable" card is up (2026-07-12, tvOS parity
+    /// with the Android connection-issue Retry). Set by the MPV coordinator
+    /// on terminal error, cleared on PLAYBACK_RESTART recovery.
+    @Published var connectionIssueActive: Bool = false
+    /// Live AVPlayer tile whose stream failed (standing retry or the
+    /// terminal card) and has not shown a frame since: the user-facing
+    /// error text. Nil while the stream plays. Radio Mode reads it.
+    @Published var liveFailureMessage: String? = nil
+    /// Set by the AVPlayer tile: one fresh tune of the failed channel.
+    var liveFailureRetryAction: (() -> Void)?
+    /// True once the live pipeline has confirmed the picture is wedged: mpv
+    /// has stopped delivering real frames for longer than the stall-report
+    /// threshold and the forced reload has NOT recovered it. Set by the MPV
+    /// coordinator's stale-frame watchdog and cleared the instant real frames
+    /// resume. The tile observes this to raise a soft "Reconnecting…" card
+    /// EARLY (~15s) instead of waiting the full ~60s for the buffer relay +
+    /// LAN/WAN failover + direct-fallback ladder to exhaust into a terminal
+    /// error. Distinct from `connectionIssueActive` (which the terminal-error
+    /// reconnect loop owns): this is the pre-terminal "we noticed, we're on it"
+    /// signal (2026-07-13, kill-the-container freeze fix).
+    @Published var streamStalled: Bool = false
+    /// Transient user-facing note raised by the coordinator when a live
+    /// unpause had no rewind buffer to resume from and playback rejoined
+    /// the live edge (GH #70). Nil = no notice. The tile renders it as a
+    /// small capsule and the coordinator auto-clears it after a few
+    /// seconds. Honest-UX ruling (Logan 2026-08-12): keep the snap, say
+    /// so, and point at the Live Rewind toggle when it is off.
+    @Published var liveResumeNotice: String? = nil
+    /// Live stream stopped on purpose and waiting for Retry: a Dispatcharr
+    /// connection-limit refusal or the reconnect-bounce stop (see
+    /// LiveStopNotice). Set by the tile's engine; the tile renders the card.
+    @Published var liveStopNotice: LiveStopNotice? = nil
+    /// Retry for `liveStopNotice`: one fresh tune, set by the engine.
+    var liveStopRetryAction: (() -> Void)?
+    /// VOD resume tracking, set before playback starts, nil for live
+    var vodID: String?
+    var vodTitle: String?
+    var vodPosterURL: String?
+    var vodStreamURL: String?   // Resolved stream URL (for Continue Watching resume)
+    var vodServerID: String?    // Server UUID (for Continue Watching auth headers)
+    var vodType: String = "movie"  // "movie" or "episode", determines which Continue Watching section
+    var explicitResumeMs: Int32?  // Pre-loaded resume position (bypasses DB lookup)
+    /// True for an in-progress server recording played over its live-style
+    /// HLS playlist (no ENDLIST, nothing rolls off). The AVPlayer driver
+    /// then grows `durationMs` from `seekableTimeRanges` every tick so the
+    /// chrome renders a growing scrubber instead of the scrubber-less live
+    /// layout, and periodic WatchProgress saves never mark it finished
+    /// (position rides the live edge, which would trip the >90% rule).
+    var isDVRWindow: Bool = false
+    /// Closure set by the Coordinator; call with a target position in ms to seek.
+    var seekAction: ((Int32) -> Void)?
+    /// Jump to the live edge (AVPlayer driver only; nil on mpv). Used by
+    /// the multiview tile Playback submenu's "Return to Live".
+    var seekToLiveAction: (() -> Void)?
+    /// Seek RELATIVE to the current player position (delta ms, clamped
+    /// to the seekable range). The tile Playback submenu uses this for
+    /// every kind - live tiles never pump currentMs, so absolute
+    /// currentMs math seeked to nonsense there (field find 2026-08-28).
+    var relativeSeekAction: ((Int32) -> Void)?
+    /// True while a LIVE stream's playhead sits well behind its seekable
+    /// edge. STABLE by construction: set on pause, cleared only by
+    /// Return to Live (seekToLiveAction) or a fresh item. The old
+    /// tick-derived version flapped - the edge distance sawtooths a few
+    /// seconds per arriving segment, and a threshold inside that
+    /// oscillation made the menu item blink (field 2026-08-28).
+    @Published var behindLiveEdge = false
+    /// Closure set by the Coordinator; replays the current VOD file from
+    /// the start. Distinct from `seekAction` because a VOD that has hit
+    /// EOF has `playbackEnded` latched, which the normal seek guard
+    /// blocks. This path clears that latch (and `reachedEOF`), seeks to
+    /// 0, and unpauses. Used by the multiview "Finished" overlay's Replay
+    /// button. Nil / unused on the legacy single PlayerView path.
+    var replayFromStartAction: (() -> Void)?
+    /// Closure set by the Coordinator; resets the exhausted retry
+    /// budgets and starts a fresh connection attempt after a fatal
+    /// error (native catch-up mints a new session instead of replaying
+    /// its session-bound URL). Driven by the playback-error overlay's
+    /// Retry button and auto-reconnect loop; success is reported back
+    /// through the representable's `onRecovered`.
+    var retryAction: (() -> Void)?
+    /// Closure set by the Coordinator; toggles play/pause.
+    var togglePauseAction: (() -> Void)?
+    /// Closure set by the Coordinator; sets playback speed.
+    var setSpeedAction: ((Double) -> Void)?
+    /// Closure set by the Coordinator; sets audio track (0 = auto).
+    var setAudioTrackAction: ((Int) -> Void)?
+    /// Closure set by the Coordinator; sets subtitle track (0 = off).
+    var setSubtitleTrackAction: ((Int) -> Void)?
+    /// True while something OTHER than the AVPlayer driver owns the
+    /// store's subtitle fields (the MKV tile's harvested-cue overlay).
+    /// AVPlayerProgressDriver.populateTracks must then leave
+    /// subtitleTracks / currentSubtitleTrackID / setSubtitleTrackAction
+    /// alone - the legible group is empty on that path and would wipe
+    /// the picker. Cleared by the tile's stop().
+    var externalSubtitleControl = false
+    /// v1.8.17 VOD version switching (Dispatcharr Direct Connect): the
+    /// pre-built provider-copy URLs for the playing item (empty = row
+    /// hidden), which copy is currently playing, and the Coordinator's
+    /// swap closure (loadfile replace at the current position).
+    @Published var vodVersionOptions: [VODVersionOption] = []
+    @Published var currentVersionOptionID: Int? = nil
+    var switchVersionAction: ((VODVersionOption) -> Void)?
+    /// Storage key for remembering the user's version choice, so a switch
+    /// made mid-playback survives the same way a detail-screen pick does.
+    var vodVersionSelectionKey: String?
+    /// Closure set by the Coordinator; enables/disables the video track
+    /// (mpv vid=auto/no) and mirrors `isAudioOnly`. Drives the companion
+    /// hosts' Audio Only command (GH #33 parity with the Android host's
+    /// setVideoTrackEnabled) -- unlike the overflow menu's overlay-only
+    /// toggle, this actually stops video decode.
+    var setVideoEnabledAction: ((Bool) -> Void)?
+    /// Task #184: current audio sync offset in ms (positive = audio
+    /// later). Session-lifetime: mpv's audio-delay property lives on the
+    /// warm mpv instance, so it survives channel swaps and resets only
+    /// when the engine is torn down. Not persisted to disk.
+    @Published var audioSyncMs: Int = 0
+    /// Closure set by the Coordinator; applies an audio sync offset in ms
+    /// (mpv audio-delay). nil on engines without the knob (AVPlayer) -
+    /// the menus hide the control when unset.
+    var setAudioSyncAction: ((Int) -> Void)?
+    /// Whether PiP is currently active. Written synchronously by the
+    /// AVPictureInPictureController delegates (auto-PiP only, the manual
+    /// menu entry was removed in favour of swipe-home auto-PiP). Read by
+    /// `Coordinator.didEnterBackground` to skip the vid=no GPU-safeguard
+    /// when iOS is actively driving the PiP window.
+    @Published var isPiPActive: Bool = false
+    /// True when the user flipped the overflow menu's "Audio Only" item.
+    /// Mirrored from `PlayerView`'s local `@State` so the Coordinator's
+    /// background handler can keep mpv's audio decoder running when the
+    /// user has explicitly opted into background audio. Default false.
+    @Published var isAudioOnly: Bool = false
+    /// The SOURCE is an audio-only program (GH #90, radio): no video
+    /// track exists. Distinct from `isAudioOnly` (the user's choice to
+    /// hide video). Set by the AVPlayer tile; drives the format badge.
+    @Published var isAudioOnlyProgram: Bool = false
+    /// On-screen video sizing (issue #26). The Coordinator observes this and
+    /// applies the matching `videoGravity` to the display layer. Self-seeds
+    /// from UserDefaults so the user's choice survives across streams and
+    /// launches; the overflow menu's action writes the same key.
+    @Published var aspectMode: VideoAspectMode =
+        VideoAspectMode(rawValue: UserDefaults.standard.string(forKey: VideoAspectMode.defaultsKey) ?? "") ?? .fit
+    /// False while this store drives a multiview tile that shares the
+    /// screen with other tiles: Fill is a solo-player affordance, so a
+    /// grid of 2+ tiles stays Fit no matter what the global setting is.
+    @Published var allowsVideoFill: Bool = true
+    /// Video Scale: sets the mode and persists it globally. The single
+    /// entry point for every control (pinch, options row, tvOS pills).
+    func setVideoScale(_ mode: VideoAspectMode) {
+        aspectMode = mode
+        VideoAspectMode.persist(mode)
+    }
+    /// Gravity the layer should actually use right now: Fill is
+    /// suppressed for non-solo multiview tiles and while PiP owns the
+    /// video (PiP keeps Fit).
+    var effectiveVideoGravity: AVLayerVideoGravity {
+        (allowsVideoFill && !isPiPActive) ? aspectMode.videoGravity : .resizeAspect
+    }
+    /// Stream technical info (codec, resolution, bitrate, etc.) sourced
+    /// from mpv. Populated for live playback and read by the Stream
+    /// Info overlay on every server type.
+    @Published var streamInfo = StreamInfo()
+    /// When true, the stream info overlay is visible and the volatile
+    /// stats timer should be running. When false, the timer is paused
+    /// to avoid mpv lock contention that causes frame-delivery jitter.
+    var isStreamInfoVisible: Bool = false
+
+    static let speedOptions: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+}
+
+// MARK: - Shared Error UI
+private struct StreamErrorView: View {
+    let title: String
+    let message: String
+    @ObservedObject var logStore: AttemptLogStore
+    @Binding var didCopyErrorDetails: Bool
+    let onClose: () -> Void
+    /// Non-nil enables the Retry button AND a 10s auto-retry countdown
+    /// (the error state remounts the player, so each failed retry lands
+    /// back here with a fresh countdown). nil keeps the old terminal
+    /// behavior.
+    var onRetry: (() -> Void)? = nil
+
+    @State private var retryCountdown = 0
+    @State private var autoRetryTask: Task<Void, Never>? = nil
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .scaledFont(.system(size: 44))
+                        .foregroundColor(.red)
+                        .padding(.top, 60)
+
+                    Text("Stream Failed")
+                        .scaledFont(.title2.bold())
+                        .foregroundColor(.white)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("ATTEMPTS")
+                            .scaledFont(.system(size: 10, weight: .bold))
+                            .foregroundColor(.gray)
+
+                        ForEach(Array(logStore.lines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .scaledFont(.system(size: 10, design: .monospaced))
+                                .foregroundColor(line.hasPrefix("✓") ? .green : .yellow)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.07))
+                    .cornerRadius(8)
+                    .padding(.horizontal, 20)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("ERROR")
+                            .scaledFont(.system(size: 10, weight: .bold))
+                            .foregroundColor(.gray)
+
+                        Text(message)
+                            .scaledFont(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.85))
+                            .textSelection(.enabled)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.07))
+                    .cornerRadius(8)
+                    .padding(.horizontal, 20)
+
+                    if onRetry != nil, retryCountdown > 0 {
+                        Text(PlaybackFailureCopy.retrying(retryCountdown))
+                            .scaledFont(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+
+                    HStack(spacing: 14) {
+                        if let onRetry {
+                            Button(PlaybackFailureCopy.retryNow) {
+                                autoRetryTask?.cancel()
+                                onRetry()
+                            }
+                            .foregroundColor(.accentColor)
+                        }
+
+                        Button("Copy to Clipboard") {
+                            let text = "ATTEMPTS\n" + logStore.lines.joined(separator: "\n") +
+                                       "\n\nERROR\n" + message
+                            UIPasteboard.general.string = text
+                            didCopyErrorDetails = true
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                                didCopyErrorDetails = false
+                            }
+                        }
+                        .foregroundColor(.accentColor)
+
+                        Button("Close") {
+                            autoRetryTask?.cancel()
+                            onClose()
+                        }
+                        .foregroundColor(.accentColor)
+                    }
+                    .padding(.top, 8)
+
+                    if didCopyErrorDetails {
+                        Text("Copied!")
+                            .scaledFont(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.green)
+                            .padding(.top, 4)
+                    }
+
+                    Spacer(minLength: 40)
+                }
+            }
+        }
+        // Player chrome floats over video and stays dark in every appearance
+        // mode (light frosted-glass controls would be low-contrast on video).
+        // Pinning the player root dark also makes every .ultraThinMaterial
+        // control in this subtree resolve dark without per-site overrides.
+        .preferredColorScheme(.dark)
+        .statusBarHidden(true)
+        .onAppear {
+            // Auto-retry: this view is freshly mounted per error (the
+            // .error case removes the player from the hierarchy), so a
+            // plain 10s countdown per appearance gives a steady retry
+            // cadence without extra state plumbing.
+            guard let onRetry else { return }
+            autoRetryTask = Task { @MainActor in
+                var remaining = 10
+                while remaining > 0 {
+                    retryCountdown = remaining
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if Task.isCancelled { return }
+                    remaining -= 1
+                }
+                onRetry()
+            }
+        }
+        .onDisappear {
+            autoRetryTask?.cancel()
+            autoRetryTask = nil
+        }
+    }
+}
+
+// MARK: - PlayerView (player)
+
+struct PlayerView: View {
+    let urls: [URL]
+    let title: String
+    let headers: [String: String]
+    let isLive: Bool
+    /// True when this is an in-progress DVR recording: a growing
+    /// seekable window from the recording's start to the live edge,
+    /// rather than a fixed-duration file. Drives the live-edge seek
+    /// clamp + LIVE timeline affordance. Always false for live TV and
+    /// regular VOD.
+    let isDVR: Bool
+    let subtitle: String?
+    /// Player Info Card: episode title for the current program, and its
+    /// synopsis. Live callers supply them; VOD/DVR/catch-up leave them
+    /// nil and the two rows simply never draw.
+    let programSubtitle: String?
+    let programDescription: String?
+    let subtitleStart: Date?
+    let subtitleEnd: Date?
+    let artworkURL: URL?
+    let vodID: String?
+    let vodPosterURL: String?
+    let vodServerID: String?
+    let vodType: String  // "movie" or "episode", only used when vodID != nil
+    let resumePositionMs: Int32?
+    /// Catch-up (timeshift): non-nil when this playback is an aired
+    /// programme replayed from the provider archive. Fixes the timeline
+    /// to the programme's real duration and turns seeks into URL
+    /// re-tunes (the timeshift protocol's only random access).
+    let catchup: CatchupPlayback?
+    /// v1.8.17: provider-copy URLs for in-play version switching
+    /// (Dispatcharr Direct Connect VOD only; empty everywhere else).
+    let vodVersionOptions: [VODVersionOption]
+    /// Which copy this playback started on, when the caller pinned one.
+    /// Nil for Auto (the server picked, so we cannot attribute what plays).
+    let vodSelectedVersionID: Int?
+    /// See `PlayerProgressStore.vodVersionSelectionKey`.
+    let vodVersionSelectionKey: String?
+    let onMinimize: (() -> Void)?
+    let onClose: (() -> Void)?
+
+    init(urls: [URL], title: String, headers: [String: String]? = nil,
+         isLive: Bool = true, isDVR: Bool = false,
+         subtitle: String? = nil, subtitleStart: Date? = nil, subtitleEnd: Date? = nil,
+         programSubtitle: String? = nil, programDescription: String? = nil,
+         artworkURL: URL? = nil,
+         vodID: String? = nil, vodPosterURL: String? = nil,
+         vodServerID: String? = nil, vodType: String = "movie",
+         resumePositionMs: Int32? = nil,
+         catchup: CatchupPlayback? = nil,
+         vodVersionOptions: [VODVersionOption] = [],
+         vodSelectedVersionID: Int? = nil,
+         vodVersionSelectionKey: String? = nil,
+         onMinimize: (() -> Void)? = nil, onClose: (() -> Void)? = nil) {
+        self.urls = urls
+        self.title = title
+        self.headers = headers ?? [:]
+        self.isLive = isLive
+        self.isDVR = isDVR
+        self.subtitle = subtitle
+        self.programSubtitle = programSubtitle
+        self.programDescription = programDescription
+        self.subtitleStart = subtitleStart
+        self.subtitleEnd = subtitleEnd
+        self.artworkURL = artworkURL
+        self.vodID = vodID
+        self.vodPosterURL = vodPosterURL
+        self.vodServerID = vodServerID
+        self.vodType = vodType
+        self.resumePositionMs = resumePositionMs
+        self.catchup = catchup
+        self.vodVersionOptions = vodVersionOptions
+        self.vodSelectedVersionID = vodSelectedVersionID
+        self.vodVersionSelectionKey = vodVersionSelectionKey
+        self.onMinimize = onMinimize
+        self.onClose = onClose
+    }
+
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var logStore = AttemptLogStore()
+    @State private var didCopyErrorDetails = false
+    @State private var isAudioOnly = false
+
+    // The "Apple TV up/down channel-flip" toggle (v1.7.x) lives on
+    // `PlayerRootView` because that's where `.onMoveCommand` is
+    // mounted. PlayerView itself doesn't read the value.
+
+    var body: some View {
+        PlayerRootView(
+            urls: urls, title: title, headers: headers,
+            isLive: isLive, isDVR: isDVR,
+            subtitle: subtitle,
+            programSubtitle: programSubtitle, programDescription: programDescription,
+            subtitleStart: subtitleStart, subtitleEnd: subtitleEnd,
+            artworkURL: artworkURL,
+            vodID: vodID, vodPosterURL: vodPosterURL, vodServerID: vodServerID,
+            vodType: vodType,
+            resumePositionMs: resumePositionMs,
+            catchup: catchup,
+            vodVersionOptions: vodVersionOptions,
+            vodSelectedVersionID: vodSelectedVersionID,
+            vodVersionSelectionKey: vodVersionSelectionKey,
+            onDismiss: { if let c = onClose { c() } else { dismiss() } },
+            onMinimize: onMinimize,
+            logStore: logStore,
+            didCopyErrorDetails: $didCopyErrorDetails,
+            isAudioOnly: $isAudioOnly
+        )
+        .ignoresSafeArea()
+    }
+}
+
+
+// MARK: - Player Root View
+
+private struct PlayerRootView: View {
+    /// Live Rewind engine state: drives the live scrubber window
+    /// (fullscreen single live with a rolling buffer session).
+    @ObservedObject private var liveRewind = LiveRewindEngine.shared
+    // Settings > App Behaviors > Player Info Card. Card rows only.
+    @AppStorage(PlayerInfoCardSettings.channelNameKey) private var showCardChannelName = true
+    @AppStorage(PlayerInfoCardSettings.programNameKey) private var showCardProgramName = true
+    @AppStorage(PlayerInfoCardSettings.programTimeKey) private var showCardProgramTime = true
+    @AppStorage(PlayerInfoCardSettings.programSubtitleKey) private var showCardProgramSubtitle = true
+    @AppStorage(PlayerInfoCardSettings.programDescriptionKey) private var showCardProgramDescription = true
+    let urls: [URL]
+    let title: String
+    let headers: [String: String]
+    let isLive: Bool
+    /// See `PlayerView.isDVR`. Mirrored here (the timeline math lives in
+    /// this view) and threaded into the Coordinator for the live-edge
+    /// seek clamp.
+    let isDVR: Bool
+    let subtitle: String?
+    /// See `PlayerView.programSubtitle` / `.programDescription`.
+    var programSubtitle: String? = nil
+    var programDescription: String? = nil
+    let subtitleStart: Date?
+    let subtitleEnd: Date?
+    let artworkURL: URL?
+    let vodID: String?
+    let vodPosterURL: String?
+    let vodServerID: String?
+    let vodType: String  // "movie" or "episode"
+    let resumePositionMs: Int32?
+    /// See `PlayerView.catchup`. Mirrored here for the fixed-duration
+    /// timeline and threaded into the Coordinator for re-tune seeks.
+    var catchup: CatchupPlayback? = nil
+    /// See `PlayerView.vodVersionOptions`.
+    var vodVersionOptions: [VODVersionOption] = []
+    /// See `PlayerView.vodSelectedVersionID`.
+    var vodSelectedVersionID: Int? = nil
+    /// See `PlayerView.vodVersionSelectionKey`.
+    var vodVersionSelectionKey: String? = nil
+    let onDismiss: () -> Void
+    let onMinimize: (() -> Void)?
+
+    @ObservedObject var logStore: AttemptLogStore
+    @Binding var didCopyErrorDetails: Bool
+    @Binding var isAudioOnly: Bool
+
+    @State private var state: PlayState = .loading
+    @State private var lastError: String = ""
+    /// Per-player guard for the one-shot LAN/WAN failover. The MPV
+    /// coordinator only calls `onFatalError` after ALL its built-in
+    /// retries (URL-list failover, loadFailureRetry backoff, premature-end
+    /// retry, warm-up retry) have exhausted. We then attempt exactly ONE
+    /// re-probe + re-point. This flag (plus the URL-unchanged bail inside
+    /// `failoverRetryCurrent`) prevents a genuinely-dead WAN URL from
+    /// looping: the second fatal error skips failover straight to the
+    /// error overlay. The player is `.id(item.id)`, so a successful
+    /// re-begin mounts a fresh PlayerRootView with the flag reset.
+    @State private var didAttemptPlayFailover = false
+    @AppStorage(showRemoteHintsKey) private var showRemoteHints = true
+    @State private var showControls = true
+    @State private var controlsHideTask: Task<Void, Never>?
+    @State private var dragOffset: CGFloat = 0
+    // Resume prompt removed, no DVR.
+
+    /// v1.7.x: gates the Apple TV up/down d-pad channel-flip on
+    /// single-stream live playback. Default ON to preserve the
+    /// behaviour shipped since v1.6.15. Surfaced in Settings →
+    /// App Behaviors → Apple TV Remote. Mirrored on `PlayerView`
+    /// for parity (each struct's @AppStorage shares the same
+    /// UserDefaults backing store, so they stay in sync).
+    @AppStorage("appBehaviorsAppleTVChannelFlip")
+    private var appleTVChannelFlip = true
+
+    /// True while an In-Player edge slide owns the touch; the root drag
+    /// (minimize / channel flip) stands down for its duration.
+    @ObservedObject private var edgeAdjust = EdgeAdjustState.shared
+
+    /// Key window height (iPad split screen safe); the swipe-down minimize
+    /// travel and the top-strip bounds are both measured against it.
+    private var playerWindowHeight: CGFloat {
+        playerWindowFrame.height
+    }
+
+    private var playerWindowFrame: CGRect {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }?
+            .frame ?? UIScreen.main.bounds
+    }
+
+
+    // Skip Intervals (Settings > App Behaviors): the skip buttons and a
+    // single scrub press. Held here so a change re-renders the glyphs.
+    @AppStorage(SkipIntervals.backKey) private var skipBackSeconds = SkipIntervals.defaultBack
+    @AppStorage(SkipIntervals.forwardKey) private var skipForwardSeconds = SkipIntervals.defaultForward
+
+    // Sleep timer
+    @State private var sleepTimerEnd: Date?
+
+    // Stream info
+    @State private var showStreamInfo = false
+    /// User-draggable position for the stream info overlay (nil = default top-center).
+    @State private var streamInfoPosition: CGPoint?
+
+    /// Channel-picker presentation. The `+` button in the top bar
+    /// (iPad) / "Add Stream" row in the options panel (tvOS) sets
+    /// this to `true`. Presenting from PlayerView, *not* from
+    /// MultiviewContainerView after a mode flip, keeps the current
+    /// stream playing under the sheet. The picker commits the mode
+    /// transition on pick, so the user never sees the "original
+    /// channel stops" mid-transition stall that the previous design
+    /// produced.
+    @State private var showAddStreamSheet = false
+
+
+    // Timeline / scrubber
+    @StateObject private var progressStore = PlayerProgressStore()
+    @State private var isDragging = false
+    @State private var dragFraction: CGFloat = 0
+    // iOS: after a drag releases, hold the bar at the released position
+    // until mpv's reported position catches up (mirrors the tvOS
+    // scrubSettleTask), so the thumb doesn't snap back to the stale
+    // pre-seek spot and then jump forward.
+    @State private var dragSettling = false
+    @State private var dragSettleTask: Task<Void, Never>?
+    /// iOS full-screen button: when true the player has forced the window
+    /// into landscape (overriding a portrait rotation-lock). Released when
+    /// toggled off or when the player closes.
+    @State private var forcedLandscape = false
+
+
+    enum PlayState { case loading, playing, error }
+
+    @ViewBuilder
+    private var playerView: some View {
+        #if canImport(Libmpv)
+        // v1.7.x: black backdrop directly behind the representable so
+        // the AstralTV navy theme background can't leak through during
+        // the ~1.5s window before the first decoded frame lands. The
+        // outer ZStack at body level already paints black, but on
+        // some layout paths (UHD letterbox, multiview tile transitions)
+        // SwiftUI's UIViewControllerRepresentable host appears to
+        // briefly show through to the SwiftUI background fill rather
+        // than the ZStack's Color.black. Adding an explicit
+        // `.background(Color.black)` on the representable closes that
+        // gap regardless of which parent is rendering. Combined with
+        // the `view.backgroundColor = .black` set in viewDidLoad, this
+        // is a double-fence: the UIKit side is black, AND the SwiftUI
+        // side is black.
+        MPVPlayerViewRepresentable(
+            urls: urls, headers: headers,
+            isLive: isLive, isDVR: isDVR,
+            catchup: catchup,
+            nowPlayingTitle: title,
+            nowPlayingSubtitle: subtitle,
+            nowPlayingArtworkURL: artworkURL,
+            progressStore: progressStore,
+            logStore: logStore,
+            onFatalError: { err in
+                if !didAttemptPlayFailover, isLive {
+                    didAttemptPlayFailover = true
+                    Task { @MainActor in
+                        let ok = await PlayerSession.shared.failoverRetryCurrent()
+                        if !ok { lastError = err; state = .error }
+                        // if ok: begin() reseeds NowPlaying and a fresh
+                        // player mounts (player is .id(item.id)), so this
+                        // PlayerRootView is replaced and its error state
+                        // never needs to be set.
+                    }
+                } else {
+                    lastError = err; state = .error
+                }
+            }
+        )
+        .background(Color.black)
+        .videoScalePinch(progressStore)
+        #else
+        Text("MPV engine not available on this platform")
+            .foregroundColor(.red)
+        #endif
+    }
+
+    var body: some View {
+        // GH #71: digit-key channel entry on the legacy live player,
+        // tuning through the same `tuneDirect` path the overlays use.
+        playerBody
+            .channelNumberEntry(
+                scope: .player,
+                isActive: numberEntryActive,
+                channels: { ChannelStore.shared.channels },
+                onResolve: { item in NowPlayingManager.shared.tuneDirect(item) }
+            )
+    }
+
+    /// Live and full-screen. The observed `nowPlayingManager` is tvOS
+    /// only; the legacy iOS player has no mini-player state to gate on.
+    private var numberEntryActive: Bool {
+        return isLive
+    }
+
+    @ViewBuilder
+    private var playerBody: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            switch state {
+            case .loading:
+                loadingOverlay
+
+            case .playing:
+                ZStack {
+                    // Player stays in the hierarchy at all times, removing it tears down the
+                    // coordinator and forces a full restart when toggling back from audio-only.
+                    playerView
+                        .ignoresSafeArea()
+
+                    if isAudioOnly {
+                        audioOnlyBackground
+                            .transition(.opacity)
+                    }
+
+                    if showControls {
+                        controlsOverlay
+                            .transition(.opacity)
+                    }
+
+                    // Stream info overlay, visible when toggled, independent of controls auto-hide
+                    if showStreamInfo {
+                        GeometryReader { geo in
+                            let defaultPos = CGPoint(
+                                x: geo.size.width / 2,
+                                y: deviceSafeAreaTop + 70
+                            )
+                            let pos = streamInfoPosition ?? defaultPos
+                            // Close (x) button matching the unified path's
+                            // card (MultiviewContainerView.streamInfoCardWithCloseButton).
+                            // Pre-fix the legacy VOD/single-stream player
+                            // rendered the bare card with no dismiss
+                            // affordance on iPhone - the overlay could only
+                            // be cleared by reopening Options.
+                            ZStack(alignment: .topTrailing) {
+                                streamInfoOverlay
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        showStreamInfo = false
+                                    }
+                                } label: {
+                                    ZStack {
+                                        Circle()
+                                            .fill(.ultraThinMaterial)
+                                            .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 11, weight: .bold))  // glyph in a fixed box: not text, stays fixed
+                                            .foregroundStyle(.white)
+                                    }
+                                    .frame(width: 22, height: 22)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Close stream info")
+                                .offset(x: 10, y: -10)
+                            }
+                                .position(pos)
+                                .gesture(
+                                    DragGesture()
+                                        .onChanged { value in
+                                            streamInfoPosition = value.location
+                                        }
+                                )
+                        }
+                        .transition(.opacity)
+                    }
+
+                    // iOS: transparent tap layer, toggles controls on tap.
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
+                            if showControls && !progressStore.isPaused { scheduleControlsHide() }
+                        }
+                        .allowsHitTesting(!showControls)
+                }
+
+            case .error:
+                StreamErrorView(
+                    title: title, message: lastError.isEmpty ? "Playback failed." : lastError,
+                    logStore: logStore, didCopyErrorDetails: $didCopyErrorDetails,
+                    onClose: onDismiss,
+                    // Retry remounts the player (the .error case removed
+                    // it from the hierarchy, so flipping back to .playing
+                    // stands up a fresh coordinator that starts from the
+                    // URL list's top). Re-arming the one-shot LAN/WAN
+                    // failover gives the retry the full recovery ladder.
+                    onRetry: {
+                        didAttemptPlayFailover = false
+                        lastError = ""
+                        state = .playing
+                    }
+                )
+                .onAppear { logStore.flush() }
+            }
+        }
+        // Connection-limit / stream-ended stop from the mpv engine: the
+        // error screen with its Retry (a fresh coordinator), no failover.
+        .onReceive(progressStore.$liveStopNotice) { notice in
+            guard let notice, state == .playing else { return }
+            debugLog("[LIMIT] player screen showing \(notice.kind.rawValue) notice")
+            didAttemptPlayFailover = true
+            lastError = "\(notice.title). \(notice.message)"
+            state = .error
+        }
+        // Offset and opacity applied to the whole view (including the black background) so the
+        // tab content already rendered beneath in MainTabView is revealed as the player slides down.
+        .offset(y: max(0, dragOffset))
+        .opacity(1.0 - min(0.4, dragOffset / 400))
+        // Release a forced-landscape lock when the player closes so the
+        // rest of the app returns to the device's own orientation.
+        .onDisappear { if forcedLandscape { requestOrientation(landscape: false) } }
+        // In-Player Gestures (Settings → App Behaviors): the edge slides for
+        // brightness and volume. Same modifier on every fullscreen touch
+        // host so behavior and priority are identical.
+        .inPlayerEdgeGestures(isEnabled: state == .playing, host: "PlayerRootView")
+        .gesture(
+            DragGesture()
+                .onChanged { value in
+                    guard state == .playing, !edgeAdjust.isEngaged else { return }
+                    guard value.translation.height > 0 else { return }
+                    // Top-strip swipe down (Logan 2026-09-14): follows the
+                    // finger at a damped rate with chrome up or down; it
+                    // never flips (see onEnded).
+                    if PlayerTopStripSwipe.startsInStrip(
+                        value.startLocation.y, height: playerWindowHeight) {
+                        dragOffset = PlayerTopStripSwipe.followOffset(value.translation)
+                        return
+                    }
+                    // v1.6.18: when chrome is visible, a downward swipe
+                    // is a channel-flip-down gesture (handled in
+                    // onEnded below), NOT a minimize. Skip the
+                    // dragOffset assignment so the player doesn't
+                    // visually slide while the user is trying to flip.
+                    if showControls { return }
+                    dragOffset = value.translation.height
+                }
+                .onEnded { value in
+                    // An edge slide owns the whole drag: never also minimize,
+                    // flip channels, or seek off the same gesture.
+                    guard state == .playing, !edgeAdjust.isEngaged else {
+                        if dragOffset != 0 {
+                            withAnimation(.spring(response: 0.3)) { dragOffset = 0 }
+                        }
+                        return
+                    }
+
+                    // Top-strip swipe down: minimize (onMinimize ->
+                    // NowPlayingManager.minimize, which on iPhone is foreground
+                    // PiP with the player hidden in place, iPad the corner
+                    // mini). Swipes starting in the strip never flip channels.
+                    if PlayerTopStripSwipe.startsInStrip(
+                        value.startLocation.y, height: playerWindowHeight) {
+                        guard PlayerTopStripSwipe.commits(value) else {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                                dragOffset = 0
+                            }
+                            return
+                        }
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                            dragOffset = 0
+                        }
+                        if let minimize = onMinimize { minimize() } else { onDismiss() }
+                        return
+                    }
+
+                    // v1.6.18: chrome-visible vertical swipe = channel
+                    // flip (live only). User flow: tap once to summon
+                    // chrome, then swipe up/down to flip channels;
+                    // each flip refreshes the chrome fade timer so
+                    // the Tap → Swipe → Swipe → Swipe flow stays
+                    // alive without re-tapping. Inverted from the
+                    // tvOS gate at line ~590 above (which flips on
+                    // !showControls, since tvOS chrome-visible
+                    // up/down navigates the Options pill row).
+                    // Direction matches tvOS: up = next (+1), down
+                    // = previous (-1). Strong vertical bias keeps
+                    // iPad split-view drag-from-edge from being
+                    // misread as a channel flip.
+                    // v1.7.x: also gated on the Settings → App
+                    // Behaviors → "Up / Down channel change" toggle.
+                    // iOS swipe + tvOS d-pad share the same storage
+                    // key; users who turn the feature off don't get
+                    // accidental flips from either input path.
+                    if appleTVChannelFlip, showControls, isLive {
+                        let dy = value.translation.height
+                        let dx = abs(value.translation.width)
+                        if abs(dy) > 40, abs(dy) > dx * 1.5 {
+                            let direction = dy < 0 ? +1 : -1
+                            NowPlayingManager.shared.changeChannel(direction: direction)
+                            scheduleControlsHide()
+                            withAnimation(.spring(response: 0.25)) { dragOffset = 0 }
+                            return
+                        }
+                    }
+
+                    // Use the key window height for iPad/split-screen compatibility.
+                    let screenH = playerWindowHeight
+                    let isSwipeDown = value.translation.height > abs(value.translation.width) &&
+                                      (value.translation.height > 60 ||
+                                       value.predictedEndTranslation.height > 150)
+                    if isSwipeDown {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 1.0)) {
+                            dragOffset = screenH
+                        }
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 220_000_000)
+                            if let minimize = onMinimize {
+                                minimize()
+                            } else {
+                                onDismiss()
+                            }
+                            dragOffset = 0
+                        }
+                    } else {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                            dragOffset = 0
+                        }
+                    }
+                }
+        )
+        .task { await startPlayback() }
+        // ATV retest 2026-08-17: startPlayback seeds the version menu ONCE,
+        // so a caller that resolves its options asynchronously (Continue
+        // Watching fetches the provider copies as the cover mounts) landed
+        // them after the seed and the Switch Version list stayed empty.
+        // Adopt late arrivals, keeping any selection the user already made
+        // in this session.
+        .onChange(of: vodVersionOptions) { _, options in
+            guard !options.isEmpty else { return }
+            progressStore.vodVersionOptions = options
+            if progressStore.currentVersionOptionID == nil {
+                progressStore.currentVersionOptionID = vodSelectedVersionID
+                    ?? options.first { $0.url.absoluteString == urls.first?.absoluteString }?.id
+            }
+        }
+        .task(id: sleepTimerEnd) {
+            // Sleep timer countdown, checks every 30s, pauses playback when expired
+            guard let end = sleepTimerEnd else { return }
+            while true {
+                let remaining = end.timeIntervalSince(Date())
+                if remaining <= 0 {
+                    progressStore.togglePauseAction?()
+                    sleepTimerEnd = nil
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30s
+            }
+        }
+        // Player chrome floats over video and stays dark in every appearance
+        // mode (light frosted-glass controls would be low-contrast on video).
+        // Pinning the player root dark also makes every .ultraThinMaterial
+        // control in this subtree resolve dark without per-site overrides.
+        .preferredColorScheme(.dark)
+        .statusBarHidden(!showControls)
+        .onAppear {
+            scheduleControlsHide()
+            // If a car is already connected when the player mounts (the user
+            // opened the phone app mid-CarPlay session), default to
+            // audio-only, same as the fresh-connect handler below.
+            if NowPlayingManager.shared.isCarPlayConnected {
+                isAudioOnly = true
+                progressStore.isAudioOnly = true
+            }
+        }
+        // Add-stream picker. Presented on top of the live PlayerView
+        // deliberate: the current stream keeps playing under it, so
+        // cancelling the picker leaves the user exactly where they
+        // were. The sheet commits the multiview transition only if
+        // the user actually picks a channel; that commit is the one
+        // moment when `PlayerSession.mode` flips, the PlayerView
+        // unmounts, and MultiviewContainerView takes over with both
+        // tiles already requested.
+        .sheet(isPresented: $showAddStreamSheet) {
+            AddToMultiviewSheet(isPresented: $showAddStreamSheet)
+                .presentationDetents([.fraction(0.45), .large])
+                .presentationDragIndicator(.visible)
+        }
+        .onChange(of: progressStore.isPaused) { _, isPaused in
+            if isPaused {
+                controlsHideTask?.cancel()
+                withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+            } else {
+                scheduleControlsHide()
+            }
+        }
+        .onChange(of: showStreamInfo) { _, visible in
+            // Bridge to the coordinator so the volatile stats timer
+            // only runs while the overlay is visible, avoids mpv
+            // lock contention that causes frame-delivery jitter.
+            progressStore.isStreamInfoVisible = visible
+            // v1.6.18: also publish to the shared NowPlayingManager
+            // so `ChannelInfoBanner` can suppress itself while the
+            // user has Stream Info open, they sit at the same
+            // top-left coordinates on iPhone and would otherwise
+            // overlap, covering the stats the user just asked for.
+            NowPlayingManager.shared.streamInfoIsVisible = visible
+        }
+        // v1.6.15: mirror this player's chrome visibility into the
+        // shared `NowPlayingManager.chromeIsVisible` flag so the
+        // `ChannelInfoBanner` overlay (in HomeView's outer ZStack)
+        // can lock step with chrome's auto-fade. Cross-platform,
+        // both legacy iOS PlayerView and tvOS need this; the
+        // unified iOS path goes through `MultiviewContainerView`'s
+        // own mirror and lands in the same shared flag.
+        .onChange(of: showControls) { _, visible in
+            NowPlayingManager.shared.chromeIsVisible = visible
+        }
+        // v1.6.15: wake the chrome only on stream starts that asked
+        // for it (cold-launch auto-resume, channel-row tap). Siri
+        // Remote up/down flips intentionally do not bump
+        // `chromeWakeToken`, a flip should keep chrome hidden so
+        // the next up/down keeps flipping channels. The banner
+        // (HomeView's `ChannelInfoBanner`) still surfaces on every
+        // flip via its own 5s timer.
+        // initial: true + consume: mirrors MultiviewContainerView's wake
+        // observer. A fresh mount is created in the same transaction that
+        // publishes the token, so a plain onChange misses it and the tune-in
+        // controls never appear (ATV field report 2026-08-13). Consuming
+        // keeps the token one-shot across remounts.
+        .onChange(of: NowPlayingManager.shared.chromeWakeToken, initial: true) { _, newToken in
+            guard newToken != nil else { return }
+            NowPlayingManager.shared.chromeWakeToken = nil
+            guard isLive else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+            scheduleControlsHide()
+        }
+        // CarPlay sessions default to audio-only (the driver is not watching
+        // the phone). The existing Show Video toggle still overrides it for a
+        // passenger; disconnecting CarPlay returns to video. Drives the same
+        // isAudioOnly path the overflow toggle uses. No-op on tvOS (CarPlay
+        // never connects there).
+        .onChange(of: NowPlayingManager.shared.isCarPlayConnected) { _, connected in
+            isAudioOnly = connected
+            progressStore.isAudioOnly = connected
+        }
+    }
+
+
+    // MARK: - Loading
+    private var loadingOverlay: some View {
+        VStack(spacing: 20) {
+            ProgressView().tint(.accentColor).scaleEffect(1.5)
+            Text(title).scaledFont(.headline).foregroundColor(.white)
+            Text("Connecting…").scaledFont(.subheadline).foregroundColor(.gray)
+            Button("Cancel") { onDismiss() }
+                .foregroundColor(.accentColor).padding(.top, 8)
+        }
+    }
+
+    // MARK: - Audio-Only Background
+    private var audioOnlyBackground: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(hex: "0A0F0D"), Color(hex: "111916")],
+                startPoint: .top, endPoint: .bottom
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 24) {
+                ZStack {
+                    Circle()
+                        .fill(Color.accentPrimary.opacity(0.15))
+                        .frame(width: 140, height: 140)
+                    Image(systemName: "music.note")
+                        .scaledFont(.system(size: 56, weight: .light))
+                        .foregroundStyle(LinearGradient.accentGradient)
+                }
+                .shadow(color: Color.accentPrimary.opacity(0.3), radius: 30)
+
+                Text(title)
+                    .scaledFont(.title2.bold())
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+
+                Text("Audio Only")
+                    .scaledFont(.subheadline)
+                    .foregroundColor(.gray)
+            }
+        }
+    }
+
+    // MARK: - Safe area helper
+    // Reads the key window's top safe area inset directly from UIKit so it's
+    // accurate even inside a view that uses .ignoresSafeArea().
+    //
+    // Two cases the plain reading gets wrong on iPhone:
+    //
+    //  • Portrait with a running Live Activity in the Dynamic Island. iOS
+    //    does NOT enlarge `safeAreaInsets.top` when an LA is active, but
+    //    the LA pill visually extends further down than a plain DI. The
+    //    player's top chrome ends up kissing (or under) the LA pill.
+    //  • Landscape on DI/notch devices. iOS reports `safeAreaInsets.top == 0`
+    //    because the app isn't showing a traditional status bar, but the
+    //    system still draws the status-bar row + any LA as an overlay.
+    //
+    // Fix: on iPhone, bump the reported inset by a constant LA buffer on
+    // devices that have a notch or Dynamic Island (reported > 40pt is a
+    // reliable proxy), and floor landscape to a value that clears a compact
+    // LA pill even when the reported inset is zero.
+    private var deviceSafeAreaTop: CGFloat {
+        // Robust scene/window lookup. `.first { $0.isKeyWindow }` returns
+        // nil during fullScreenCover transitions, that's probably why the
+        // previous read occasionally fell through to 0 even on iPhone Pro
+        // Max portrait. Fall back to the first window of the active scene,
+        // then any connected window, before giving up.
+        let reported: CGFloat = {
+            let scenes = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+            if let active = scenes.first(where: { $0.activationState == .foregroundActive }) {
+                if let key = active.windows.first(where: { $0.isKeyWindow }) {
+                    return key.safeAreaInsets.top
+                }
+                if let any = active.windows.first {
+                    return any.safeAreaInsets.top
+                }
+            }
+            return scenes.first?.windows.first?.safeAreaInsets.top ?? 0
+        }()
+
+        guard UIDevice.current.userInterfaceIdiom == .phone else {
+            return max(reported, 24)  // iPad, conservative minimum
+        }
+        let isLandscape = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.interfaceOrientation.isLandscape ?? false
+        // Notch / Dynamic Island iPhones report > 40pt of top inset in
+        // portrait; older home-button iPhones report ~20pt. Only apply
+        // the LA buffer to the former in portrait, iPhone SE / 8 would
+        // get wasted vertical space otherwise.
+        //
+        // In landscape we used to apply the LA buffer AND floor at 60pt,
+        // which stacked to ~88pt on Pro iPhones, way too low for a
+        // fullscreen video (#22 feedback). In landscape iOS does not
+        // overlay a Live Activity pill on top of fullscreen-landscape
+        // app content, so the LA buffer isn't needed there, and the
+        // floor only has to clear a hypothetical hardware camera or
+        // rounded-corner insets (~20pt is plenty).
+        let hasNotchOrDI = reported > 40
+        let laBuffer: CGFloat = (hasNotchOrDI && !isLandscape) ? 28 : 0
+        // 20pt floor in landscape keeps the chrome visually snug against
+        // the top edge of the video without crowding the camera cutout.
+        // 70pt floor in portrait continues to clear the status-bar row
+        // and give the LA buffer room to breathe below.
+        let floor: CGFloat = isLandscape ? 20 : 70
+        return max(reported, floor) + laBuffer
+    }
+
+    private var deviceSafeAreaLeading: CGFloat {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }?
+            .safeAreaInsets.left ?? 0
+    }
+
+    private var deviceSafeAreaBottom: CGFloat {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }?
+            .safeAreaInsets.bottom ?? 0
+    }
+
+    // MARK: - Timeline helpers
+
+    /// The right end of the seekable timeline, in ms.
+    ///
+    /// - Regular VOD: mpv's reported `duration` (a fixed file length).
+    /// - DVR (in-progress recording): the live edge of a growing HLS
+    ///   window. mpv's `duration` tracks the published-playlist extent,
+    ///   which only grows; flooring it at `currentMs` keeps the bar from
+    ///   ever sitting left of the playhead during a playlist-refresh
+    ///   wobble. The right edge therefore represents "live".
+    /// Live Rewind: this player is live with a rolling buffer session,
+    /// so the timeline spans the rewind window instead of a programme.
+    private var isLiveRewindMode: Bool {
+        isLive && catchup == nil && liveRewind.buffering
+    }
+
+    private var timelineEndMs: Int32 {
+        // Catch-up: the timeline is ALWAYS the programme's real length.
+        // The bounded timeshift TS reports an unreliable (estimated)
+        // duration, and each re-tune resets mpv's clock, so neither is
+        // allowed to drive the scrubber's right edge.
+        if let cu = catchup { return cu.programDurationMs }
+        // Live Rewind: the window is [buffer tail .. live edge]; the
+        // right edge is "live" exactly like the DVR growing window.
+        if isLiveRewindMode {
+            return Int32(clamping: max(Int64(1), liveRewind.headWallMs - liveRewind.tailWallMs))
+        }
+        if isDVR { return max(progressStore.durationMs, progressStore.currentMs) }
+        return progressStore.durationMs
+    }
+
+    /// For VOD: once player reports a non-zero duration.
+    private var canSeekBackward: Bool {
+        timelineEndMs > 0 && progressStore.currentMs > 2_000
+    }
+
+    private var canSeekForward: Bool {
+        timelineEndMs > 0 && progressStore.currentMs < timelineEndMs - 2_000
+    }
+
+    private func formatMs(_ ms: Int32) -> String {
+        let total = Int(ms / 1_000)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s)
+                     : String(format: "%d:%02d", m, s)
+    }
+
+    // MARK: - Scrubber bar
+
+    /// Converts a scrubber fraction (0–1) to a target seek position in ms.
+    private func fractionToMs(_ fraction: CGFloat) -> Int32 {
+        guard timelineEndMs > 0 else { return 0 }
+        return Int32(fraction * CGFloat(timelineEndMs))
+    }
+
+    /// Converts the current playback position to a 0–1 scrubber fraction.
+    private var currentFraction: CGFloat {
+        guard timelineEndMs > 0 else { return 0 }
+        return CGFloat(progressStore.currentMs) / CGFloat(timelineEndMs)
+    }
+
+    /// True when the timeline can accept drag/seek gestures.
+    private var isScrubberActive: Bool {
+        timelineEndMs > 0
+    }
+
+    private var scrubberBar: some View {
+        // Position holds at the drag fraction both while dragging AND while
+        // settling (post-release, until mpv catches up). Thumb SIZE keys off
+        // isDragging alone, so it shrinks the instant the finger lifts.
+        let displayFraction: CGFloat = (isDragging || dragSettling) ? dragFraction : max(0, min(1, currentFraction))
+
+        return GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                // Track
+                Capsule()
+                    .fill(Color.white.opacity(0.25))
+                    .frame(height: isDragging ? 5 : 3)
+
+                // Filled portion
+                Capsule()
+                    .fill(Color.accentPrimary)
+                    .frame(width: geo.size.width * max(0, min(1, displayFraction)),
+                           height: isDragging ? 5 : 3)
+
+                // Thumb, shown once the timeline is interactive
+                if isScrubberActive {
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: isDragging ? 18 : 13, height: isDragging ? 18 : 13)
+                        .shadow(color: .black.opacity(0.4), radius: 3)
+                        .offset(x: geo.size.width * max(0, min(1, displayFraction))
+                                    - (isDragging ? 9 : 6.5))
+                }
+            }
+            .frame(height: 22)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard isScrubberActive else { return }
+                        dragSettleTask?.cancel()  // a fresh drag supersedes any settle
+                        dragSettling = false
+                        isDragging = true
+                        dragFraction = max(0, min(1, value.location.x / geo.size.width))
+                        scheduleControlsHide()
+                    }
+                    .onEnded { value in
+                        guard isScrubberActive else { return }
+                        let f = max(0, min(1, value.location.x / geo.size.width))
+                        let target = fractionToMs(f)
+                        dragFraction = f
+                        progressStore.seekAction?(target)
+                        withAnimation(.easeOut(duration: 0.15)) { isDragging = false }
+                        // Hold the bar at the released position until mpv's
+                        // reported position lands within a GOP of the target
+                        // (keyframe seeks land a little short), then release
+                        // it onto the real position instead of snapping back.
+                        dragSettling = true
+                        dragSettleTask?.cancel()
+                        dragSettleTask = Task { @MainActor in
+                            for _ in 0..<75 {  // ~6s backstop at 80ms/iter
+                                if Task.isCancelled { return }
+                                if abs(Int64(progressStore.currentMs) - Int64(target)) < 4_000 { break }
+                                try? await Task.sleep(nanoseconds: 80_000_000)
+                            }
+                            guard !Task.isCancelled else { return }
+                            dragSettling = false
+                        }
+                    }
+            )
+        }
+        .frame(height: 22)
+        .animation(.easeInOut(duration: 0.12), value: isDragging)
+    }
+
+
+    // MARK: - Bottom controls (timeline + skip buttons)
+
+    /// Control-row geometry: cell spacing, and the fixed-width slot the
+    /// center (Pause) cell occupies so its label width never moves the
+    /// screen center (Logan 2026-09-11).
+    private static let tvToolCellSpacing: CGFloat = 18
+    private static let tvCenterCellSlot: CGFloat = 120
+
+    private var bottomControls: some View {
+        VStack(spacing: 10) {
+
+            // Live streams: program progress bar. VOD: scrubber + skip
+            // buttons. Live Rewind: the scrubber transport over the
+            // buffer window (cable-DVR model), same as VOD/DVR.
+            if isLive && !isLiveRewindMode {
+                liveProgressSection
+            } else {
+                vodControlsSection
+            }
+
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, deviceSafeAreaBottom + 20)
+        .background(
+            LinearGradient(
+                colors: [Color.clear, Color.black.opacity(0.72)],
+                startPoint: .top, endPoint: .bottom
+            )
+            .ignoresSafeArea(edges: .bottom)
+        )
+    }
+
+    // MARK: - Live Progress (program progress bar based on start/end times)
+    private var liveProgressSection: some View {
+        VStack(spacing: 6) {
+            if let start = subtitleStart, let end = subtitleEnd {
+                let now = Date()
+                let total = end.timeIntervalSince(start)
+                let elapsed = now.timeIntervalSince(start)
+                let fraction = total > 0 ? min(1, max(0, elapsed / total)) : 0
+                let remaining = max(0, end.timeIntervalSince(now))
+
+                // Progress bar + (tvOS) leading play/pause indicator.
+                // The indicator is NON-FOCUSABLE on tvOS, Siri
+                // Remote's hardware Play/Pause button drives the
+                // actual toggle; this is purely visual feedback.
+                HStack(spacing: 12) {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(Color.white.opacity(0.2))
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(Color.accentPrimary)
+                                .frame(width: geo.size.width * fraction)
+                        }
+                    }
+                    .frame(height: 6)
+                }
+
+                // Time remaining
+                HStack {
+                    if let prog = subtitle, !prog.isEmpty {
+                        Text(prog)
+                            .scaledFont(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.8))
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    let mins = Int(remaining / 60)
+                    Text(mins > 0 ? "\(mins) min remaining" : "Ending soon")
+                        .scaledFont(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.6))
+                }
+            }
+        }
+    }
+
+    /// tvOS: timeline band inset matching the unified live chrome's
+    /// 80pt (this section already carries a 20pt section inset).
+    private var tvBandInset: CGFloat {
+        return 0
+    }
+
+    // MARK: - VOD Controls (scrubber + skip + time labels)
+    private var vodControlsSection: some View {
+        VStack(spacing: 8) {
+            scrubberBar
+
+            HStack(spacing: 0) {
+                let leftMs: Int32 = isDragging
+                    ? fractionToMs(dragFraction)
+                    : progressStore.currentMs
+                Text(formatMs(leftMs))
+                    .scaledFont(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.75))
+                    .frame(minWidth: 46, alignment: .leading)
+                    .monospacedDigit()
+
+                Spacer()
+
+                // Skip back by the Skip Intervals setting (iOS only; tvOS uses the scrubber)
+                Button {
+                    let target = max(0, progressStore.currentMs - SkipIntervals.backMs)
+                    progressStore.seekAction?(target)
+                    scheduleControlsHide()
+                } label: {
+                    Image(systemName: SkipIntervals.backSymbol(skipBackSeconds))
+                        .font(.system(size: 22, weight: .medium))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundColor(.white)
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel(SkipIntervals.backLabel(skipBackSeconds))
+                .opacity(canSeekBackward ? 1 : 0.3)
+                .disabled(!canSeekBackward)
+
+                Spacer().frame(width: 32)
+
+                // Skip forward by the Skip Intervals setting (iOS only)
+                Button {
+                    let target = timelineEndMs > 0
+                        ? min(timelineEndMs, progressStore.currentMs + SkipIntervals.forwardMs)
+                        : progressStore.currentMs + SkipIntervals.forwardMs
+                    progressStore.seekAction?(target)
+                    scheduleControlsHide()
+                } label: {
+                    Image(systemName: SkipIntervals.forwardSymbol(skipForwardSeconds))
+                        .font(.system(size: 22, weight: .medium))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundColor(.white)
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel(SkipIntervals.forwardLabel(skipForwardSeconds))
+                .opacity(canSeekForward ? 1 : 0.3)
+                .disabled(!canSeekForward)
+
+                Spacer()
+
+                timelineTrailingLabel
+            }
+            .padding(.horizontal, tvBandInset)
+
+        }
+        // YouTube-style scrub readout: a floating bubble above the bar
+        // showing exactly where a scrub will land + how far that is from
+        // the live/current position. Overlay (not a row) so it never
+        // shifts the timeline; it fades in only while scrubbing.
+        .overlay(alignment: .top) { scrubReadout }
+        .animation(.easeInOut(duration: 0.18), value: scrubReadoutActive)
+    }
+
+    /// The position the scrub readout + landing reflect: the preview
+    /// target while the user is actively scrubbing, otherwise the live
+    /// playback position. iOS drives it from the drag fraction, tvOS
+    /// from the step preview.
+    private var scrubReadoutTargetMs: Int32 {
+        return isDragging ? fractionToMs(dragFraction) : progressStore.currentMs
+    }
+
+    /// True while the user is moving the playhead (drag on iOS, step on
+    /// tvOS) and the readout bubble should be shown.
+    private var scrubReadoutActive: Bool {
+        return isDragging
+    }
+
+    /// "+2:30" / "-0:45": the signed offset of the scrub target from the
+    /// current playback position, for the readout's secondary line.
+    private func signedDelta(_ ms: Int64) -> String {
+        let sign = ms < 0 ? "-" : "+"
+        return sign + formatMs(Int32(min(Int64(Int32.max), abs(ms))))
+    }
+
+    @ViewBuilder
+    private var scrubReadout: some View {
+        if scrubReadoutActive {
+            let target = scrubReadoutTargetMs
+            let delta = Int64(target) - Int64(progressStore.currentMs)
+            VStack(spacing: 2) {
+                Text(formatMs(target))
+                    .scaledFont(.system(size: 17, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white)
+                    .monospacedDigit()
+                Text(signedDelta(delta))
+                    .scaledFont(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(delta < 0 ? Color.orange : Color.green)
+                    .monospacedDigit()
+            }
+            .padding(.horizontal, 14).padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.15), lineWidth: 1))
+            .offset(y: -52)
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+        }
+    }
+
+    /// Right-hand timeline readout. Regular VOD shows the total runtime.
+    /// DVR (in-progress recording) shows a LIVE pill: a filled red dot
+    /// when the playhead is riding the live edge, a hollow gray dot when
+    /// the user has scrubbed back into the window. The pill's right edge
+    /// is "live", so scrubbing all the way right (or tapping it on iOS)
+    /// returns to the live edge.
+    @ViewBuilder
+    private var timelineTrailingLabel: some View {
+        // scrubReadoutTargetMs already resolves the active scrub/drag
+        // preview per-platform (tvOS step state vs iOS drag fraction).
+        let displayMs = scrubReadoutTargetMs
+        let atLive = timelineEndMs > 0 && displayMs >= timelineEndMs - 15_000
+        if isLiveRewindMode {
+            // Live Rewind (locked layout): LIVE at the timeline's right
+            // edge, or the behind-live countdown while rewound. Tap =
+            // Go Live (seek to the window end snaps to the live relay).
+            let behindMs = max(0, timelineEndMs - displayMs)
+            HStack(spacing: 5) {
+                if behindMs <= 15_000 {
+                    Circle().fill(Color.red).frame(width: 8, height: 8)
+                }
+                Text(behindMs > 15_000
+                     ? String(format: "-%d:%02d", behindMs / 60_000, (behindMs / 1000) % 60)
+                     : "LIVE")
+                    .scaledFont(.system(size: 11, weight: .semibold))
+                    .foregroundColor(behindMs > 15_000 ? .white.opacity(0.8) : .white)
+                    .monospacedDigit()
+            }
+            .frame(minWidth: 46, alignment: .trailing)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                progressStore.seekAction?(timelineEndMs)
+                scheduleControlsHide()
+            }
+        } else if isDVR {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(atLive ? Color.red : Color.white.opacity(0.4))
+                    .frame(width: 8, height: 8)
+                Text("LIVE")
+                    .scaledFont(.system(size: 11, weight: .semibold))
+                    .foregroundColor(atLive ? .white : .white.opacity(0.55))
+            }
+            .frame(minWidth: 46, alignment: .trailing)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                progressStore.seekAction?(timelineEndMs)
+                scheduleControlsHide()
+            }
+        } else {
+            Text(formatMs(timelineEndMs))
+                .scaledFont(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundColor(.white.opacity(0.75))
+                .frame(minWidth: 46, alignment: .trailing)
+                .monospacedDigit()
+        }
+    }
+
+    // MARK: - Controls Overlay
+    private var controlsOverlay: some View {
+        ZStack {
+            VStack(spacing: 0) {
+                VStack(spacing: 8) {
+                    // Swipe-down handle, hints that dragging down minimizes
+                    Capsule()
+                        .fill(Color.white.opacity(0.35))
+                        .frame(width: 36, height: 4)
+                        .padding(.top, deviceSafeAreaTop + 8)
+
+                    // Top bar
+                    HStack(alignment: .center, spacing: 12) {
+                        // Stop / close button (far left), tvOS uses the Menu button instead
+                        liquidButton(systemName: "xmark", tint: .white) { onDismiss() }
+
+                        // Title + optional current-program subtitle
+                        VStack(alignment: .leading, spacing: 2) {
+                        if showCardChannelName {
+                        Text(title)
+                            .scaledFont(.headline)
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .shadow(color: .black.opacity(0.6), radius: 4)
+                        }
+
+                        // Program Name / Program Time are independent
+                        // rows (Player Info Card settings); the block
+                        // still only exists when program data does.
+                        if let prog = subtitle, !prog.isEmpty,
+                           showCardProgramName || showCardProgramTime {
+                            VStack(alignment: .leading, spacing: 2) {
+                                if showCardProgramName {
+                                    Text(prog)
+                                        .lineLimit(1)
+                                }
+                                // Time range line: show "HH:MM – HH:MM" when both times known,
+                                // "ends HH:MM" when only end time available.
+                                if showCardProgramTime {
+                                Group {
+                                    if let start = subtitleStart, let end = subtitleEnd {
+                                        HStack(spacing: 3) {
+                                            Text(start, style: .time)
+                                            Text("–")
+                                            Text(end, style: .time)
+                                        }
+                                    } else if let end = subtitleEnd {
+                                        HStack(spacing: 3) {
+                                            Text("ends")
+                                            Text(end, style: .time)
+                                        }
+                                    }
+                                }
+                                .lineLimit(1)
+                                }
+                            }
+                            .scaledFont(.system(size: 12, weight: .regular))
+                            .foregroundColor(.white.opacity(0.72))
+                            .shadow(color: .black.opacity(0.5), radius: 3)
+                        }
+
+                        // Episode title + synopsis (Android parity).
+                        // Independent toggles, each drawn only when the
+                        // caller supplied text, so nothing reserves space.
+                        if showCardProgramSubtitle,
+                           let sub = programSubtitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !sub.isEmpty {
+                            Text(sub)
+                                .scaledFont(.system(size: 13, weight: .medium).subtext())
+                                .italic()
+                                .foregroundColor(.white.opacity(0.72))
+                                .lineLimit(1)
+                                .shadow(color: .black.opacity(0.5), radius: 3)
+                        }
+                        if showCardProgramDescription,
+                           let desc = programDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !desc.isEmpty {
+                            Text(desc)
+                                .scaledFont(.system(size: 11).subtext())
+                                .lineLimit(2)
+                                .foregroundColor(.white.opacity(0.62))
+                                .fixedSize(horizontal: false, vertical: true)
+                                .shadow(color: .black.opacity(0.5), radius: 3)
+                        }
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 10) {
+                        // Full-screen / force-landscape toggle. Lets users who
+                        // lock their device to portrait force landscape playback
+                        // without turning off their rotation lock. Tap again to
+                        // release back to the device orientation.
+                        liquidButton(systemName: forcedLandscape
+                                     ? "arrow.down.right.and.arrow.up.left"
+                                     : "arrow.up.left.and.arrow.down.right",
+                                     tint: .white) {
+                            forcedLandscape.toggle()
+                            requestOrientation(landscape: forcedLandscape)
+                        }
+                        // Overflow menu, all secondary controls
+                        playerOverflowMenu
+
+                        // "+" add-stream button, iPad only. Screen is
+                        // too narrow on iPhone for a usable 2×2 grid,
+                        // let alone 3×3 (see plan's iPhone out-of-scope
+                        // note). Tapping opens the channel picker,
+                        // which on pick seeds tile 0 with the current
+                        // channel + adds the picked one as tile 1.
+                        if UIDevice.current.userInterfaceIdiom == .pad {
+                            addStreamButton
+                        }
+                        // AirPlay moved into the overflow menu, the
+                        // `AirPlayMenuTrigger` helper keeps a hidden
+                        // AVRoutePickerView in the key window so the
+                        // menu item can still present the system picker.
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 18)
+            }
+            .background(
+                LinearGradient(
+                    colors: [Color.black.opacity(0.65), Color.clear],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .ignoresSafeArea(edges: .top)
+            )
+
+                Spacer()
+
+                bottomControls
+            }
+
+            // Center play/pause button, iOS / iPadOS only. tvOS
+            // users press Play/Pause on the Siri Remote (hardware
+            // button); the on-screen play/pause state is surfaced as
+            // a small indicator next to the timeline instead, which
+            // keeps the center of the video unobstructed.
+            centerPlayPauseButton
+        }
+    }
+
+    /// GH #76: a recording playing in this cover (DVR tab legacy path).
+    private var isRecordingPlayback: Bool { vodType == "recording" && !isLive }
+
+    /// GH #76: hand the recording to Multiview as tile 0 at the current
+    /// position, close this cover, and let the container open its add
+    /// sheet for the second stream.
+    private func enterMultiviewFromRecording() {
+        guard let url = urls.first else { return }
+        let entered = PlayerSession.shared.enterMultiview(
+            seedingRecording: title, streamURL: url, headers: headers,
+            isDVR: isDVR, vodID: vodID, serverID: vodServerID,
+            positionMs: progressStore.currentMs)
+        if entered { onDismiss() }
+    }
+
+    // MARK: - Player Overflow Menu (ellipsis)
+
+    /// iPad-only `+` button. Mirrors the AirPlay button's 52×52
+    /// ultraThinMaterial chrome so the iPad top bar has three
+    /// matching circular buttons (overflow / `+` / AirPlay).
+    ///
+    /// Presents `AddToMultiviewSheet` **on top of the live PlayerView**
+    /// crucially without touching `PlayerSession.mode`. The current
+    /// stream keeps playing behind the sheet. Only when the user
+    /// commits (picks a channel) does the sheet call
+    /// `PlayerSession.enterMultiview(...)` to seed tile 0 and flip
+    /// into multiview. That's where the view swap happens, after
+    /// the user has made a deliberate choice, not at button-tap.
+    ///
+    /// The earlier design flipped mode on tap + relied on a pending
+    /// flag to auto-open the picker from the newly-mounted
+    /// `MultiviewContainerView`; observed on-device it torched the
+    /// live MPV instance twice (PlayerView's teardown + the seed
+    /// tile's cold-start), stalled the main thread 1.5-6s, and the
+    /// picker sometimes never presented because SwiftUI was still
+    /// churning on the view swap. Keeping the sheet owned by
+    /// PlayerView avoids all of that, the sheet is just an overlay
+    /// on an otherwise-untouched view tree.
+    private var addStreamButton: some View {
+        Button {
+            if isRecordingPlayback {
+                enterMultiviewFromRecording()
+            } else {
+                showAddStreamSheet = true
+            }
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(.ultraThinMaterial)
+                    .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                    .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+                Image(systemName: "plus")
+                    .font(.system(size: 22, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 52, height: 52)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Add stream")
+        .accessibilityHint("Pick another channel to watch alongside this one")
+    }
+
+
+    private var playerOverflowMenu: some View {
+        PlayerOverflowMenu(
+            versionOptions: progressStore.vodVersionOptions,
+            currentVersionOptionID: progressStore.currentVersionOptionID,
+            switchVersionAction: progressStore.switchVersionAction == nil
+                ? nil
+                : { [weak progressStore] in progressStore?.switchVersionAction?($0) },
+            audioTracks: progressStore.audioTracks,
+            currentAudioTrackID: progressStore.currentAudioTrackID,
+            subtitleTracks: progressStore.subtitleTracks,
+            currentSubtitleTrackID: progressStore.currentSubtitleTrackID,
+            speed: progressStore.speed,
+            isLive: isLive,
+            sleepTimerEnd: sleepTimerEnd,
+            showStreamInfo: showStreamInfo,
+            isAudioOnly: isAudioOnly,
+            aspectMode: progressStore.aspectMode,
+            // Legacy single-stream PlayerView doesn't have record-sheet
+            // plumbing (it's only reached with the Developer-Settings
+            // `playback.unified` flag flipped off, a diagnostic fallback).
+            // Record lives in the unified chrome, which users hit by
+            // default. Keep this false here so the menu stays clean on
+            // the legacy path.
+            canRecord: false,
+            audioSyncMs: progressStore.audioSyncMs,
+            setAudioTrack: { [weak progressStore] in progressStore?.setAudioTrackAction?($0) },
+            setAudioSync: progressStore.setAudioSyncAction == nil
+                ? nil
+                : { [weak progressStore] in progressStore?.setAudioSyncAction?($0) },
+            setSubtitleTrack: { [weak progressStore] in progressStore?.setSubtitleTrackAction?($0) },
+            setSpeed: { [weak progressStore] in progressStore?.setSpeedAction?($0) },
+            setVideoScale: { progressStore.setVideoScale($0) },
+            setSleepTimer: { sleepTimerEnd = $0 },
+            toggleStreamInfo: { withAnimation(.easeInOut(duration: 0.2)) { showStreamInfo.toggle() } },
+            recordAction: nil,
+            onMenuOpen: { controlsHideTask?.cancel() },
+            onMenuClose: { if !progressStore.isPaused { scheduleControlsHide() } }
+        )
+        .equatable()
+    }
+
+    // MARK: - Audio Track Menu (legacy, now used inside overflow menu)
+
+    private var audioTrackMenu: some View {
+        Menu {
+            ForEach(progressStore.audioTracks) { track in
+                Button {
+                    progressStore.setAudioTrackAction?(track.id)
+                } label: {
+                    if track.id == progressStore.currentAudioTrackID {
+                        Label(track.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(track.displayName)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "waveform.circle")
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .frame(width: 52, height: 52)
+                .foregroundColor(.white)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+
+    // MARK: - Subtitle Track Menu
+
+    private var subtitleTrackMenu: some View {
+        Menu {
+            Button {
+                progressStore.setSubtitleTrackAction?(0)
+            } label: {
+                if progressStore.currentSubtitleTrackID == 0 {
+                    Label("Off", systemImage: "checkmark")
+                } else {
+                    Text("Off")
+                }
+            }
+            ForEach(progressStore.subtitleTracks) { track in
+                Button {
+                    progressStore.setSubtitleTrackAction?(track.id)
+                } label: {
+                    if track.id == progressStore.currentSubtitleTrackID {
+                        Label(track.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(track.displayName)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "captions.bubble")
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .frame(width: 52, height: 52)
+                .foregroundColor(progressStore.currentSubtitleTrackID != 0 ? Color.accentPrimary : .white)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+
+    /// Cycles through playback speed options (0.5x → 0.75x → 1x → 1.25x → 1.5x → 2x).
+    private var speedButton: some View {
+        Button {
+            let speeds = PlayerProgressStore.speedOptions
+            let currentIdx = speeds.firstIndex(of: progressStore.speed) ?? 2
+            let nextIdx = (currentIdx + 1) % speeds.count
+            progressStore.setSpeedAction?(speeds[nextIdx])
+        } label: {
+            let label = progressStore.speed == 1.0 ? "1x" : String(format: "%gx", progressStore.speed)
+            Text(label)
+                .scaledFont(.system(size: 14, weight: .bold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .frame(width: 52, height: 52)
+                .foregroundColor(progressStore.speed == 1.0 ? .white : Color.accentPrimary)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+
+    // MARK: - Sleep Timer Menu
+
+    private var sleepTimerMenu: some View {
+        Menu {
+            if sleepTimerEnd != nil {
+                Button(role: .destructive) {
+                    sleepTimerEnd = nil
+                } label: {
+                    Label("Cancel Timer", systemImage: "xmark")
+                }
+            }
+            ForEach([30, 60, 90, 120], id: \.self) { minutes in
+                Button {
+                    sleepTimerEnd = Date().addingTimeInterval(Double(minutes) * 60)
+                } label: {
+                    Label("\(minutes) minutes", systemImage: minutes == 30 ? "moon" : minutes == 60 ? "moon.fill" : minutes == 90 ? "moon.stars" : "moon.stars.fill")
+                }
+            }
+        } label: {
+            VStack(spacing: 2) {
+                // Sleep timer circle: fixed-size control, glyph and countdown stay fixed.
+                Image(systemName: sleepTimerEnd != nil ? "moon.zzz.fill" : "moon.zzz")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundColor(sleepTimerEnd != nil ? Color.accentPrimary : .white)
+
+                if let remaining = sleepTimerRemainingText {
+                    Text(remaining)
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(Color.accentPrimary)
+                }
+            }
+            .frame(width: 52, height: 52)
+            .background(.ultraThinMaterial, in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+            .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+
+    private var sleepTimerRemainingText: String? {
+        guard let end = sleepTimerEnd else { return nil }
+        let remaining = end.timeIntervalSince(Date())
+        guard remaining > 0 else { return nil }
+        let mins = Int(remaining / 60)
+        if mins >= 60 {
+            let h = mins / 60
+            let m = mins % 60
+            return m > 0 ? "\(h)h\(m)m" : "\(h)h"
+        }
+        return "\(mins)m"
+    }
+
+    // MARK: - Stream Info Overlay
+
+    /// v1.6.15.x: thin wrapper that delegates to the standalone
+    /// `StreamInfoCardView` (defined alongside `StreamInfo` near the
+    /// top of this file). The card itself is reusable across both
+    /// the legacy single-stream path (this view) and the unified
+    /// multiview path (`MultiviewContainerView`).
+    private var streamInfoOverlay: some View {
+        StreamInfoCardView(info: progressStore.streamInfo)
+    }
+
+    /// Force the window orientation. `landscape` rotates into (and pins)
+    /// landscape even when the device is rotation-locked to portrait,
+    /// because the app's Info.plist permits landscape. Passing false
+    /// releases the lock back to the device's own orientation. iOS 16+.
+    /// On iPad-on-Mac this is a no-op (Mac windows do not rotate; use the
+    /// window's full-screen control there).
+    private func requestOrientation(landscape: Bool) {
+        // Route through the shared AppOrientationLock so the AppDelegate's
+        // reported mask is updated too (issue #38). requestGeometryUpdate
+        // alone cannot override an engaged rotation lock without that mask.
+        AppOrientationLock.apply(landscape: landscape)
+    }
+
+    private func liquidButton(
+        systemName: String,
+        tint: Color = .white,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundColor(tint)
+                .frame(width: 52, height: 52)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+
+    private func startPlayback() async {
+        logStore.reset()
+        logStore.append("ℹ️ Player: MPV (libmpv)")
+        // Set VOD resume info on progressStore so the coordinator can save/restore progress
+        progressStore.vodID = vodID
+        progressStore.vodTitle = title
+        progressStore.vodPosterURL = vodPosterURL
+        progressStore.vodStreamURL = urls.first?.absoluteString
+        progressStore.vodServerID = vodServerID
+        progressStore.vodType = vodType
+        progressStore.explicitResumeMs = resumePositionMs
+        // v1.8.17: seed the version-switch menu. Current selection is
+        // whichever option matches the launch URL (nil = Auto).
+        progressStore.vodVersionOptions = vodVersionOptions
+        // Identify the copy being played from the caller's explicit choice.
+        // Matching URLs cannot work here: the detail view resolves the proxy
+        // redirect before launching, so `urls.first` is the one-shot session
+        // URL (/proxy/vod/movie/<uuid>/vod_<session>) and never equals the
+        // option URL. The URL match stays as a fallback for callers that
+        // hand over an unresolved option URL.
+        progressStore.vodVersionSelectionKey = vodVersionSelectionKey
+        progressStore.currentVersionOptionID = vodSelectedVersionID
+            ?? vodVersionOptions.first { $0.url.absoluteString == urls.first?.absoluteString }?.id
+        state = .playing
+        scheduleControlsHide()
+    }
+
+    /// Compact, NON-INTERACTIVE play/pause state indicator for tvOS.
+    ///
+    /// Rendered inline with the timeline (left of the progress bar /
+    /// scrubber) so the user has a clear visual of whether playback
+    /// is currently running. It deliberately does NOT accept focus:
+    /// the Siri Remote's hardware Play/Pause button fires
+    /// `playPauseTapped` via `TVRemoteInputView` → `togglePauseAction`
+    /// and the user doesn't need a focusable on-screen equivalent.
+    /// Omitting it from the focus chain also keeps the focus engine
+    /// from requiring an extra left-then-right D-pad step to reach
+    /// the scrubber.
+    ///
+    /// The icon matches current state (not the action): `pause.fill`
+    /// while paused, `play.fill` while playing. Read it as "the
+    /// stream is currently X".
+
+    private var centerPlayPauseButton: some View {
+        Button {
+            progressStore.togglePauseAction?()
+            if !progressStore.isPaused {
+                scheduleControlsHide()
+            } else {
+                controlsHideTask?.cancel()
+            }
+        } label: {
+            Image(systemName: progressStore.isPaused ? "play.fill" : "pause.fill")
+                .font(.system(size: 28, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundColor(.white)
+                .frame(width: 72, height: 72)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+        }
+        .animation(.easeInOut(duration: 0.15), value: progressStore.isPaused)
+    }
+
+    private func scheduleControlsHide() {
+        // Cancel FIRST: bailing out before the cancel (paused, scrubbing)
+        // used to leave an older task running, which then fired early -
+        // one of the "controls vanish too soon" paths (Logan 2026-09-11).
+        controlsHideTask?.cancel()
+        guard !progressStore.isPaused else { return }
+        controlsHideTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(playerChromeFadeSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.3)) { showControls = false }
+            }
+        }
+    }
+
+
+}
+
+/// Kept Live rows for the player's Options menu: one submenu per kept
+/// channel (Watch, Stop) plus Stop All when more than one is kept.
+struct KeptLiveMenuSection: View {
+    @ObservedObject private var kept = KeptLiveChannels.shared
+
+    var body: some View {
+        if !kept.channels.isEmpty {
+            Section("Kept Live") {
+                ForEach(kept.channels) { ch in
+                    Menu {
+                        Button {
+                            KeptLiveChannels.shared.tune(ch)
+                        } label: {
+                            Label("Watch \(ch.name)", systemImage: "play.tv")
+                        }
+                        Button(role: .destructive) {
+                            LiveChannelRetention.shared.releaseByUser(channelID: ch.id)
+                        } label: {
+                            Label("Stop", systemImage: "xmark.circle")
+                        }
+                    } label: {
+                        Label(ch.name, systemImage: "rectangle.stack.badge.play")
+                    }
+                }
+                if kept.channels.count > 1 {
+                    Button(role: .destructive) {
+                        LiveChannelRetention.shared.releaseAllByUser()
+                    } label: {
+                        Label("Stop All", systemImage: "xmark.circle")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Player Overflow Menu (isolated from rapid progress updates)
+
+/// Extracted into its own Equatable view so that high-frequency
+/// `PlayerProgressStore` publishes (position, stream-info, buffer) don't
+/// cause the system Menu popover to flicker.  SwiftUI skips re-rendering
+/// when all Equatable inputs are unchanged.
+struct PlayerOverflowMenu: View, Equatable {
+    // Value properties, used for rendering AND equality comparison.
+    /// v1.8.17 VOD version switching: provider-copy options + current
+    /// selection. Empty options hide the row (single provider, XC/M3U,
+    /// live). Defaults keep the other call sites (unified chrome) source-
+    /// compatible.
+    var versionOptions: [VODVersionOption] = []
+    var currentVersionOptionID: Int? = nil
+    /// Same presence-gates-row + `nonisolated(unsafe)` contract as
+    /// `switchStreamAction` below.
+    nonisolated(unsafe) var switchVersionAction: ((VODVersionOption) -> Void)?
+    let audioTracks: [MediaTrack]
+    let currentAudioTrackID: Int
+    let subtitleTracks: [MediaTrack]
+    let currentSubtitleTrackID: Int
+    let speed: Double
+    let isLive: Bool
+    let sleepTimerEnd: Date?
+    let showStreamInfo: Bool
+    let isAudioOnly: Bool
+    /// Current on-screen aspect mode (issue #26), shown as the Video
+    /// Scale row's current value.
+    let aspectMode: VideoAspectMode
+    /// When true, the menu shows a "Record Current Program" item that
+    /// fires `recordAction`. Gated off the audio tile's live EPG state
+    /// in the unified chrome so it hides for streams without EPG data.
+    let canRecord: Bool
+    /// Task #184: current audio sync offset in ms (positive = audio
+    /// later). The Audio Sync submenu shows only when `setAudioSync`
+    /// is non-nil (mpv engine; AVPlayer has no delay knob).
+    let audioSyncMs: Int
+
+    // Action closures, excluded from equality check.
+    var setAudioTrack: ((Int) -> Void)?
+    /// Task #184: same presence-gates-row pattern as switchStreamAction.
+    nonisolated(unsafe) var setAudioSync: ((Int) -> Void)?
+    var setSubtitleTrack: ((Int) -> Void)?
+    var setSpeed: ((Double) -> Void)?
+    /// Video Scale: cycles Fit / Fill / Stretch and persists globally.
+    /// nil hides the row.
+    var setVideoScale: ((VideoAspectMode) -> Void)?
+    var setSleepTimer: ((Date?) -> Void)?
+    var toggleStreamInfo: (() -> Void)?
+    var recordAction: (() -> Void)?
+    /// Switch Stream (Dispatcharr Direct Connect, admin only). When the
+    /// caller supplies a non-nil closure the menu shows a "Switch Stream"
+    /// row; nil hides it (non-Dispatcharr / non-admin / no channel ids).
+    /// `nonisolated(unsafe)` so the `nonisolated ==` can read its nil-ness
+    /// (the PRESENCE of the action gates the row, so it must affect equality)
+    /// without Xcode 27's strict-concurrency warning about referencing a
+    /// main-actor non-Sendable closure from the `&&` autoclosure. Safe: `==`
+    /// only reads nil-ness (on the main actor during view diffing), and the
+    /// closure is only ever INVOKED from `body`, also on the main actor.
+    nonisolated(unsafe) var switchStreamAction: (() -> Void)?
+    /// Radio Mode: presence gates the row (same contract as above).
+    nonisolated(unsafe) var radioModeAction: (() -> Void)? = nil
+    var onMenuOpen: (() -> Void)?
+    var onMenuClose: (() -> Void)?
+
+    // Only compare the data that affects rendering, skip closures.
+    nonisolated static func == (lhs: PlayerOverflowMenu, rhs: PlayerOverflowMenu) -> Bool {
+        lhs.audioTracks == rhs.audioTracks &&
+        lhs.currentAudioTrackID == rhs.currentAudioTrackID &&
+        lhs.subtitleTracks == rhs.subtitleTracks &&
+        lhs.currentSubtitleTrackID == rhs.currentSubtitleTrackID &&
+        lhs.speed == rhs.speed &&
+        lhs.isLive == rhs.isLive &&
+        lhs.sleepTimerEnd == rhs.sleepTimerEnd &&
+        lhs.showStreamInfo == rhs.showStreamInfo &&
+        lhs.isAudioOnly == rhs.isAudioOnly &&
+        lhs.aspectMode == rhs.aspectMode &&
+        lhs.canRecord == rhs.canRecord &&
+        lhs.audioSyncMs == rhs.audioSyncMs &&
+        // Closures are excluded from ==, but the PRESENCE of the Switch
+        // Stream action gates whether the row shows, so compare its
+        // nil-ness so eligibility changes still re-render the menu.
+        (lhs.switchStreamAction == nil) == (rhs.switchStreamAction == nil) &&
+        (lhs.radioModeAction == nil) == (rhs.radioModeAction == nil) &&
+        (lhs.setAudioSync == nil) == (rhs.setAudioSync == nil) &&
+        lhs.versionOptions == rhs.versionOptions &&
+        lhs.currentVersionOptionID == rhs.currentVersionOptionID &&
+        (lhs.switchVersionAction == nil) == (rhs.switchVersionAction == nil)
+    }
+
+    /// Task #184: "+0.25 s" style label for the Audio Sync submenu.
+    private var audioSyncLabel: String {
+        audioSyncMs == 0 ? "0 ms" : String(format: "%+d ms", audioSyncMs)
+    }
+
+    private var sleepTimerRemainingText: String? {
+        guard let end = sleepTimerEnd else { return nil }
+        let remaining = end.timeIntervalSince(Date())
+        guard remaining > 0 else { return nil }
+        let mins = Int(remaining / 60)
+        if mins >= 60 {
+            let h = mins / 60
+            let m = mins % 60
+            return m > 0 ? "\(h)h\(m)m" : "\(h)h"
+        }
+        return "\(mins)m"
+    }
+
+    var body: some View {
+        Menu {
+            Group {
+                // v1.8.17: provider-copy switcher (Dispatcharr Direct
+                // Connect VOD with >1 copy; hidden otherwise).
+                if versionOptions.count > 1, let switchVersionAction {
+                    Menu {
+                        ForEach(versionOptions) { option in
+                            Button {
+                                switchVersionAction(option)
+                            } label: {
+                                if option.id == currentVersionOptionID {
+                                    Label(option.label, systemImage: "checkmark")
+                                } else {
+                                    Text(option.label)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Switch Version", systemImage: "square.stack.3d.up")
+                    }
+                }
+
+                // Audio track (sub-menu, only when multiple)
+                if audioTracks.count > 1 {
+                    Menu {
+                        ForEach(audioTracks) { track in
+                            Button {
+                                setAudioTrack?(track.id)
+                            } label: {
+                                if track.id == currentAudioTrackID {
+                                    Label(track.displayName, systemImage: "checkmark")
+                                } else {
+                                    Text(track.displayName)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Audio Track", systemImage: "waveform.circle")
+                    }
+                }
+
+                // Task #184: Audio Sync (sub-menu; SwiftUI Menu cannot host
+                // a Slider, so 100ms steppers). Positive = audio later.
+                // Hidden on engines without the knob (setAudioSync nil).
+                if let setAudioSync {
+                    Menu {
+                        Button { setAudioSync(audioSyncMs + 100) } label: {
+                            Label("Audio later +100 ms", systemImage: "plus.circle")
+                        }
+                        Button { setAudioSync(audioSyncMs - 100) } label: {
+                            Label("Audio earlier -100 ms", systemImage: "minus.circle")
+                        }
+                        if audioSyncMs != 0 {
+                            Button { setAudioSync(0) } label: {
+                                Label("Reset to 0", systemImage: "arrow.counterclockwise")
+                            }
+                        }
+                    } label: {
+                        if audioSyncMs == 0 {
+                            Label("Audio Sync", systemImage: "metronome")
+                        } else {
+                            Label("Audio Sync: \(audioSyncLabel)", systemImage: "metronome")
+                        }
+                    }
+                }
+
+                // Subtitles (sub-menu, only when available)
+                if !subtitleTracks.isEmpty {
+                    Menu {
+                        Button {
+                            setSubtitleTrack?(0)
+                        } label: {
+                            if currentSubtitleTrackID == 0 {
+                                Label("Off", systemImage: "checkmark")
+                            } else {
+                                Text("Off")
+                            }
+                        }
+                        ForEach(subtitleTracks) { track in
+                            Button {
+                                setSubtitleTrack?(track.id)
+                            } label: {
+                                if track.id == currentSubtitleTrackID {
+                                    Label(track.displayName, systemImage: "checkmark")
+                                } else {
+                                    Text(track.displayName)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label {
+                            if currentSubtitleTrackID != 0,
+                               let track = subtitleTracks.first(where: { $0.id == currentSubtitleTrackID }) {
+                                Text("Subtitles: \(track.displayName)")
+                            } else {
+                                Text("Subtitles")
+                            }
+                        } icon: {
+                            Image(systemName: "captions.bubble")
+                        }
+                    }
+                }
+
+                // Playback speed (VOD only)
+                if !isLive {
+                    let speeds = PlayerProgressStore.speedOptions
+                    Menu {
+                        ForEach(speeds, id: \.self) { spd in
+                            Button {
+                                setSpeed?(spd)
+                            } label: {
+                                let label = spd == 1.0 ? "Normal" : "\(String(format: "%g", spd))x"
+                                if spd == speed {
+                                    Label(label, systemImage: "checkmark")
+                                } else {
+                                    Text(label)
+                                }
+                            }
+                        }
+                    } label: {
+                        let speedLabel = speed == 1.0 ? "1x" : "\(String(format: "%g", speed))x"
+                        Label("Speed: \(speedLabel)", systemImage: "gauge.with.dots.needle.67percent")
+                    }
+                }
+
+                // Video Scale (issue #26): one row cycling
+                // Fit -> Fill -> Stretch. Live + VOD, hidden in audio-only.
+                if !isAudioOnly, let setVideoScale {
+                    Button {
+                        setVideoScale(aspectMode.next)
+                    } label: {
+                        Label("Video Scale: \(aspectMode.label)", systemImage: aspectMode.icon)
+                    }
+                }
+
+                Divider()
+
+                // Record current program. Gated on `canRecord` so streams
+                // without live EPG data (raw M3U / missing tvg-id) don't
+                // show an item the user can't usefully tap.
+                if canRecord {
+                    Button {
+                        recordAction?()
+                    } label: {
+                        Label("Record Current Program", systemImage: "record.circle")
+                    }
+                }
+
+                // Switch Stream (Dispatcharr Direct Connect, admin only).
+                // Gated by the caller via a non-nil closure; opens the
+                // member-stream picker.
+                if let switchStreamAction {
+                    Button {
+                        switchStreamAction()
+                    } label: {
+                        Label("Switch Stream", systemImage: "arrow.triangle.swap")
+                    }
+                }
+
+                // Sleep timer (sub-menu)
+                Menu {
+                    if sleepTimerEnd != nil {
+                        Button(role: .destructive) {
+                            setSleepTimer?(nil)
+                        } label: {
+                            Label("Cancel Timer", systemImage: "xmark")
+                        }
+                        Divider()
+                    }
+                    ForEach([30, 60, 90, 120], id: \.self) { minutes in
+                        Button {
+                            setSleepTimer?(Date().addingTimeInterval(Double(minutes) * 60))
+                        } label: {
+                            Text("\(minutes) minutes")
+                        }
+                    }
+                } label: {
+                    if let remaining = sleepTimerRemainingText {
+                        Label("Sleep Timer: \(remaining)", systemImage: "moon.zzz.fill")
+                    } else {
+                        Label("Sleep Timer", systemImage: "moon.zzz")
+                    }
+                }
+
+                // Kept Live (Logan 2026-10-04): the Kept Live card's rows
+                // while the player is fullscreen. Its own observer, so the
+                // Equatable menu does not need the set as an input.
+                KeptLiveMenuSection()
+
+                // Stream info (toggle)
+                Button {
+                    toggleStreamInfo?()
+                } label: {
+                    Label(
+                        showStreamInfo ? "Hide Stream Info" : "Stream Info",
+                        systemImage: showStreamInfo ? "info.circle.fill" : "info.circle"
+                    )
+                }
+
+                Divider()
+
+                // Radio Mode: keep the audio, close the video player.
+                if let radioModeAction {
+                    Button {
+                        radioModeAction()
+                    } label: {
+                        Label(RadioModeSession.shared.isActive ? "Exit Radio Mode" : "Radio Mode",
+                              systemImage: RadioModeSession.menuSymbol)
+                    }
+                }
+
+                // Picture-in-Picture is automatic, no manual menu item.
+                // Swipe home to shrink the player into a floating window;
+                // controlled by Settings → Appearance → Picture-in-Picture.
+
+                // AirPlay. The AVPlayer engine hands video to the receiver
+                // (served over the LAN since the 2026-09-21 rebuild); the
+                // mpv engine still routes audio only.
+                Button {
+                    AirPlayMenuTrigger.present()
+                } label: {
+                    Label("AirPlay", systemImage: "airplay.video")
+                }
+            }
+            // Cancel auto-hide while the menu popover is open so the
+            // anchor view stays in the hierarchy and items remain tappable.
+            .onAppear { onMenuOpen?() }
+            .onDisappear { onMenuClose?() }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundColor(.white)
+                .frame(width: 52, height: 52)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+}
+
+// MARK: - tvOS Player Options Sheet
+
+
+
+// MARK: - AirPlay Route Picker Button
+struct AirPlayButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let v = AVRoutePickerView()
+        v.tintColor = .white
+        v.activeTintColor = UIColor(Color.accentPrimary)
+        v.backgroundColor = .clear
+        // A pick here clears the user-ended AirPlay latch (AirPlayMonitor).
+        v.delegate = AirPlayRoutePickerDelegate.shared
+        return v
+    }
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+
+// MARK: - AirPlay Menu Trigger
+// We moved AirPlay off the top-chrome button row and into the overflow
+// menu. Since AstralTV streams audio-only via AirPlay (no video routing
+// on iPhone given the mix of HLS + MPV-backed TS streams), a dedicated
+// visible button was chrome bloat. Menus, however, can't host an
+// interactive `AVRoutePickerView` directly, items are rendered as
+// Buttons by SwiftUI. We route the menu tap through this helper,
+// which keeps one `AVRoutePickerView` permanently attached to the
+// key window (invisible and sized 1×1 offscreen) and fires the
+// touchUpInside on its internal UIButton when `present()` is called.
+//
+// Subview-hopping into `AVRoutePickerView` is not officially blessed
+// by Apple but is the documented workaround across the iOS community
+// (Podcasts, Spotify, etc. all do it). The route picker view's
+// private subview layout has been stable through iOS 13 → 18; if
+// Apple ever rearranges it, `present()` becomes a no-op and the
+// user can still reach AirPlay via Control Center, a graceful
+// degradation rather than a crash.
+@MainActor
+enum AirPlayMenuTrigger {
+    private static let pickerView: AVRoutePickerView = {
+        let v = AVRoutePickerView(frame: CGRect(x: -100, y: -100, width: 1, height: 1))
+        // Video receivers (Apple TV, Roku, AirPlay TVs) first: the sheet is
+        // how a channel reaches a TV.
+        v.prioritizesVideoDevices = true
+        // A pick here clears the user-ended AirPlay latch (AirPlayMonitor).
+        v.delegate = AirPlayRoutePickerDelegate.shared
+        v.alpha = 0.01       // kept non-zero so the subview button stays touch-enabled
+        v.isUserInteractionEnabled = true
+        return v
+    }()
+
+    /// Attach the hidden picker view to the app's key window (idempotent)
+    /// and fire the underlying UIButton's touchUpInside action to make iOS
+    /// present the system AirPlay route selection sheet.
+    static func present() {
+        attachIfNeeded()
+        for subview in pickerView.subviews {
+            if let button = subview as? UIButton {
+                button.sendActions(for: .touchUpInside)
+                return
+            }
+        }
+        // Iteration fallback, Apple has historically nested the button one
+        // level deeper in some iOS versions. Walk one layer down before
+        // giving up.
+        for subview in pickerView.subviews {
+            for inner in subview.subviews {
+                if let button = inner as? UIButton {
+                    button.sendActions(for: .touchUpInside)
+                    return
+                }
+            }
+        }
+    }
+
+    private static func attachIfNeeded() {
+        guard pickerView.superview == nil else { return }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        guard let window = activeScene?.windows.first(where: { $0.isKeyWindow })
+                ?? activeScene?.windows.first else { return }
+        window.addSubview(pickerView)
+    }
+}
+
+// MARK: - tvOS Remote Input Handler (gesture recognizers for hold-to-scrub)
+
+// MARK: - Native AVPlayer engine (TEST, branch test/avplayer-hls-engine)
+
+/// Per-channel live-edge hold-back learned from stalls, applied at the
+/// START of a tune instead of mid-playback (see the holdback note in
+/// `logPerfSummary`). Persisted so a channel that is reliably bursty
+/// joins further back from the edge on its next tune instead of
+/// re-learning it with a stall every session. Values are seconds of
+/// `configuredTimeOffsetFromLive`, 6 (the default) to 18.
+enum LiveEdgeHoldback {
+    private static let defaultsKey = "playback.liveEdgeHoldback"
+    /// When each key was last learned (epoch seconds). A SEPARATE dictionary so
+    /// the value format above is untouched: an install written by an older
+    /// build has values and no stamps, which reads as expired (below).
+    private static let learnedAtKey = "playback.liveEdgeHoldbackAt"
+    static let base = 6.0
+    /// Learned hold-back expires after 30 minutes (Logan 2026-09-12). It only
+    /// ever grew before, so one bad night pinned a channel forever: an AAC bug
+    /// trained ESPN HD to 12 s and every later tune joined 12 s back even
+    /// though the feed was fine. A fresh stall re-learns it exactly as before.
+    static let ttl: TimeInterval = 30 * 60
+
+    static func offset(for key: String) -> Double {
+        let map = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]
+        guard let learned = map?[key], learned > base else { return base }
+        let stamps = UserDefaults.standard.dictionary(forKey: learnedAtKey) as? [String: Double]
+        let stamp = stamps?[key]
+        // No stamp at all (a value written by a pre-2026-09-12 build): there is
+        // no age to print. The old code turned the missing stamp into
+        // .greatestFiniteMagnitude and logged an absurd "age 2996155224770...m"
+        // on the Apple TV, and it did that on EVERY tune because the value was
+        // never cleared. Say what actually happened, once.
+        guard let stamp else {
+            debugLog(String(format: "[HOLDBACK] learned %.0fs has no stamp, treating as expired, using base %.0fs",
+                            learned, base))
+            forget(key)
+            return base
+        }
+        let age = Date().timeIntervalSince1970 - stamp
+        // Expired (or a stamp from the future, e.g. the clock moved back):
+        // discard and fall back to the base computation at the call site.
+        guard age >= 0, age < ttl else {
+            // Cap the printed age so a nonsense stamp can never produce a
+            // nonsense number; the clear below stops it repeating next tune.
+            let minutes = min(max(age, 0) / 60, 9999)
+            debugLog(String(format: "[HOLDBACK] learned %.0fs expired (age %.0fm), using base %.0fs",
+                            learned, minutes, base))
+            forget(key)
+            return base
+        }
+        // Roll the TTL on use (2026-10-05): a successful read re-stamps the
+        // entry, so expiry is 30 minutes from the last tune that used it. A
+        // value still never persists forever. offset(for:) runs more than once
+        // per tune (player host, remuxer join floor), so only re-stamp when the
+        // stamp is older than the debounce window; that logs once per tune.
+        if age >= restampDebounce {
+            var fresh = stamps ?? [:]
+            fresh[key] = Date().timeIntervalSince1970
+            UserDefaults.standard.set(fresh, forKey: learnedAtKey)
+            debugLog("[AVP-HOLDBACK] learned value re-stamped on use")
+        }
+        return learned
+    }
+
+    /// Reads within this many seconds of the last stamp belong to the same
+    /// tune and do not re-stamp again.
+    private static let restampDebounce: TimeInterval = 20
+
+    /// Drop one stale learned value with its stamp, so the expiry line above
+    /// logs once instead of on every tune of that channel.
+    private static func forget(_ key: String) {
+        var map = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]) ?? [:]
+        var stamps = (UserDefaults.standard.dictionary(forKey: learnedAtKey) as? [String: Double]) ?? [:]
+        guard map.removeValue(forKey: key) != nil || stamps.removeValue(forKey: key) != nil else { return }
+        UserDefaults.standard.set(map, forKey: defaultsKey)
+        UserDefaults.standard.set(stamps, forKey: learnedAtKey)
+    }
+
+    /// Ceiling for the audio-only bursty-feed rule (2026-10-15): a proxied
+    /// radio channel released in 256 KB chunks goes 9 to 10 s between
+    /// segments, so W + 2 s can pass the 18 s video ceiling. Raised to 32 s
+    /// the same day: Alt Nation's bursts grew to 18 to 29 s mid-session and a
+    /// 20 s ceiling could not cover them.
+    static let audioOnlyCap = 32.0
+
+    static func record(_ seconds: Double, for key: String, cap: Double = 18) {
+        var map = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double]) ?? [:]
+        var stamps = (UserDefaults.standard.dictionary(forKey: learnedAtKey) as? [String: Double]) ?? [:]
+        let value = min(cap, max(base, seconds))
+        map[key] = value
+        // Stamp every learn (a raise OR a re-confirm by another stall) so the
+        // 30-minute clock restarts while a channel keeps stalling.
+        let now = Date().timeIntervalSince1970
+        stamps[key] = now
+        // Bounded: one entry per channel the user has stalled on, and a
+        // playlist change rotates keys out on its own.
+        if map.count > 200 { map.removeAll(); stamps.removeAll() }
+        stamps = stamps.filter { map[$0.key] != nil }
+        UserDefaults.standard.set(map, forKey: defaultsKey)
+        UserDefaults.standard.set(stamps, forKey: learnedAtKey)
+        debugLog(String(format: "[HOLDBACK] learned %.0fs at %@ (expires in %.0fm)",
+                        value, ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: now)),
+                        ttl / 60))
+    }
+}
+
+
+/// Weak player -> display layer map so diagnostics that only hold the
+/// AVPlayer (the progress driver, the held DVR start) can read the layer
+/// actually showing it (GH #93 video probe).
+@MainActor
+enum AVPlayerDisplayLayerRegistry {
+    private static let map = NSMapTable<AVPlayer, AVPlayerLayer>.weakToWeakObjects()
+    static func register(_ layer: AVPlayerLayer, for player: AVPlayer?) {
+        guard let player else { return }
+        map.setObject(layer, forKey: player)
+    }
+    static func layer(for player: AVPlayer) -> AVPlayerLayer? { map.object(forKey: player) }
+}
+
+
+/// Bridges an `AVPlayer`'s playback state into the shared
+/// `PlayerProgressStore`, the SAME store the mpv path populates, so ONE
+/// custom control overlay can drive both engines. This is the AVPlayer
+/// analog of `MPVPlayerView.Coordinator`'s store wiring: KVO + a
+/// periodic time observer push state IN (currentMs / durationMs /
+/// isPaused / tracks / streamInfo), and the store's command closures
+/// route user intents OUT (play-pause / seek / speed / track select /
+/// aspect). With this in place the overlay's scrubber, play-pause, and
+/// track pickers work identically regardless of which engine is live.
+@MainActor
+final class AVPlayerProgressDriver {
+    /// Held strongly: the driver's lifetime is strictly inside the
+    /// player's (the screen owns both and tears the driver down first),
+    /// and every capture back to the driver is weak, so there is no
+    /// cycle. Strong ownership lets teardown/deinit always reach a live
+    /// player to remove the time observer (AVFoundation requires removal
+    /// before the player deallocates).
+    private let player: AVPlayer
+    private let store: PlayerProgressStore
+    private let isLive: Bool
+    /// Live Rewind (AVPlayer container): true when the tile's remuxer is
+    /// spilling a rewind window and the playlist advertises all of it.
+    /// The time observer then pumps currentMs in the chrome's tail-
+    /// relative domain and mirrors the window into LiveRewindEngine's
+    /// external-window state; seekAction remaps tail-domain targets onto
+    /// the playlist timeline. Set by the tile right after driver init.
+    var liveRewindWindowActive = false
+    /// Catch-up mode: non-nil = the programme-relative ms offset of the
+    /// CURRENT archive window (each re-tune restarts the item clock at
+    /// ~0, mpv parity). currentMs = base + player position, and the
+    /// duration observer never overwrites the pinned EPG duration.
+    var catchupBaseMs: Int32?
+    /// Natural live-edge distance (seconds, EMA) while NOT timeshifting:
+    /// the AVPlayer live cushion self-builds (measured up to ~36s on a
+    /// starved feed), so "behind live" can only be declared beyond it.
+    private var naturalEdgeOffset: Double = 4
+    /// Host-provided sink for aspect changes (the overlay has no handle
+    /// to the AVPlayerLayer; the host owns it and applies the gravity).
+    private let applyGravity: (AVLayerVideoGravity) -> Void
+
+    private var timeObserver: Any?
+    private var observations: [NSKeyValueObservation] = []
+    /// Item-scoped KVO, replaced wholesale on every currentItem swap so
+    /// a discarded item's late callbacks can't clobber the store and the
+    /// observation set can't grow per swap.
+    private var itemObservations: [NSKeyValueObservation] = []
+    private var aspectCancellable: AnyCancellable?
+    // AVPlayer selects tracks by AVMediaSelectionOption, not integer id.
+    // We hand the overlay synthetic 1-based ids (0 = auto/off, matching
+    // mpv's aid/sid convention) and map them back here.
+    private var audibleGroup: AVMediaSelectionGroup?
+    private var legibleGroup: AVMediaSelectionGroup?
+    private var audioOptionByID: [Int: AVMediaSelectionOption] = [:]
+    private var subtitleOptionByID: [Int: AVMediaSelectionOption] = [:]
+    /// One-shot per item: subtitles start OFF (mpv parity). Without the
+    /// explicit deselect, the device's system caption preference
+    /// auto-enables a legible rendition (field find 2026-08-26,
+    /// "subtitles seem to be enabled by default"). The flag keeps a
+    /// re-fired ready callback from clobbering a user's later pick.
+    private var appliedDefaultSubtitleOff = false
+
+    // MARK: instrumentation ([AVP-STREAM]/[AVP-PERF], mpv-path parity)
+    /// Wall clock at construction; time-to-first-frame is measured from
+    /// here so it includes asset load, not just decode.
+    private let launchStart = CACurrentMediaTime()
+    private var firstPlayLogged = false
+    /// Fired once, on the first frame actually playing. The tile uses it
+    /// to close the press-to-picture clock and to release a deferred
+    /// display-mode switch (review 2026-09-11 section 1 proposals 6, 7).
+    var onFirstFrame: (() -> Void)? {
+        didSet {
+            // A first frame that landed before the tile assigned this
+            // fires late rather than never.
+            if firstFrameRendered, onFirstFrame != nil { onFirstFrame?() }
+        }
+    }
+    /// True once the item clock has actually ADVANCED with rate > 0, which
+    /// is the only honest "there is moving video" signal available here.
+    /// `timeControlStatus == .playing` is NOT that signal: on 2026-09-11
+    /// at 17:15 the player reported .playing 15 ms after construction and
+    /// then sat at pos 0.0s for eleven seconds (session2.txt:280-347),
+    /// which is what made the [TUNE] line print before playback existed.
+    private var firstFrameRendered = false
+    private var firstFrameProbeClock: CMTime = .invalid
+
+    private var streamSummaryLogged = false
+
+    /// Error-log dedupe. At the UHD live join in atvlogs/s7 (2026-09-11)
+    /// AVPlayer posted the identical -16832 "restarting 3.84s from end of
+    /// live playlist" error-log entry 21 times inside 10 ms, which buried
+    /// every other line. We keep the last logged (status, domain, comment)
+    /// triple plus a suppressed count and the time it was logged; repeats
+    /// inside the window only bump the count.
+    private var lastErrorLogKey: (status: Int, domain: String, comment: String)?
+    private var lastErrorLogTime: Date = .distantPast
+    private var suppressedErrorLogCount = 0
+    private static let errorLogDedupeWindow: TimeInterval = 5
+
+    /// Emits the "repeated N more times" tail for the previous entry, if
+    /// any repeats were swallowed, and clears the dedupe record.
+    private func flushSuppressedErrorLog() {
+        if suppressedErrorLogCount > 0 {
+            debugLog("[AVP-STREAM] error log repeated \(suppressedErrorLogCount) more times")
+        }
+        suppressedErrorLogCount = 0
+        lastErrorLogKey = nil
+        lastErrorLogTime = .distantPast
+    }
+    /// NotificationCenter tokens scoped to the current item, torn down
+    /// on swap alongside itemObservations.
+    private var itemNotificationTokens: [NSObjectProtocol] = []
+    private var perfTimer: Timer?
+    /// Access-log deltas: last-seen counters so each [AVP-PERF] line
+    /// reports stalls/dropped-frames since the previous line, like the
+    /// mpv vo_drops/dec_drops deltas.
+    private var lastStallCount = 0
+    /// Channel key for the persisted live-edge hold-back, set by the tile
+    /// right after init. Nil (VOD/DVR/catch-up) disables the mechanism.
+    var liveHoldbackKey: String?
+    /// Channel name for the audio-only hold-back log line.
+    var liveChannelName: String?
+    /// Audio-only bursty-feed rule state (see `checkAudioOnlyBurstyFeed`):
+    /// handled once per session; a raised offset waits here until the
+    /// local window holds enough to rejoin at it.
+    private var audioOnlyBurstHandled = false
+    private var audioOnlyPendingRejoin: Double?
+    private var audioOnlyRejoinDeferredLogged = false
+    /// In-session growth (2026-10-15): the hold-back this session currently
+    /// runs for an audio-only program, the starvation stamp already handled,
+    /// how many in-session raises happened, when the last audio-only rejoin
+    /// seek ran (one per 15 s at most), and whether the cap line was logged.
+    private var audioOnlyHoldback = 0.0
+    private var audioOnlyHandledStarvation: Date?
+    private var audioOnlyRaiseCount = 0
+    private var audioOnlyLastRejoinSeekAt: Date?
+    private var audioOnlyCapLogged = false
+    private var audioOnlySpacingLogged = false
+    private static let audioOnlyRejoinSpacing: TimeInterval = 15
+    private static let audioOnlyMinReseekRaise = 2.0
+    private let driverInitWall = Date()
+    /// Live join-offset bookkeeping (see `maybeRaiseJoinOffset`).
+    var appliedLiveOffset = 0.0
+    var liveOffsetFloor = 0.0
+    var liveTargetDuration: (() -> Double)?
+    private var lastDroppedFrames = 0
+    /// Throttle for the periodic VOD WatchProgress save (10s cadence,
+    /// matching the mpv coordinator's saver).
+    private var lastProgressSaveAt = Date.distantPast
+    /// Presentation-freeze detector state (see the 1s sampler below).
+    private var freezeLastMediaTime = CMTime.invalid
+    private var freezeConsecutiveTicks = 0
+    /// Post-stall nudge state (2026-09-11, atvlogs/s6_85.txt:710-770):
+    /// consecutive ticks spent in
+    /// .waitingToPlayAtSpecifiedRate/AVPlayerWaitingToMinimizeStallsReason,
+    /// the remuxer's published-segment count when that streak began, and
+    /// the once-per-streak latch for playImmediately.
+    private var minimizeStallsWaitTicks = 0
+    private var minimizeStallsWaitBaseSegments = 0
+    private var nudgedThisWaitStreak = false
+    /// When the first-join nudge started playback without waiting for a
+    /// fresh segment (2026-10-04, atv_hz.log 02:03:05-14). A stall inside
+    /// `earlyStartLearningQuiet` of that start is the cost of starting with
+    /// a smaller cushion, not evidence the channel needs a larger hold-back,
+    /// so the hold-back learner skips it.
+    private var earlyStartNudgeAt: Date?
+    /// Stall resume gate (2026-09-13, atv_skip2.txt 13:02-13:06). A bursty
+    /// feed stalled six times in two minutes because every resume went out
+    /// with ~2 s buffered: the nudge below fired the moment ONE segment had
+    /// landed, so the next upstream gap (4.8 s there) emptied the buffer
+    /// again. After a "buffer ran empty" stall the resume now waits for the
+    /// worst observed delivery gap plus 2 s, capped at 8 s, with a 25 s hard
+    /// timeout after which it resumes with whatever it has. Skipped outright
+    /// when the feed is measured below real time.
+    private var stallGateSince: Date?
+    private var stallGateTarget = 0.0
+    /// Repeat-stall rejoin (2026-09-13, atv_stalls3.txt 14:14-14:16). A feed
+    /// with 7 to 8 s silent gaps stalled nine times in 90 s: every gate hold
+    /// reached its cap, bought exactly one burst, and the next gap drained it.
+    /// The buffer was there the whole time - the local remux window held about
+    /// 24 s of the channel BEHIND the playhead - so on the SECOND empty-buffer
+    /// stall inside 60 s the playhead moves back into that window instead of
+    /// waiting at the edge for a cushion the provider never delivers.
+    private var lastStallAt: Date?
+    private var lastRejoinAt: Date?
+    /// Hold-back the learner raised DURING this session. Before 2026-09-13 a
+    /// learned raise only took effect at the next tune of the channel, so a
+    /// session that was stalling kept playing 2 to 4 s from the edge while
+    /// the learner walked 6 -> 18 s for a tune that might never come. It is
+    /// now also the floor for Return to Live in the current session (it is
+    /// NOT part of the post-stall resume gate: see armStallResumeGate).
+    private var sessionHoldback = 0.0
+    private var freezeTimer: Timer?
+    /// True while the owner wants this player running (not deliberately
+    /// paused). The freeze detector reports rate 0 + .paused as a freeze
+    /// only when this is set; the chrome's pause toggle keeps it current.
+    var expectPlaying = false
+    private var pausedWhileExpectedTicks = 0
+    // GH #93 video probe (DVR windows only): a video output on the item
+    // tells us which frame is actually due for display, independent of
+    // the audio-driven clock.
+    private var probeOutput: AVPlayerItemVideoOutput?
+    private weak var probeItem: AVPlayerItem?
+    private var probeLastFramePTS: Double = .nan
+    private var probeStaleSeconds = 0
+    private var probeTicks = 0
+    /// Escalation sink for a fatal/persistent stream error the errorLog
+    /// surfaces (e.g. a rejected playlist or a failed blocking reload that
+    /// never throws to `status`). The host wires this to its engine fallback.
+    /// Fired at most once per driver.
+    var onUnrecoverable: ((String) -> Void)?
+    private var firedUnrecoverable = false
+    /// Consecutive non-fatal fetch errors (segment/part 404, playlist not
+    /// received); escalated only after a few strikes so a single transient
+    /// blip does not bounce the engine. Reset whenever the clock advances.
+    private var softErrorCount = 0
+    /// First moment the live playlist went stale (-12888 "unchanged")
+    /// with no recovery since. Cleared on any clock advance; a 60s hold
+    /// = the feed is genuinely dead and a re-tune is warranted.
+    private var playlistStaleSince: Date?
+
+    init(player: AVPlayer,
+         store: PlayerProgressStore,
+         isLive: Bool,
+         applyGravity: @escaping (AVLayerVideoGravity) -> Void) {
+        self.player = player
+        self.store = store
+        self.isLive = isLive
+        self.applyGravity = applyGravity
+        wireCommands(player)
+        observe(player)
+        // Apply the persisted aspect immediately and on every change.
+        applyGravity(store.effectiveVideoGravity)
+        aspectCancellable = Publishers.CombineLatest3(
+            store.$aspectMode, store.$allowsVideoFill, store.$isPiPActive)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] mode, allowsFill, pipActive in
+                let gravity: AVLayerVideoGravity =
+                    (allowsFill && !pipActive) ? mode.videoGravity : .resizeAspect
+                self?.applyGravity(gravity)
+                debugLog("[VIDEO-SCALE] applied \(mode.rawValue) gravity=\(gravity.rawValue) layer=avplayer allowsFill=\(allowsFill) pip=\(pipActive)")
+            }
+    }
+
+    /// State IN: observers that mirror AVPlayer -> store.
+    private func observe(_ player: AVPlayer) {
+        // Position. 0.5s cadence matches the overlay's needs without
+        // churning the main thread; live streams keep durationMs == 0,
+        // which the overlay already reads as "live" (no scrubber).
+        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: interval, queue: .main) { [weak self] time in
+            guard let self else { return }
+            // REAL first frame: the item clock advanced while the rate is
+            // positive. Everything else (timeControlStatus .playing,
+            // readyToPlay, the layer's isReadyForDisplay) can be true over
+            // a frozen picture - session2.txt:280-347 is eleven seconds of
+            // "status playing" at pos 0.0s. Resolution is one observer
+            // tick (0.5 s), which is stated in the log line.
+            if !self.firstFrameRendered, self.player.rate > 0, time.isValid {
+                if self.firstFrameProbeClock.isValid,
+                   (time - self.firstFrameProbeClock).seconds > 0.01 {
+                    self.firstFrameRendered = true
+                    let ms = Int((CACurrentMediaTime() - self.launchStart) * 1000)
+                    debugLog(String(format:
+                        "[AVP-STREAM] first frame rendered by +%dms from screen open (clock at %.2fs, +/-0.5s sampling)",
+                        ms, time.seconds))
+                    TuneTimeline.shared.firstFrame()
+                    self.onFirstFrame?()
+                }
+                self.firstFrameProbeClock = time
+            }
+            self.maybeRaiseJoinOffset()
+            // Frame rate is not always known when the item goes ready:
+            // remuxed fMP4 declares no nominalFrameRate and
+            // currentVideoFrameRate stays 0 until frames render. Re-sample
+            // until something lands, then fall back to the rate the
+            // remuxer measured off the frame timestamps (Logan 2026-09-11).
+            self.sampleFrameRateIfUnknown()
+            if self.isLive {
+                self.pumpLiveRewindWindow(time)
+                return
+            }
+            let secs = time.seconds
+            if secs.isFinite {
+                if let base = self.catchupBaseMs {
+                    self.store.currentMs = base + Int32(secs * 1000)
+                } else {
+                    self.store.currentMs = Int32(secs * 1000)
+                }
+            }
+            // DVR window: the playlist is live-shaped (no ENDLIST) so the
+            // duration observer below never fires. The seekable range end
+            // IS the recorded-so-far duration; monotonic max() so playlist
+            // reload jitter can't shrink the timeline under the scrubber.
+            if self.store.isDVRWindow,
+               let range = self.player.currentItem?.seekableTimeRanges.last?.timeRangeValue {
+                let endSecs = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+                if endSecs.isFinite, endSecs > 0 {
+                    self.store.durationMs = max(self.store.durationMs, Int32(endSecs * 1000))
+                }
+            }
+            // Periodic WatchProgress save, mpv-coordinator parity: the
+            // container AVPlayer path previously never persisted VOD
+            // position at all - Continue Watching only advanced when the
+            // legacy cover or a version switch happened to write it
+            // (found 2026-08-26 wiring the Back-exits-VOD behavior).
+            if let vodID = self.store.vodID, !vodID.isEmpty,
+               self.store.durationMs > 0, self.store.currentMs > 2_000,
+               Date().timeIntervalSince(self.lastProgressSaveAt) >= 10 {
+                self.lastProgressSaveAt = Date()
+                let s = self.store
+                WatchProgressManager.save(
+                    vodID: vodID, title: s.vodTitle ?? "",
+                    positionMs: s.currentMs, durationMs: s.durationMs,
+                    posterURL: s.vodPosterURL, vodType: s.vodType,
+                    isFinished: !s.isDVRWindow && s.currentMs > Int32(Double(s.durationMs) * 0.9),
+                    streamURL: s.vodStreamURL, serverID: s.vodServerID)
+            }
+        }
+
+        // Play/pause. timeControlStatus is authoritative (covers the
+        // buffering-vs-paused distinction); treat waiting-to-play as not
+        // paused so the spinner logic matches the mpv path.
+        observations.append(player.observe(\.timeControlStatus, options: [.initial, .new]) {
+            [weak self] p, _ in
+            // Diagnostic (Apple TV 2026-10-13): a user-paused tile started
+            // playing by itself 7 s after the pause with no nudge line in
+            // the log. KVO fires synchronously on the caller's thread, so
+            // the stack here names whoever called play().
+            let status = p.timeControlStatus
+            let stack: String? = {
+                guard status != .paused, Thread.isMainThread else { return nil }
+                let paused = MainActor.assumeIsolated { MultiviewStore.shared.audioProgressStore?.userPaused ?? false }
+                guard paused else { return nil }
+                return Thread.callStackSymbols.prefix(14).joined(separator: "\n")
+            }()
+            Task { @MainActor in
+                if let stack {
+                    debugLog("[PLAYER] rate rose while user paused (status=\(status.rawValue)) caller:\n\(stack)")
+                }
+                guard let self else { return }
+                self.store.isPaused = (p.timeControlStatus == .paused)
+                // A paused live stream is behind its edge by definition,
+                // and the periodic observer stops ticking while paused -
+                // without this the Playback submenu's Return to Live
+                // vanished the moment ticks stopped (field 2026-08-28).
+                if self.isLive, p.timeControlStatus == .paused,
+                   !self.store.behindLiveEdge {
+                    self.store.behindLiveEdge = true
+                }
+                switch p.timeControlStatus {
+                case .playing:
+                    if !self.firstPlayLogged {
+                        self.firstPlayLogged = true
+                        let ms = Int((CACurrentMediaTime() - self.launchStart) * 1000)
+                        debugLog("[AVP-STREAM] first frame playing in \(ms)ms from screen open")
+                        // NOT the first frame, despite the wording this
+                        // line has always carried: it only means the
+                        // player accepted a play() request. The real
+                        // first frame is detected in the periodic
+                        // observer below.
+                        TuneTimeline.shared.mark("rate1")
+                    }
+                case .waitingToPlayAtSpecifiedRate:
+                    // The cause of any mid-stream "skip"/rebuffer. Reason
+                    // codes: evaluatingBufferingRate, toMinimizeStalls,
+                    // noItemToPlay.
+                    let reason = p.reasonForWaitingToPlay?.rawValue ?? "unknown"
+                    debugLog("[AVP-STREAM] waiting to play (reason=\(reason))")
+                case .paused:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        })
+
+        observeCurrentItem(player.currentItem)
+        // Re-observe if the item is swapped (remux ready, fallback, etc.).
+        observations.append(player.observe(\.currentItem, options: [.new]) {
+            [weak self] _, change in
+            Task { @MainActor in
+                if let item = change.newValue ?? nil { self?.observeCurrentItem(item) }
+            }
+        })
+    }
+
+    private func observeCurrentItem(_ item: AVPlayerItem?) {
+        // Drop the previous item's observers first, so a swapped-out
+        // item's late .status/.duration/.presentationSize callbacks can
+        // never re-run populateTracks/populateStreamInfo with stale data.
+        itemObservations.forEach { $0.invalidate() }
+        itemObservations.removeAll()
+        // A new item is a new source: clear the format readouts so a
+        // channel change can never leave the PREVIOUS channel's numbers
+        // on screen while the new one is still loading (2026-09-11 audit).
+        // NOTE: the remuxer's measured cadence is NOT reset here - it is
+        // measured BEFORE the player item exists on the remux path, so
+        // clearing it on item swap would throw away the only rate that
+        // path ever has. It is only read while streamInfo.fps is 0.
+        store.streamInfo = StreamInfo()
+        // New item gets a fresh error-escalation budget.
+        if isLive { store.behindLiveEdge = false }
+        softErrorCount = 0
+        playlistStaleSince = nil
+        firedUnrecoverable = false
+        appliedDefaultSubtitleOff = false
+        guard let item else { return }
+        // Duration (VOD / seekable). Live HLS reports indefinite, which
+        // we leave as durationMs == 0.
+        itemObservations.append(item.observe(\.duration, options: [.initial, .new]) {
+            [weak self] i, _ in
+            let d = i.duration
+            guard let self, !self.isLive, self.catchupBaseMs == nil,
+                  d.isNumeric, d.seconds.isFinite, d.seconds > 0 else { return }
+            Task { @MainActor in self.store.durationMs = Int32(d.seconds * 1000) }
+        })
+        // Ready -> populate tracks + stream info once metadata exists.
+        itemObservations.append(item.observe(\.status, options: [.initial, .new]) {
+            [weak self] i, _ in
+            guard let self, i.status == .readyToPlay else { return }
+            Task { @MainActor in
+                await self.populateTracks(item: i)
+                self.populateStreamInfo(item: i)
+            }
+        })
+        // Presentation size -> stream info resolution.
+        itemObservations.append(item.observe(\.presentationSize, options: [.initial, .new]) {
+            [weak self] i, _ in
+            // presentationSize is the DISPLAY size (pixel aspect ratio
+            // already applied), which is what we want for anamorphic and
+            // for an adaptive HLS variant switch: it re-fires on every
+            // variant change, so the readout follows the ladder.
+            let size = i.presentationSize
+            guard let self, size.width > 0 else { return }
+            Task { @MainActor in
+                self.store.streamInfo.width = Int(size.width)
+                self.store.streamInfo.height = Int(size.height)
+            }
+        })
+        instrument(item: item)
+    }
+
+    // MARK: - Stream instrumentation ([AVP-STREAM]/[AVP-PERF])
+
+    /// AVPlayer telemetry parity with the mpv `[MPV-STREAM]/[MPV-PERF]`
+    /// block: startup time, stalls, dropped frames, and observed
+    /// bitrate, sourced from the item's access/error logs and the stall
+    /// notification. Scoped to `item`; replaced on every swap.
+    private func instrument(item: AVPlayerItem) {
+        itemNotificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        itemNotificationTokens.removeAll()
+        flushSuppressedErrorLog()
+        let nc = NotificationCenter.default
+
+        // Access log: AVFoundation's own measurement of startup time and
+        // stalls. The first event's startupTime is the authoritative
+        // "time to first frame" answer for the slow-load report.
+        itemNotificationTokens.append(nc.addObserver(
+            forName: AVPlayerItem.newAccessLogEntryNotification,
+            object: item, queue: .main) { [weak self] _ in
+            // queue: .main means this closure already runs on the main
+            // actor; assumeIsolated lets us touch the @MainActor stored
+            // property `streamSummaryLogged` without an async hop.
+            MainActor.assumeIsolated {
+                guard let self, let event = item.accessLog()?.events.last else { return }
+                // Log the stream summary once.
+                if !self.streamSummaryLogged, event.startupTime > 0 {
+                    self.streamSummaryLogged = true
+                    debugLog(String(format:
+                        "[AVP-STREAM] startup=%.0fms indicatedBitrate=%.0fkbps observed=%.0fkbps uri-changes=%d",
+                        event.startupTime * 1000,
+                        event.indicatedBitrate / 1000,
+                        event.observedBitrate / 1000,
+                        event.numberOfStalls))
+                }
+            }
+        })
+
+        // Error log: surfaces transient HLS fetch errors (segment 404,
+        // bitrate switch failures) that show as skips but never throw.
+        itemNotificationTokens.append(nc.addObserver(
+            forName: AVPlayerItem.newErrorLogEntryNotification,
+            object: item, queue: .main) { [weak self] _ in
+            guard let event = item.errorLog()?.events.last else { return }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Dedupe before logging: see `lastErrorLogKey`.
+                let key = (status: event.errorStatusCode,
+                           domain: event.errorDomain ?? "",
+                           comment: event.errorComment ?? "")
+                let now = Date()
+                if let last = self.lastErrorLogKey,
+                   last == key,
+                   now.timeIntervalSince(self.lastErrorLogTime) < Self.errorLogDedupeWindow {
+                    self.suppressedErrorLogCount += 1
+                } else {
+                    self.flushSuppressedErrorLog()
+                    self.lastErrorLogKey = key
+                    self.lastErrorLogTime = now
+                    debugLog("[AVP-STREAM] error log: status=\(key.status) domain=\(key.domain) \(key.comment)")
+                }
+                guard !self.firedUnrecoverable else { return }
+                // The receiver owns playback; its fetch errors are not this
+                // engine's to escalate.
+                if self.externalRenderSuspended { return }
+                // A paused player stops polling the playlist, so every
+                // "unchanged" / not-received entry while the user has
+                // paused is the pause itself, not a dead feed. Reset the
+                // counters and wait for the resume.
+                if self.store.userPaused {
+                    if self.playlistStaleSince != nil || self.softErrorCount > 0 {
+                        debugLog("[AVP-STREAM] error log ignored: user paused (no escalation)")
+                    }
+                    self.playlistStaleSince = nil
+                    self.softErrorCount = 0
+                    return
+                }
+                let code = event.errorStatusCode
+                // Fatal, one entry is enough: playlist parse/validation failure
+                // (-12642), variant/media selection failure (-12646), and
+                // Blocking Playlist Reload failure (-15416). All three leave
+                // AVPlayer wedged with no throw to `status`, which is exactly
+                // why nothing surfaced for the frozen live channels.
+                let fatal: Set<Int> = [-12642, -12646, -15416]
+                if fatal.contains(code) {
+                    self.firedUnrecoverable = true
+                    let reason = "fatal stream error \(code) (\(event.errorComment ?? "?"))"
+                    debugLog("[AVP-STREAM] \(reason); escalating to engine fallback")
+                    self.onUnrecoverable?(reason)
+                    return
+                }
+                // "Playlist File unchanged for longer than 1.5 * target
+                // duration" is AVPlayer's ADVISORY during a feed gap - the
+                // upstream starves 7-14s routinely (Sky), the playlist is
+                // legitimately static, and AVPlayer resumes by itself when
+                // the next segment lands. Counting three of these as fatal
+                // is what caused the 15-minute blackout-and-retune cycle
+                // (2026-08-26, Logan: "unacceptable in a production app") -
+                // the escalation KILLED sessions that would have healed in
+                // seconds. Only a playlist frozen for a full 60s means the
+                // feed is truly dead, and THAT is when a re-tune helps.
+                if code == -12888, (event.errorComment ?? "").contains("unchanged") {
+                    let since = self.playlistStaleSince ?? Date()
+                    self.playlistStaleSince = since
+                    let stale = Date().timeIntervalSince(since)
+                    if stale > 60 {
+                        self.firedUnrecoverable = true
+                        let reason = "live feed stalled (playlist unchanged \(Int(stale))s)"
+                        debugLog("[AVP-STREAM] \(reason); escalating to engine fallback")
+                        self.onUnrecoverable?(reason)
+                    }
+                    return
+                }
+                // Persistent (not one-off) fetch failures: playlist not received
+                // (-12888) or segment/part 404 out of the window (-12938).
+                // Escalate only after 3 strikes so a single transient blip does
+                // not bounce the engine. (The counter resets whenever the
+                // clock advances - see freezeTick - so sporadic singles
+                // can never accumulate to a kill across a long session.)
+                if code == -12888 || code == -12938 {
+                    self.softErrorCount += 1
+                    if self.softErrorCount >= 3 {
+                        self.firedUnrecoverable = true
+                        let reason = "persistent fetch error \(code) x\(self.softErrorCount)"
+                        debugLog("[AVP-STREAM] \(reason); escalating to engine fallback")
+                        self.onUnrecoverable?(reason)
+                    }
+                }
+            }
+        })
+
+        // Hard stall: the player ran dry. This is the "skipping in the
+        // feed" smoking gun if it fires after first frame.
+        itemNotificationTokens.append(nc.addObserver(
+            forName: AVPlayerItem.playbackStalledNotification,
+            object: item, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            // A receiver (Roku and other non-Apple AirPlay targets) never
+            // reports its buffer back through this item, so "ran empty"
+            // here is the phone's view, not the TV's. No verdict.
+            if self.externalRenderSuspended {
+                if !self.loggedReceiverStallSkip {
+                    self.loggedReceiverStallSkip = true
+                    debugLog("[AVP-STREAM] stall check skipped: receiver owns playback")
+                }
+                self.stallGateSince = nil
+                return
+            }
+            let ms = Int((CACurrentMediaTime() - self.launchStart) * 1000)
+            debugLog("[AVP-STREAM] STALL at +\(ms)ms (buffer ran empty)")
+            self.armStallResumeGate()
+        })
+
+        // Periodic summary (15s), mpv [STREAM-SUMMARY] cadence: report
+        // stall + dropped-frame deltas and the current observed bitrate.
+        perfTimer?.invalidate()
+        perfTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.logPerfSummary() }
+        }
+        // Presentation-freeze detector (2026-08-25 UHD soak): the user saw
+        // freezing while the access log swore stalls=0 and dropped=0 for
+        // the whole session. A held frame with the playback clock still
+        // advancing is invisible to every counter above; a held CLOCK
+        // while timeControlStatus stays .playing is invisible too, because
+        // numberOfStalls only counts re-buffer events AVPlayer itself
+        // declares. Sample currentTime once a second and call out any
+        // second where it moved less than a quarter of the way while the
+        // player claims to be playing.
+        freezeTimer?.invalidate()
+        freezeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.freezeTick() }
+        }
+    }
+
+    /// AirPlay (2026-09-21 rebuild): while a receiver plays this player the
+    /// local clock is the receiver's, and the phone must not judge, rejoin
+    /// or bounce the engine off it.
+    /// One "stall check skipped" line per driver, not one per stall.
+    private var loggedReceiverStallSkip = false
+    private var externalRenderSuspended: Bool {
+        return AirPlayTileDelivery.isServingReceiver || AirPlayMonitor.shared.isExternal
+            || player.isExternalPlaybackActive
+    }
+
+    private func videoProbeTick() {
+        guard store.isDVRWindow, let item = player.currentItem else { return }
+        if probeItem !== item {
+            if let old = probeOutput, let oldItem = probeItem { oldItem.remove(old) }
+            let out = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+            item.add(out)
+            probeOutput = out
+            probeItem = item
+            probeLastFramePTS = .nan
+            probeStaleSeconds = 0
+            probeTicks = 0
+        }
+        guard let out = probeOutput else { return }
+        probeTicks += 1
+        let itemTime = out.itemTime(forHostTime: CACurrentMediaTime())
+        var displayTime = CMTime.invalid
+        let hasBuffer = out.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil
+        let pts = displayTime.isValid ? displayTime.seconds : probeLastFramePTS
+        let videoTrack = item.tracks.first { $0.assetTrack?.mediaType == .video }
+        let fps = Double(videoTrack?.assetTrack?.nominalFrameRate ?? 0)
+        var framesPerSec = 0
+        if pts.isFinite, probeLastFramePTS.isFinite, fps > 0 {
+            framesPerSec = Int(((pts - probeLastFramePTS) * fps).rounded())
+        }
+        let advanced = pts.isFinite && (!probeLastFramePTS.isFinite || pts > probeLastFramePTS + 0.001)
+        if hasBuffer || advanced { probeStaleSeconds = 0 } else if player.rate > 0 { probeStaleSeconds += 1 }
+        if pts.isFinite { probeLastFramePTS = pts }
+        let layer = AVPlayerDisplayLayerRegistry.layer(for: player)
+        let clock = item.currentTime().seconds
+        if probeTicks <= 15 || probeTicks % 15 == 0 {
+            debugLog(String(format:
+                "[AVP-VIDEO] frames=%d/s framePTS=%@ readyForDisplay=%@ layerPlayerSame=%@ size=%.0fx%.0f videoTrackEnabled=%@ rate=%.2f clock=%.2f",
+                framesPerSec, pts.isFinite ? String(format: "%.2f", pts) : "none",
+                layer.map { $0.isReadyForDisplay ? "true" : "false" } ?? "nolayer",
+                layer.map { $0.player === player ? "true" : "false" } ?? "nolayer",
+                item.presentationSize.width, item.presentationSize.height,
+                videoTrack.map { $0.isEnabled ? "true" : "false" } ?? "notrack",
+                player.rate, clock))
+        }
+        // GH #93: what the engine itself reports around the 10 s
+        // video hold-off, at 1, 5 and 11 s after the item started.
+        if [1, 5, 11].contains(probeTicks) {
+            let df = ISO8601DateFormatter()
+            df.formatOptions = [.withTime, .withFractionalSeconds, .withColonSeparatorInTime]
+            for (i, e) in (item.accessLog()?.events ?? []).enumerated() {
+                debugLog(String(format:
+                    "[AVP-VIDEO] t+%ds accessLog[%d] startup=%.3f playbackStart=%@ watched=%.2f mediaReqs=%d stalls=%d dropped=%d indicated=%.0f observed=%.0f switchBitrate=%.0f transfer=%.2fs uri=%@",
+                    probeTicks, i, e.startupTime,
+                    e.playbackStartDate.map { df.string(from: $0) } ?? "-",
+                    e.durationWatched, e.numberOfMediaRequests,
+                    e.numberOfStalls, e.numberOfDroppedVideoFrames,
+                    e.indicatedBitrate, e.observedBitrate, e.switchBitrate,
+                    e.transferDuration, DebugLogger.sanitize(e.uri ?? "-")))
+            }
+            let errs = item.errorLog()?.events ?? []
+            if errs.isEmpty { debugLog("[AVP-VIDEO] t+\(probeTicks)s errorLog empty") }
+            for (i, e) in errs.enumerated() {
+                debugLog("[AVP-VIDEO] t+\(probeTicks)s errorLog[\(i)] at=\(df.string(from: e.date ?? Date())) domain=\(e.errorDomain) code=\(e.errorStatusCode) comment=\(e.errorComment ?? "-") uri=\(DebugLogger.sanitize(e.uri ?? "-"))")
+            }
+            let loaded = item.loadedTimeRanges.map { r -> String in
+                let t = r.timeRangeValue
+                return String(format: "%.2f-%.2f", t.start.seconds, CMTimeRangeGetEnd(t).seconds)
+            }.joined(separator: ",")
+            let seekable = item.seekableTimeRanges.map { r -> String in
+                let t = r.timeRangeValue
+                return String(format: "%.2f-%.2f", t.start.seconds, CMTimeRangeGetEnd(t).seconds)
+            }.joined(separator: ",")
+            debugLog("[AVP-VIDEO] t+\(probeTicks)s loaded=[\(loaded)] seekable=[\(seekable)] waitsToMinimizeStalling=\(player.automaticallyWaitsToMinimizeStalling) fwdBuf=\(item.preferredForwardBufferDuration) likelyToKeepUp=\(item.isPlaybackLikelyToKeepUp) tracks=\(item.tracks.map { "\($0.assetTrack?.mediaType.rawValue ?? "?"):\($0.isEnabled)" }.joined(separator: ","))")
+        }
+        if probeStaleSeconds > 0, probeStaleSeconds <= 5 || probeStaleSeconds % 10 == 0 {
+            debugLog(String(format:
+                "[AVP-VIDEO] no new frames for %ds while rate=%.0f (clock %.2f, last framePTS %@)",
+                probeStaleSeconds, player.rate, clock,
+                probeLastFramePTS.isFinite ? String(format: "%.2f", probeLastFramePTS) : "none"))
+        }
+    }
+
+    private func freezeTick() {
+        videoProbeTick()
+        checkAudioOnlyBurstyFeed()
+        if externalRenderSuspended {
+            freezeLastMediaTime = .invalid
+            freezeConsecutiveTicks = 0
+            endWaitStreak()
+            return
+        }
+        guard let item = player.currentItem else {
+            freezeLastMediaTime = .invalid
+            freezeConsecutiveTicks = 0
+            return
+        }
+        // 14:26 field freeze (2026-08-25): AVPlayer sat in
+        // .waitingToPlayAtSpecifiedRate at the live edge - not a stall to
+        // the access log, no PlaybackStalled notification, and the first
+        // version of this guard MUTED the detector on exactly that state.
+        // A waiting player IS the freeze; log it with the system's reason.
+        if player.timeControlStatus != .playing {
+            if player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+                freezeConsecutiveTicks += 1
+                let reason = player.reasonForWaitingToPlay?.rawValue ?? "unknown"
+                debugLog(String(format:
+                    "[AVP-FREEZE] waiting (%@) tick %d, pos %.1fs",
+                    reason, freezeConsecutiveTicks, item.currentTime().seconds))
+                maybeNudgeOutOfWait(item: item, reason: reason)
+            } else if expectPlaying {
+                // Device 2026-10-12: a held DVR start left rate 0 with no
+                // wait reason and this detector said nothing for minutes.
+                pausedWhileExpectedTicks += 1
+                let t = pausedWhileExpectedTicks
+                if t <= 5 || t % 10 == 0 {
+                    debugLog(String(format:
+                        "[AVP-FREEZE] rate=0 while expected playing (status paused) tick %d, pos %.1fs",
+                        t, item.currentTime().seconds))
+                }
+                endWaitStreak()
+            } else {
+                endWaitStreak()
+                freezeConsecutiveTicks = 0 // paused deliberately
+                pausedWhileExpectedTicks = 0
+            }
+            freezeLastMediaTime = .invalid
+            return
+        }
+        endWaitStreak()
+        if pausedWhileExpectedTicks > 0 {
+            debugLog("[AVP-FREEZE] rate=0 while expected playing cleared after ~\(pausedWhileExpectedTicks)s")
+            pausedWhileExpectedTicks = 0
+        }
+        let now = item.currentTime()
+        defer { freezeLastMediaTime = now }
+        guard freezeLastMediaTime.isValid else {
+            if freezeConsecutiveTicks > 0 {
+                debugLog(String(format:
+                    "[AVP-FREEZE] recovered after ~%ds frozen (pos %.1fs)",
+                    freezeConsecutiveTicks, now.seconds))
+                freezeConsecutiveTicks = 0
+            }
+            return
+        }
+        let advanced = (now - freezeLastMediaTime).seconds
+        if advanced < 0.25 {
+            freezeConsecutiveTicks += 1
+            debugLog(String(format:
+                "[AVP-FREEZE] clock advanced %.3fs in the last 1.0s wall (tick %d, pos %.1fs, status playing)",
+                advanced, freezeConsecutiveTicks, now.seconds))
+        } else {
+            // Healthy playback resets the escalation ledgers: a stale
+            // playlist that recovered, or sporadic fetch blips hours
+            // apart, must never accumulate into an engine bounce.
+            playlistStaleSince = nil
+            softErrorCount = 0
+            stallGateSince = nil
+            if freezeConsecutiveTicks > 0 {
+                debugLog(String(format:
+                    "[AVP-FREEZE] recovered after ~%ds frozen (pos %.1fs)",
+                    freezeConsecutiveTicks, now.seconds))
+                freezeConsecutiveTicks = 0
+            }
+        }
+    }
+
+    private func endWaitStreak() {
+        minimizeStallsWaitTicks = 0
+        nudgedThisWaitStreak = false
+    }
+
+    /// Post-stall nudge (2026-09-11, atvlogs/s6_85.txt:710-770). On the
+    /// UHD freeze AVPlayer sat in .waitingToPlayAtSpecifiedRate with
+    /// AVPlayerWaitingToMinimizeStallsReason for 7 s AFTER three segments
+    /// (22 MB, 11 s of media) had already landed, until the remuxer
+    /// watchdog rebuilt the pipeline. The data was there; the player was
+    /// simply still waiting. One `playImmediately(atRate:)` per waiting
+    /// streak, and only when new segments really did arrive and the
+    /// loaded range runs at least one target duration past the playhead.
+    /// The watchdog fuse is untouched: if this does not help, it still
+    /// fires exactly as before.
+    private func maybeNudgeOutOfWait(item: AVPlayerItem, reason: String) {
+        if externalRenderSuspended { stallGateSince = nil; return }
+        guard isLive else { return }
+        guard reason == AVPlayer.WaitingReason.toMinimizeStalls.rawValue else {
+            endWaitStreak()
+            return
+        }
+        minimizeStallsWaitTicks += 1
+        if minimizeStallsWaitTicks == 1 {
+            minimizeStallsWaitBaseSegments = TSHLSRemuxer.feedRateWindow.publishedCount()
+            nudgedThisWaitStreak = false
+        }
+        guard minimizeStallsWaitTicks >= 3, !nudgedThisWaitStreak else { return }
+        let newSegments = TSHLSRemuxer.feedRateWindow.publishedCount() - minimizeStallsWaitBaseSegments
+        // First join on a bursty feed (2026-10-04, atv_hz.log 02:03:05-14,
+        // atv_stalls2.log 16:23). The Dispatcharr proxy delivers in bursts
+        // 8 to 9.5 s apart, so segments 0 to 3 were all published within a
+        // second of the tune and then nothing new arrived until the next
+        // burst; the "new segment" guard below held the first frame to 8 to
+        // 9 s. On a plain first join (no stall yet, gate not armed, playhead
+        // at the start) two target durations already loaded is enough to
+        // start at the 3 s floor. The post-stall gate below is untouched.
+        if newSegments < 1, stallGateSince == nil, lastStallAt == nil,
+           item.currentTime().seconds <= 1.0,
+           let loaded = item.loadedTimeRanges.last?.timeRangeValue {
+            let ahead = (loaded.end - item.currentTime()).seconds
+            let td = liveTargetDuration?() ?? 2.0
+            if ahead >= 2 * (td > 0 ? td : 2.0) {
+                nudgedThisWaitStreak = true
+                earlyStartNudgeAt = Date()
+                guard autoPlayAllowed("first join") else { return }
+                player.playImmediately(atRate: 1.0)
+                debugLog(String(format:
+                    "[AVP-NUDGE] first join: %d s waited, %.1f s loaded ahead, no new segment needed; playImmediately",
+                    minimizeStallsWaitTicks, ahead))
+                return
+            }
+        }
+        guard newSegments >= 1 else { return }
+        guard let loadedEnd = item.loadedTimeRanges.last?.timeRangeValue,
+              (loadedEnd.end - item.currentTime()).seconds >= (liveTargetDuration?() ?? 2.0) else { return }
+        let ahead = (loadedEnd.end - item.currentTime()).seconds
+        // Post-stall: hold until the cushion is real (or the 25 s fuse
+        // blows). The plain first-join case, where no stall has armed the
+        // gate, keeps the original playImmediately behavior.
+        if let since = stallGateSince {
+            let waited = Date().timeIntervalSince(since)
+            if ahead < stallGateTarget, waited < AVPlayerProgressDriver.stallGateTimeout {
+                debugLog(String(format:
+                    "[AVP-NUDGE] holding %.0f s until %.1f s buffered (gap %.1f s), %.1f s loaded ahead",
+                    waited, stallGateTarget,
+                    TSHLSRemuxer.feedRateWindow.worstGap(), ahead))
+                return
+            }
+            if ahead < stallGateTarget {
+                debugLog(String(format:
+                    "[AVP-NUDGE] resume gate timed out after %.0f s with only %.1f s buffered (wanted %.1f s); resuming anyway",
+                    waited, ahead, stallGateTarget))
+            } else {
+                debugLog(String(format:
+                    "[AVP-NUDGE] resume gate satisfied after %.0f s: %.1f s buffered (wanted %.1f s)",
+                    waited, ahead, stallGateTarget))
+            }
+            stallGateSince = nil
+        }
+        nudgedThisWaitStreak = true
+        guard autoPlayAllowed("waiting nudge") else { return }
+        player.playImmediately(atRate: 1.0)
+        debugLog(String(format:
+            "[AVP-NUDGE] waiting %ds with %d new segments and %.1fs loaded ahead; playImmediately",
+            minimizeStallsWaitTicks, newSegments, ahead))
+    }
+
+    /// Hard fuse on the resume gate: a feed that never delivers the cushion
+    /// must still produce a picture.
+    static let stallGateTimeout: TimeInterval = 25
+
+    /// Seconds after a Switch Stream source change during which stalls are
+    /// not learned from (hold-back) and no backward rejoin is attempted.
+    static let sourceSwitchLearningQuiet: TimeInterval = 60
+
+    /// Seconds after a first-join early-start nudge during which stalls are
+    /// not learned from (hold-back). Covers about three Dispatcharr burst
+    /// gaps (8 to 9.5 s), the span in which a 4 s starting cushion can run
+    /// dry once before the buffer settles at the burst depth.
+    static let earlyStartLearningQuiet: TimeInterval = 30
+
+    private func learnedHoldback() -> Double {
+        liveHoldbackKey.map { LiveEdgeHoldback.offset(for: $0) } ?? LiveEdgeHoldback.base
+    }
+
+    /// Audio-only bursty feed (2026-10-15, iphone_choppy2.txt 00:38:32 on).
+    /// Dispatcharr's proxy releases a low-bitrate audio-only stream in
+    /// 256 KB chunks, so after the opening burst the remuxer measures 5 to
+    /// 10 s of wall time per 2 s segment. The stall learner below raises the
+    /// offset only after a stall, in steps, and only for the next tune, so a
+    /// radio channel chopped for a minute or more. For audio-only programs
+    /// only, the FIRST starvation above 4 s sets the hold-back to W + 2 s
+    /// (cap 32 s) at once, persists it for the next tune, and rejoins the
+    /// local window at that offset as soon as the window holds it, with no
+    /// 60 s / 3 minute repeat-stall gating. Video channels are untouched.
+    ///
+    /// In-session growth (2026-10-15, Alt Nation on the Apple TV): the
+    /// provider's bursts grew from 9.5 s to 18 to 29 s after the first raise,
+    /// the session kept its 11.5 s offset, and the buffer ran empty twice.
+    /// Every later starved closure whose gap + 2 s (rounded up to whole
+    /// seconds) passes the current hold-back now raises it at once, persists
+    /// it, and rejoins that far back (one rejoin seek per 15 s at most, none
+    /// for a raise under 2 s).
+    private func checkAudioOnlyBurstyFeed() {
+        guard isLive, !externalRenderSuspended,
+              store.isAudioOnlyProgram, let key = liveHoldbackKey else {
+            retryAudioOnlyRejoin()
+            return
+        }
+        // Only a starvation measured during THIS session counts, and each
+        // starved closure is handled once.
+        let nowWall = Date()
+        guard let since = TSHLSRemuxer.lastFeedStarvation.secondsSince(nowWall),
+              since <= nowWall.timeIntervalSince(driverInitWall) else {
+            retryAudioOnlyRejoin()
+            return
+        }
+        let stamp = nowWall.addingTimeInterval(-since)
+        if let handled = audioOnlyHandledStarvation, stamp.timeIntervalSince(handled) < 0.05 {
+            retryAudioOnlyRejoin()
+            return
+        }
+        let gap = TSHLSRemuxer.lastFeedStarvationGap.get()
+        guard gap > 4.0 else {
+            retryAudioOnlyRejoin()
+            return
+        }
+        audioOnlyHandledStarvation = stamp
+        let cap = LiveEdgeHoldback.audioOnlyCap
+        let wanted = (gap + 2.0).rounded(.up)
+        let want = min(cap, wanted)
+        let channel = liveChannelName ?? "-"
+        if !audioOnlyBurstHandled {
+            // First starvation of the session: same as before, from the
+            // learned value (or the base).
+            audioOnlyBurstHandled = true
+            let base = LiveEdgeHoldback.offset(for: key)
+            let target = max(base, want)
+            if want > base + 0.5 {
+                LiveEdgeHoldback.record(want, for: key, cap: cap)
+            }
+            audioOnlyHoldback = target
+            sessionHoldback = max(sessionHoldback, target)
+            liveOffsetFloor = max(liveOffsetFloor, target)
+            debugLog(String(format:
+                "[AVP-HOLDBACK] audio-only bursty feed: gap %.1fs -> hold-back %.1fs now (and for the next tune) channel=%@",
+                gap, target, channel))
+            logAudioOnlyCapIfNeeded(gap: gap, wanted: wanted, cap: cap, channel: channel)
+            audioOnlyPendingRejoin = target
+            retryAudioOnlyRejoin()
+            return
+        }
+        let was = max(audioOnlyHoldback, sessionHoldback)
+        guard want > was else {
+            logAudioOnlyCapIfNeeded(gap: gap, wanted: wanted, cap: cap, channel: channel)
+            retryAudioOnlyRejoin()
+            return
+        }
+        audioOnlyRaiseCount += 1
+        audioOnlyHoldback = want
+        LiveEdgeHoldback.record(want, for: key, cap: cap)
+        sessionHoldback = max(sessionHoldback, want)
+        liveOffsetFloor = max(liveOffsetFloor, want)
+        debugLog(String(format:
+            "[AVP-HOLDBACK] audio-only bursty feed: gap %.1fs -> hold-back %.0fs now (was %.0fs, in-session raise #%d) channel=%@",
+            gap, want, was, audioOnlyRaiseCount, channel))
+        logAudioOnlyCapIfNeeded(gap: gap, wanted: wanted, cap: cap, channel: channel)
+        if want - was >= Self.audioOnlyMinReseekRaise {
+            audioOnlyPendingRejoin = max(audioOnlyPendingRejoin ?? 0, want)
+            audioOnlyRejoinDeferredLogged = false
+            audioOnlySpacingLogged = false
+        } else {
+            if let pending = audioOnlyPendingRejoin {
+                audioOnlyPendingRejoin = max(pending, want)
+            }
+            debugLog(String(format:
+                "[AVP-NUDGE] audio-only raise %.0fs -> %.0fs under %.0f s, no rejoin seek",
+                was, want, Self.audioOnlyMinReseekRaise))
+        }
+        retryAudioOnlyRejoin()
+    }
+
+    /// One line per session when the audio-only ceiling holds the hold-back
+    /// below gap + 2 s.
+    private func logAudioOnlyCapIfNeeded(gap: Double, wanted: Double, cap: Double, channel: String) {
+        guard wanted > cap, !audioOnlyCapLogged else { return }
+        audioOnlyCapLogged = true
+        debugLog(String(format:
+            "[AVP-HOLDBACK] audio-only hold-back capped at %.0fs: gap %.1fs wanted %.0fs channel=%@",
+            cap, gap, wanted, channel))
+    }
+
+    /// Moves the playhead to `audioOnlyPendingRejoin` seconds behind the live
+    /// edge when the local window holds that much; otherwise keeps it pending
+    /// and tries again on the next tick (the window grows by a segment per
+    /// burst). Skipped when the playhead is already that far back.
+    private func retryAudioOnlyRejoin() {
+        guard let holdback = audioOnlyPendingRejoin else { return }
+        guard isLive, !externalRenderSuspended, !store.userPaused,
+              let item = player.currentItem,
+              let range = item.seekableTimeRanges.last?.timeRangeValue else { return }
+        let now = item.currentTime()
+        let end = CMTimeRangeGetEnd(range)
+        let fromEdge = (end - now).seconds
+        let window = (end - range.start).seconds
+        guard fromEdge.isFinite, window.isFinite else { return }
+        if fromEdge >= holdback - 0.5 {
+            audioOnlyPendingRejoin = nil
+            debugLog(String(format:
+                "[AVP-NUDGE] audio-only rejoin not needed: playhead already %.1f s from the edge (hold-back %.1f s)",
+                fromEdge, holdback))
+            return
+        }
+        guard window >= holdback + 0.5 else {
+            if !audioOnlyRejoinDeferredLogged {
+                audioOnlyRejoinDeferredLogged = true
+                debugLog(String(format:
+                    "[AVP-NUDGE] audio-only rejoin waiting: local window %.1f s, needs %.1f s",
+                    window, holdback))
+            }
+            return
+        }
+        if let last = audioOnlyLastRejoinSeekAt,
+           Date().timeIntervalSince(last) < Self.audioOnlyRejoinSpacing {
+            if !audioOnlySpacingLogged {
+                audioOnlySpacingLogged = true
+                debugLog(String(format:
+                    "[AVP-NUDGE] audio-only rejoin to %.1f s held: last rejoin seek %.1f s ago (min %.0f s)",
+                    holdback, Date().timeIntervalSince(last), Self.audioOnlyRejoinSpacing))
+            }
+            return
+        }
+        audioOnlyPendingRejoin = nil
+        audioOnlyLastRejoinSeekAt = Date()
+        lastRejoinAt = Date()
+        stallGateSince = nil
+        let target = end - CMTime(seconds: holdback, preferredTimescale: 600)
+        debugLog(String(format:
+            "[AVP-NUDGE] audio-only rejoin: seeking to %.1f s behind the edge (was %.1f s, window %.1f s)",
+            holdback, fromEdge, window))
+        player.seek(to: target, toleranceBefore: .zero,
+                    toleranceAfter: CMTime(seconds: 0.5, preferredTimescale: 600)) { [weak self] _ in
+            guard let self, self.autoPlayAllowed("audio-only rejoin") else { return }
+            self.player.playImmediately(atRate: 1.0)
+        }
+    }
+
+    /// Arm the post-stall resume gate. Target = worst observed delivery gap
+    /// times 1.5 plus 2 s, capped at 12 s (raised from gap + 2 s capped at
+    /// 8 s on 2026-09-13: against 7 to 8 s gaps the old target was pinned at
+    /// the 8 s cap and covered barely one gap, so the very next gap stalled
+    /// again). The learned hold-back is deliberately NOT part of this target;
+    /// it still governs the next tune and Return to Live. A feed measured
+    /// below real time is not bursty, and no wait fills a buffer the provider
+    /// is not filling, so the gate is skipped entirely there.
+    ///
+    /// On the SECOND stall within 60 s the gate is not armed at all: see
+    /// `attemptRepeatStallRejoin`, which moves the playhead back into the
+    /// local window instead of waiting at the edge.
+    private func armStallResumeGate() {
+        guard isLive, !externalRenderSuspended else { return }
+        let now = Date()
+        let repeated = lastStallAt.map { now.timeIntervalSince($0) < 60 } ?? false
+        lastStallAt = now
+        if repeated, attemptRepeatStallRejoin() {
+            // Reset the repeat window so a third stall goes through the gate
+            // again rather than chaining rejoins.
+            lastStallAt = nil
+            stallGateSince = nil
+            return
+        }
+        let gap = TSHLSRemuxer.feedRateWindow.worstGap()
+        if let rate = TSHLSRemuxer.feedRateWindow.rateRatio(), rate < 0.9 {
+            stallGateSince = nil
+            debugLog(String(format: "[AVP-NUDGE] gate skipped: upstream rate %.2f", rate))
+            return
+        }
+        let target = min(12.0, gap * 1.5 + 2.0)
+        stallGateTarget = target
+        stallGateSince = Date()
+        debugLog(String(format:
+            "[AVP-NUDGE] holding after stall until %.1f s buffered (gap %.1f s), timeout %.0f s",
+            target, gap, AVPlayerProgressDriver.stallGateTimeout))
+    }
+
+    /// Repeat-stall rejoin. Seeks the playhead BACKWARD into the part of the
+    /// local remux window that is already buffered, by the hold-back this
+    /// channel has learned, and resumes immediately. Deliberately backward:
+    /// the single-stall rule (never move the playhead back) still holds, this
+    /// runs only when the same channel has emptied the buffer twice inside a
+    /// minute and the window behind the playhead is genuinely there.
+    /// At most one rejoin per 3 minutes so it cannot loop.
+    /// Returns true when it seeked.
+    @discardableResult
+    private func attemptRepeatStallRejoin() -> Bool {
+        guard isLive, let item = player.currentItem else { return false }
+        // Moving back into the window across a source switch replays the
+        // OLD source; the switch watch returns to live instead.
+        if let sinceSwitch = TSHLSRemuxer.lastSourceSwitch.secondsSince(),
+           sinceSwitch < Self.sourceSwitchLearningQuiet { return false }
+        if let last = lastRejoinAt, Date().timeIntervalSince(last) < 180 { return false }
+        // What is ACTUALLY available behind the playhead, from the item's own
+        // seekable range (the remuxer's sliding window as AVPlayer sees it).
+        guard let range = item.seekableTimeRanges.last?.timeRangeValue else { return false }
+        let now = item.currentTime()
+        let behind = (now - range.start).seconds
+        guard behind.isFinite, behind > 0 else { return false }
+        let learned = learnedHoldback()
+        let cap = min(learned, behind - 1.0, 18.0)
+        // Not enough window to be worth a backward move.
+        guard cap >= 8.0 else { return false }
+        let back = max(8.0, cap)
+        let target = now - CMTime(seconds: back, preferredTimescale: 600)
+        guard target >= range.start else { return false }
+        lastRejoinAt = Date()
+        debugLog(String(format:
+            "[AVP-NUDGE] rejoin: seeking back %.0f s into the local window (learned %.0f s, window %.0f s)",
+            back, learned, behind))
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: CMTime(seconds: 0.5, preferredTimescale: 600)) { [weak self] _ in
+            guard let self, self.autoPlayAllowed("rejoin") else { return }
+            self.player.playImmediately(atRate: 1.0)
+        }
+        return true
+    }
+
+    /// False (and logged) when the user paused this tile: automatic
+    /// recovery may fill the buffer, never start playback.
+    func autoPlayAllowed(_ site: String) -> Bool {
+        guard store.userPaused else { return true }
+        debugLog("[AVP-NUDGE] skipped: user paused (\(site))")
+        return false
+    }
+
+    /// The remuxer's TARGETDURATION can grow during the first seconds of
+    /// a tune (a long GOP closes and the monotonic pin rises), which
+    /// stretches AVPlayer's poll cadence and leaves the join offset
+    /// chosen at `startPlayer` too small for the new geometry - the
+    /// session7 ESPN stall. Re-apply the offset for that case, but ONLY
+    /// inside the first 30 s and ONLY while the buffer is empty: writing
+    /// `configuredTimeOffsetFromLive` on a healthy playing item is what
+    /// made the player seek backward and replay content (see
+    /// `logPerfSummary`).
+    private func maybeRaiseJoinOffset() {
+        // Deliberately NOT applied mid-stream (2026-09-13): raising
+        // configuredTimeOffsetFromLive makes AVPlayer refill to the new
+        // offset before it plays, a wait of up to the whole hold-back
+        // (18 s on the device run) that the 8 s resume gate cannot bound.
+        // The learned hold-back therefore stays a NEXT-TUNE setting, plus
+        // the Return to Live floor; only the first-30 s targetDuration
+        // correction below writes the offset.
+        guard isLive, !externalRenderSuspended, let provider = liveTargetDuration,
+              let item = player.currentItem,
+              CACurrentMediaTime() - launchStart < 30 else { return }
+        let td = provider()
+        guard td > 0 else { return }
+        let want = min(18.0, max(3 * td, liveOffsetFloor))
+        guard want > appliedLiveOffset + 0.5, item.isPlaybackBufferEmpty else { return }
+        appliedLiveOffset = want
+        item.configuredTimeOffsetFromLive = CMTime(seconds: want, preferredTimescale: 600)
+        debugLog(String(format:
+            "[AVP-HOLDBACK] join offset raised to %.1fs (targetDuration grew to %.1f, buffer empty, %.0fs into the tune)",
+            want, td, CACurrentMediaTime() - launchStart))
+    }
+
+    private func logPerfSummary() {
+        guard let event = player.currentItem?.accessLog()?.events.last else { return }
+        // Live-edge cushion: seekable end minus playhead. The number that
+        // sizes the anti-freeze cushion; freezes should correlate with
+        // this hitting ~0.
+        var edge = -1.0
+        if let item = player.currentItem,
+           let range = item.seekableTimeRanges.last?.timeRangeValue {
+            edge = (range.end - item.currentTime()).seconds
+        }
+        let stalls = event.numberOfStalls
+        let dropped = event.numberOfDroppedVideoFrames
+        let dStalls = max(0, stalls - lastStallCount)
+        let dDropped = max(0, dropped - lastDroppedFrames)
+        lastStallCount = stalls
+        // Adaptive hold-back (Xtream soak, 2026-09-03): the remux serves 2 s
+        // segments and AVPlayer's default hold-back parks playback ~5 s from
+        // the edge, which a bursty source runs dry about every 90 s. Each
+        // NEW stall on a live stream moves the target 3 s further back
+        // (6 -> 9 -> ... -> 18); a steady stream never pays the latency.
+        //
+        // REWORKED 2026-09-11. Writing `configuredTimeOffsetFromLive` on a
+        // PLAYING item is what produced the "looping" Logan reported: the
+        // player honours the larger offset by repositioning the playhead
+        // back from the edge, so the content replays. The chain is in every
+        // log, pre-batch and post-batch, always in this order and always
+        // within ~1 s: [AVP-HOLDBACK] -> CoreMedia -12640 "Cannot get that
+        // close to live" -> [AVP-FREEZE] clock advanced -N s
+        // (session.txt:3422-3425 -8.107s, :3978-3982 -2.466s;
+        // session6.txt:17:59:04-05 -5.747s). So the new offset is never
+        // applied to the session that stalled; it is remembered for the
+        // channel and applied at its NEXT tune, where it costs nothing.
+        //
+        // The first version of this rule then refused to raise the offset
+        // at all whenever the remuxer had just reported a starved closure,
+        // on the theory that no hold-back fills a buffer the provider is
+        // not feeding (this provider: "34 starved closures, worst gap
+        // 8.8s", session.txt:4022).
+        //
+        // REFINED 2026-09-11 (atvlogs/s6_85.txt). That blanket ignore was
+        // wrong for the common case: EVERY stall in that session followed
+        // an upstream gap and so every one was answered by "[AVP-HOLDBACK]
+        // stall #N ignored: upstream starved Ns ago", which meant the
+        // hold-back never grew even though a bigger hold-back was exactly
+        // what would have absorbed the jitter. The feed there is BURSTY,
+        // not slow: 5 to 8 s of nothing and then two or three segments at
+        // once, with the AVERAGE rate still at real time (ESPN HD
+        // :340-380, ESPNU :540-580 and :640-665, UHD :710-770 where three
+        // segments, 22 MB and 11 s of media, landed in one go). So the
+        // decision now reads the rate, not the timestamp:
+        //   - average at or above real time (or not enough window yet):
+        //     bursty, raise the hold-back past the worst observed gap;
+        //   - average below real time: genuinely slow, keep ignoring.
+        if isLive, dStalls > 0, let key = liveHoldbackKey {
+            let rate = TSHLSRemuxer.feedRateWindow.rateRatio()
+            let worstGap = TSHLSRemuxer.feedRateWindow.worstGap()
+            if let sinceSwitch = TSHLSRemuxer.lastSourceSwitch.secondsSince(),
+               sinceSwitch < Self.sourceSwitchLearningQuiet {
+                // Switch Stream (2026-09-15): the stall is the source swap,
+                // not feed jitter. Learning from it pushed ESPN's live edge
+                // 6 -> 18 s ("worst gap 25.5s") for every later tune.
+                debugLog(String(format:
+                    "[AVP-HOLDBACK] stall #%d ignored: source switch %.0fs ago, a switch gap is not feed jitter",
+                    stalls, sinceSwitch))
+            } else if let early = earlyStartNudgeAt,
+                      Date().timeIntervalSince(early) < Self.earlyStartLearningQuiet {
+                debugLog(String(format:
+                    "[AVP-HOLDBACK] stall #%d ignored: first-join early start %.0fs ago, a thin starting cushion is not feed jitter",
+                    stalls, Date().timeIntervalSince(early)))
+            } else if let rate, rate < 0.95 {
+                debugLog(String(format:
+                    "[AVP-HOLDBACK] stall #%d ignored: upstream below real time (rate %.2f), a larger hold-back cannot fill a buffer the feed is not filling",
+                    stalls, rate))
+            } else {
+                let td = liveTargetDuration?() ?? 2.0
+                let learnedBase = LiveEdgeHoldback.offset(for: key)
+                // Audio-only programs use their own ceiling, and the base is
+                // never below the in-session value, so a stall after an
+                // in-session raise never lowers it (2026-10-15).
+                let audioOnly = store.isAudioOnlyProgram
+                let ceiling = audioOnly ? LiveEdgeHoldback.audioOnlyCap : 18.0
+                let base = audioOnly ? max(learnedBase, audioOnlyHoldback) : learnedBase
+                let next = min(ceiling, max(base + 3, worstGap + (td > 0 ? td : 2.0)))
+                if next > base + 0.5 {
+                    LiveEdgeHoldback.record(next, for: key, cap: ceiling)
+                }
+                // Applied to THIS session as well (2026-09-13): the raise is
+                // the session's target live-edge offset from here on, and the
+                // next empty-buffer moment writes it onto the item.
+                sessionHoldback = max(sessionHoldback, max(base, next))
+                debugLog(String(format:
+                    "[AVP-HOLDBACK] stall #%d: bursty feed (rate %.2f, worst gap %.1fs), live edge offset %.0fs -> %.0fs for the NEXT tune of this channel and for Return to Live",
+                    stalls, rate ?? -1, worstGap, base, max(base, next)))
+            }
+        }
+        lastDroppedFrames = dropped
+        // rss rides this tick deliberately. Apple #74 was an ingest buffer
+        // growing at exactly the stream bitrate for the whole session, and
+        // nothing sampled memory during steady playback -- rss was only
+        // logged per tune and on an OS memory warning, by which point the
+        // jetsam kill is minutes away. A periodic sample turns that class of
+        // leak into a visible slope in any ordinary debug log.
+        // "fp" = phys_footprint, the number jetsam actually judges
+        // (ProcessMetrics returns it despite the legacy "rss" name).
+        // Labeled honestly since the 2026-08-26 kill analysis compared
+        // this line against the JetsamEvent pages and needed the
+        // distinction.
+        debugLog(String(format:
+            "[AVP-PERF] stalls:+%d(%d) dropped:+%d(%d) observed=%.0fkbps mediaReqs=%d edge=%.1fs fp=%.1f MB",
+            dStalls, stalls, dDropped, dropped,
+            event.observedBitrate / 1000,
+            // Renamed from "switches" 2026-09-11: this is
+            // AVPlayerItemAccessLogEvent.numberOfMediaRequests, the count
+            // of media/playlist REQUESTS in this access-log event, not
+            // bitrate/rendition switches (the remux serves a single
+            // rendition, so it can never switch). It climbing 6 -> 23 in a
+            // minute on the UHD run was just the segment fetch cadence.
+            event.numberOfMediaRequests, edge,
+            Double(ProcessMetrics.residentSetSizeBytes()) / 1_048_576.0))
+    }
+
+    /// Map AVMediaSelectionGroups to the overlay's integer-id track lists.
+    /// Uses the async `loadMediaSelectionGroup(for:)` accessor (the
+    /// synchronous `mediaSelectionGroup(forMediaCharacteristic:)` is
+    /// deprecated since iOS 16). Called at `status == .readyToPlay`, so
+    /// the groups are already loaded and the awaits return immediately.
+    private func populateTracks(item: AVPlayerItem) async {
+        let asset = item.asset
+        let audioGroup = try? await asset.loadMediaSelectionGroup(for: .audible)
+        let subGroup = try? await asset.loadMediaSelectionGroup(for: .legible)
+
+        audibleGroup = audioGroup
+        legibleGroup = subGroup
+        audioOptionByID.removeAll()
+        subtitleOptionByID.removeAll()
+
+        var audioTracks: [MediaTrack] = []
+        if let audioGroup {
+            for (index, option) in audioGroup.options.enumerated() {
+                let id = index + 1
+                audioOptionByID[id] = option
+                audioTracks.append(MediaTrack(
+                    id: id, type: "audio",
+                    title: option.displayName,
+                    lang: option.extendedLanguageTag ?? "",
+                    codec: "", isDefault: index == 0))
+            }
+        }
+        var subtitleTracks: [MediaTrack] = []
+        if let subGroup {
+            for (index, option) in subGroup.options.enumerated() {
+                let id = index + 1
+                subtitleOptionByID[id] = option
+                subtitleTracks.append(MediaTrack(
+                    id: id, type: "sub",
+                    title: option.displayName,
+                    lang: option.extendedLanguageTag ?? "",
+                    codec: "", isDefault: false))
+            }
+        }
+
+        store.audioTracks = audioTracks
+        debugLog("[AVP-TRACKS] audible=\(audioTracks.count) [\(audioTracks.map(\.title).joined(separator: ", "))] legible=\(subtitleTracks.count) externalSubs=\(store.externalSubtitleControl)")
+        if !store.externalSubtitleControl {
+            store.subtitleTracks = subtitleTracks
+            // Subtitles start OFF, once per item: the system caption
+            // preference otherwise auto-selects a legible rendition.
+            if let subGroup, !appliedDefaultSubtitleOff {
+                appliedDefaultSubtitleOff = true
+                if item.currentMediaSelection.selectedMediaOption(in: subGroup) != nil {
+                    item.select(nil, in: subGroup)
+                    debugLog("[AVP-TRACKS] deselected auto-enabled subtitles (default off)")
+                }
+            }
+            if let subGroup,
+               let selected = item.currentMediaSelection.selectedMediaOption(in: subGroup),
+               let id = subtitleOptionByID.first(where: { $0.value == selected })?.key {
+                store.currentSubtitleTrackID = id
+            } else {
+                store.currentSubtitleTrackID = 0
+            }
+        }
+        // Reflect the current audio selection back as the highlighted id.
+        if let audioGroup,
+           let selected = item.currentMediaSelection.selectedMediaOption(in: audioGroup),
+           let id = audioOptionByID.first(where: { $0.value == selected })?.key {
+            store.currentAudioTrackID = id
+        }
+    }
+
+    /// Fills `streamInfo.fps` once anything can report it. Order matches
+    /// the press-free truth of the engine: the track's nominal cadence
+    /// (already applied in `populateStreamInfo` when non-zero), then the
+    /// PRESENTED rate once frames render, then the remuxer's own measured
+    /// rate for the TS / fMP4 path, which declares no nominal rate at all.
+    private func sampleFrameRateIfUnknown() {
+        // Presented rate is tracked for the panel only - it is what
+        // AVPlayer managed to show, not what the stream declares, and it
+        // reads low while buffering or dropping (Logan 2026-09-11: 32fps
+        // on a 59.94 feed). It NEVER becomes streamInfo.fps.
+        if let item = player.currentItem {
+            for track in item.tracks where track.currentVideoFrameRate > 0 {
+                let presented = Double(track.currentVideoFrameRate)
+                if abs(presented - store.streamInfo.presentedFps) > 0.01 {
+                    store.streamInfo.presentedFps = presented
+                }
+                break
+            }
+        }
+        // The remuxed path's stream rate: the SPS VUI declaration when the
+        // stream carries one, else the long-window snapped median.
+        let remux = RemuxMeasuredVideo.shared
+        if remux.isInterlaced != store.streamInfo.isInterlaced {
+            store.streamInfo.isInterlaced = remux.isInterlaced
+        }
+        guard store.streamInfo.fps == 0, remux.fps > 0 else { return }
+        store.streamInfo.fps = remux.fps
+    }
+
+    private func populateStreamInfo(item: AVPlayerItem) {
+        let size = item.presentationSize
+        if size.width > 0 {
+            store.streamInfo.width = Int(size.width)
+            store.streamInfo.height = Int(size.height)
+        }
+        // AVPlayer decodes through AVFoundation / VideoToolbox. Label the
+        // decoder so the card reads as a healthy native session rather than a
+        // blank mpv one. mpv's fps/hwdec/audio/cache fields don't exist on the
+        // AVPlayer path, so fill the ones AVFoundation exposes and leave the
+        // internal-only ones (avsync, dropped frames) at 0.
+        store.streamInfo.hwdec = "AVFoundation"
+
+        // `currentVideoFrameRate` is the PRESENTED rate, so it is recorded
+        // separately and never used as the stream's rate. The stream rate
+        // comes from the track's nominalFrameRate below, or (remux path,
+        // where fMP4 declares none) from the SPS VUI timing the remuxer
+        // parsed - see sampleFrameRateIfUnknown.
+        for track in item.tracks where track.currentVideoFrameRate > 0 {
+            store.streamInfo.presentedFps = Double(track.currentVideoFrameRate)
+        }
+
+        // Buffered-ahead seconds (the AVPlayer analog of mpv's demuxer cache).
+        if let range = item.loadedTimeRanges.last?.timeRangeValue {
+            let end = CMTimeGetSeconds(range.start + range.duration)
+            let now = CMTimeGetSeconds(item.currentTime())
+            if end.isFinite, now.isFinite, end > now {
+                store.streamInfo.cacheDuration = end - now
+            }
+        }
+
+        // Observed bitrate from the access log, when available.
+        if let event = item.accessLog()?.events.last, event.observedBitrate > 0 {
+            store.streamInfo.bitrate = event.observedBitrate / 8
+        }
+
+        // Codec + audio format need iOS 16's async track loads. This class is
+        // @MainActor, so the Task resumes on the main actor and the store
+        // writes stay actor-isolated.
+        let assetTracks = item.tracks.compactMap(\.assetTrack)
+        Task { [weak self] in
+            guard let self else { return }
+            for asset in assetTracks {
+                switch asset.mediaType {
+                case .video:
+                    // nominalFrameRate is the track's own cadence and beats
+                    // the presented rate seeded above (a deinterlaced 1080i
+                    // presents at 59.94 while the source runs at 29.97).
+                    if let rate = try? await asset.load(.nominalFrameRate), rate > 0 {
+                        self.store.streamInfo.fps = VideoRateStandards.snap(Double(rate))
+                    }
+                    if let fds = try? await asset.load(.formatDescriptions), let fd = fds.first {
+                        self.store.streamInfo.videoCodec =
+                            Self.fourCCString(CMFormatDescriptionGetMediaSubType(fd))
+                        // Interlaced when the format description carries a
+                        // FieldCount of 2 (broadcast 1080i / 480i).
+                        if let fieldCount = CMFormatDescriptionGetExtension(
+                            fd, extensionKey: kCMFormatDescriptionExtension_FieldCount
+                        ) as? Int {
+                            self.store.streamInfo.isInterlaced = fieldCount > 1
+                        }
+                        // Display size fallback for sources whose
+                        // presentationSize has not arrived yet: the coded
+                        // dimensions corrected by the pixel aspect ratio.
+                        if self.store.streamInfo.width == 0 {
+                            let dims = CMVideoFormatDescriptionGetPresentationDimensions(
+                                fd, usePixelAspectRatio: true, useCleanAperture: true
+                            )
+                            if dims.width > 0 {
+                                self.store.streamInfo.width = Int(dims.width)
+                                self.store.streamInfo.height = Int(dims.height)
+                            }
+                        }
+                    }
+                case .audio:
+                    if let fds = try? await asset.load(.formatDescriptions), let fd = fds.first {
+                        if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee {
+                            self.store.streamInfo.sampleRate = Int(asbd.mSampleRate)
+                            self.store.streamInfo.channels = Int(asbd.mChannelsPerFrame)
+                        }
+                        self.store.streamInfo.audioCodec =
+                            Self.fourCCString(CMFormatDescriptionGetMediaSubType(fd))
+                    }
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    /// Render a CoreMedia media-subtype FourCC (e.g. 'avc1', 'ac-3') as a
+    /// readable codec string for the stream-info card.
+    private static func fourCCString(_ code: FourCharCode) -> String {
+        let bytes = [UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF),
+                     UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF)]
+        let s = String(bytes: bytes, encoding: .ascii)?
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \0")) ?? ""
+        return s.isEmpty ? String(format: "0x%08X", code) : s
+    }
+
+    /// Intents OUT: store command closures -> AVPlayer.
+    /// Live Rewind window pump (0.5s, main queue): currentMs = playhead
+    /// offset from the seekable start (the chrome domain), engine
+    /// window = wall-clock mapping of the seekable range, timeshifting
+    /// derived from edge distance vs the learned natural cushion.
+    private func pumpLiveRewindWindow(_ time: CMTime) {
+        guard liveRewindWindowActive,
+              let range = player.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return }
+        let start = CMTimeGetSeconds(range.start)
+        let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+        let cur = time.seconds
+        guard start.isFinite, end.isFinite, cur.isFinite, end > start else { return }
+        store.currentMs = Int32(max(0, (cur - start) * 1000))
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let windowMs = Int64((end - start) * 1000)
+        let engine = LiveRewindEngine.shared
+        Task { @MainActor in
+            engine.updateExternalWindow(tailWallMs: now - windowMs, headWallMs: now)
+        }
+        // Edge accounting. While at the edge and actually playing, learn
+        // the natural cushion; flip to timeshifting only when the
+        // playhead falls well beyond it (a pause, or a seek the action
+        // below already flagged). Rejoining within cushion+5s flips back.
+        let behind = end - cur
+        if engine.timeshifting {
+            if behind < naturalEdgeOffset + 5 { engine.noteTimeshifting(false) }
+        } else if player.timeControlStatus == .playing {
+            if behind < naturalEdgeOffset + 10 {
+                naturalEdgeOffset = naturalEdgeOffset * 0.95 + behind * 0.05
+            } else if behind > naturalEdgeOffset + 20 {
+                engine.noteTimeshifting(true)
+            }
+        }
+    }
+
+    /// GH #93: an in-progress recording's playlist is live-shaped and its
+    /// seekable end is the last segment the server has published. A seek
+    /// that lands on (or past) that end leaves AVPlayer nothing to buffer
+    /// ahead, so it waits for the next segment while the chrome shows a
+    /// frozen frame. Keep every DVR seek this far behind the written end.
+    static let dvrSeekEdgeMarginSeconds: Double = 12
+
+    /// Clamps a DVR-window seek target into [start, end - margin]. Nil
+    /// when the item has no usable seekable range yet (caller seeks as
+    /// asked). Logs every clamp so a tester can see it happen.
+    static func dvrClampedSeekSeconds(_ requested: Double, player: AVPlayer) -> Double? {
+        guard let range = player.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return nil }
+        let start = CMTimeGetSeconds(range.start)
+        let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+        guard start.isFinite, end.isFinite, end > start else { return nil }
+        let ceiling = max(start, end - dvrSeekEdgeMarginSeconds)
+        let target = min(max(requested, start), ceiling)
+        if target != requested {
+            debugLog("[AVP-DVR] seek clamped requested=\(String(format: "%.1f", requested))s -> \(String(format: "%.1f", target))s (written end \(String(format: "%.1f", end))s, margin \(Int(dvrSeekEdgeMarginSeconds))s)")
+        } else {
+            debugLog("[AVP-DVR] seek to \(String(format: "%.1f", target))s (written end \(String(format: "%.1f", end))s)")
+        }
+        return target
+    }
+
+    private func wireCommands(_ player: AVPlayer) {
+        store.togglePauseAction = { [weak self, weak player] in
+            guard let player else { return }
+            let resuming = player.timeControlStatus == .paused
+            self?.store.noteUserPause(!resuming, positionSeconds: player.currentTime().seconds)
+            // Live, no rewind window: a long pause can outlive the sliding
+            // playlist; resume at the live edge instead of a dead position.
+            if resuming, let self, self.isLive, !self.liveRewindWindowActive,
+               let item = player.currentItem,
+               let range = item.seekableTimeRanges.last?.timeRangeValue {
+                let start = CMTimeGetSeconds(range.start)
+                let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+                let cur = player.currentTime().seconds
+                if start.isFinite, end.isFinite, cur.isFinite, cur < start + 1 || end - cur > 60 {
+                    debugLog(String(format: "[PLAYER] user resume -> live edge (buffer exhausted) pos=%.1fs window=%.1f-%.1fs", cur, start, end))
+                    player.seek(to: CMTime(seconds: max(start, end - 6), preferredTimescale: 600)) { _ in
+                        player.play()
+                    }
+                    return
+                }
+            }
+            if let self, self.store.isDVRWindow {
+                // GH #93 instrumentation: position and buffered-ahead at
+                // every DVR pause/resume, so a post-resume freeze can be
+                // matched against what AVPlayer actually held.
+                let cur = player.currentTime().seconds
+                let ahead = player.currentItem?.loadedTimeRanges
+                    .map { $0.timeRangeValue }
+                    .first { CMTimeRangeContainsTime($0, time: player.currentTime()) }
+                    .map { CMTimeGetSeconds(CMTimeRangeGetEnd($0)) - cur } ?? 0
+                debugLog("[AVP-DVR] \(resuming ? "resume" : "pause") at \(String(format: "%.1f", cur))s, \(String(format: "%.1f", ahead))s buffered ahead")
+            }
+            self?.expectPlaying = resuming
+            if resuming { player.play() } else { player.pause() }
+        }
+        store.seekAction = { [weak self, weak player] ms in
+            guard let player else { return }
+            // Live Rewind: incoming targets are ms from the window tail
+            // (the chrome domain). Map onto the playlist timeline;
+            // within 5s of the head = rejoin live.
+            if let self, self.isLive, self.liveRewindWindowActive {
+                guard let range = player.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return }
+                let start = CMTimeGetSeconds(range.start)
+                let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+                guard start.isFinite, end.isFinite, end > start else { return }
+                let window = end - start
+                let target = min(max(0, Double(ms) / 1000.0), window)
+                if target >= window - 5 {
+                    LiveRewindEngine.shared.noteTimeshifting(false)
+                    debugLog("[AVP-REWIND] seek -> live edge")
+                    player.seek(to: CMTime(seconds: max(start, end - 1), preferredTimescale: 600))
+                } else {
+                    LiveRewindEngine.shared.noteTimeshifting(true)
+                    debugLog("[AVP-REWIND] seek -> \(Int(target))s into \(Int(window))s window")
+                    player.seek(to: CMTime(seconds: start + target, preferredTimescale: 600),
+                                toleranceBefore: .zero, toleranceAfter: .zero)
+                }
+                self.store.currentMs = Int32(target * 1000)
+                if player.timeControlStatus == .paused { player.play() }
+                return
+            }
+            var target = CMTime(value: CMTimeValue(ms), timescale: 1000)
+            if let self, self.store.isDVRWindow,
+               let clamped = Self.dvrClampedSeekSeconds(Double(ms) / 1000.0, player: player) {
+                target = CMTime(seconds: clamped, preferredTimescale: 600)
+            }
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        store.relativeSeekAction = { [weak self, weak player] deltaMs in
+            guard let player else { return }
+            // Solo-player parity: a deliberate backward seek on live
+            // latches behind-the-edge (their timeshifting flag does the
+            // same on astralts re-tunes); Return to Live clears it.
+            if let self, self.isLive, deltaMs < 0 {
+                self.store.behindLiveEdge = true
+            }
+            let cur = player.currentTime().seconds
+            guard cur.isFinite else { return }
+            var target = cur + Double(deltaMs) / 1000.0
+            if let self, self.store.isDVRWindow,
+               let clamped = Self.dvrClampedSeekSeconds(target, player: player) {
+                target = clamped
+            } else if let range = player.currentItem?.seekableTimeRanges.last?.timeRangeValue {
+                let start = CMTimeGetSeconds(range.start)
+                let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+                if start.isFinite, end.isFinite {
+                    target = min(max(target, start), max(start, end - 1))
+                }
+            }
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
+                        toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        store.seekToLiveAction = { [weak self, weak player] in
+            guard let player,
+                  let range = player.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return }
+            self?.store.behindLiveEdge = false
+            let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+            guard end.isFinite else { return }
+            // Never rejoin closer to the edge than this channel has taught
+            // us it can sustain (2026-09-13): landing 1 s back on a bursty
+            // feed just books the next stall.
+            let ceiling = (self?.store.isAudioOnlyProgram ?? false) ? LiveEdgeHoldback.audioOnlyCap : 20.0
+            let back = max(1.0, min(ceiling, self?.sessionHoldback ?? 0))
+            player.seek(to: CMTime(seconds: max(0, end - back), preferredTimescale: 600))
+            if player.timeControlStatus == .paused { player.play() }
+        }
+        store.replayFromStartAction = { [weak player] in
+            guard let player else { return }
+            player.seek(to: .zero)
+            player.play()
+        }
+        store.setSpeedAction = { [weak self, weak player] rate in
+            guard let player else { return }
+            player.rate = Float(rate)
+            self?.store.speed = rate
+        }
+        store.setAudioTrackAction = { [weak self] id in
+            guard let self, let group = self.audibleGroup else { return }
+            self.player.currentItem?.select(self.audioOptionByID[id], in: group)
+            self.store.currentAudioTrackID = id
+        }
+        store.setSubtitleTrackAction = { [weak self] id in
+            guard let self, let group = self.legibleGroup else { return }
+            // id 0 = off (mpv sid 0 parity).
+            self.player.currentItem?.select(id == 0 ? nil : self.subtitleOptionByID[id], in: group)
+            self.store.currentSubtitleTrackID = id
+        }
+    }
+
+    func teardown() {
+        if let timeObserver { player.removeTimeObserver(timeObserver) }
+        timeObserver = nil
+        observations.forEach { $0.invalidate() }
+        observations.removeAll()
+        itemObservations.forEach { $0.invalidate() }
+        itemObservations.removeAll()
+        itemNotificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        itemNotificationTokens.removeAll()
+        perfTimer?.invalidate()
+        perfTimer = nil
+        freezeTimer?.invalidate()
+        freezeTimer = nil
+        if let out = probeOutput, let item = probeItem { item.remove(out) }
+        probeOutput = nil
+        aspectCancellable?.cancel()
+        aspectCancellable = nil
+        onUnrecoverable = nil
+        // Drop the closures so a torn-down driver can't drive a dead player.
+        store.togglePauseAction = nil
+        store.seekAction = nil
+        store.relativeSeekAction = nil
+        store.seekToLiveAction = nil
+        store.replayFromStartAction = nil
+        store.setSpeedAction = nil
+        store.setAudioTrackAction = nil
+        store.setSubtitleTrackAction = nil
+    }
+    // No deinit safety net: a @MainActor class's nonisolated deinit
+    // cannot legally touch the non-Sendable timeObserver. It is
+    // unnecessary anyway, the driver holds `player` strongly (so the
+    // player outlives the observer), the screen always calls teardown()
+    // in onDisappear before releasing the driver, and the late-remux
+    // path that could once create an orphan driver is now closed by
+    // niling the remuxer callbacks in onDisappear.
+}
+
+/// The unified liquid-glass player chrome: ONE SwiftUI container, ONE
+/// visibility Bool, so every control fades in and out together as a
+/// single unit (the UHF-style smoothness the old mounted-capsule
+/// approach could only approximate). Engine-agnostic by construction:
+/// everything it renders reads `PlayerProgressStore` and everything it
+/// does goes through the store's command closures or host-provided
+/// intents, so the SAME view can sit over an AVPlayerLayer today and
+/// the mpv render surface when that host migrates.
+struct UnifiedPlayerChrome: View {
+    @ObservedObject var progress: PlayerProgressStore
+    let title: String
+    let programName: String?
+    /// Player Info Card: episode title + synopsis for the current
+    /// program. Nil/empty simply drops the row.
+    var programSubtitle: String? = nil
+    var programDescription: String? = nil
+    let programStart: Date?
+    let programEnd: Date?
+    let canRecord: Bool
+    /// Shows the engine escape hatch row when non-nil (AVPlayer host).
+    let onSwitchToMPV: (() -> Void)?
+    let onClose: () -> Void
+    let onRecord: () -> Void
+    let onAddStream: () -> Void
+    let onStreamInfo: () -> Void
+    let onSleepTimer: (TimeInterval?) -> Void
+    /// Bump the host's auto-hide timer (called on every interaction).
+    let onInteract: () -> Void
+    /// Cancel/restart the auto-hide while the overflow menu is open, so
+    /// the chrome can't fade out (and unmount the menu's anchor) under
+    /// the user's finger. Same hooks the mpv overflow menu uses.
+    var onMenuOpen: (() -> Void)? = nil
+    var onMenuClose: (() -> Void)? = nil
+
+    /// Ticks the live progress band once a minute.
+    @State private var bandNow = Date()
+    private let bandTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+
+    // Settings > App Behaviors > Player Info Card. Card rows only.
+    @AppStorage(PlayerInfoCardSettings.channelNameKey) private var showCardChannelName = true
+    @AppStorage(PlayerInfoCardSettings.programNameKey) private var showCardProgramName = true
+    @AppStorage(PlayerInfoCardSettings.programTimeKey) private var showCardProgramTime = true
+    @AppStorage(PlayerInfoCardSettings.programSubtitleKey) private var showCardProgramSubtitle = true
+    @AppStorage(PlayerInfoCardSettings.programDescriptionKey) private var showCardProgramDescription = true
+
+    var body: some View {
+        ZStack {
+            // Top scrim + bar
+            VStack(spacing: 0) {
+                HStack(alignment: .center, spacing: 12) {
+                    glassCircle("xmark") {
+                        onInteract()
+                        onClose()
+                    }
+                    .accessibilityLabel("Close player")
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        if showCardChannelName {
+                            Text(title)
+                                .scaledFont(.headline)
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                                .shadow(color: .black.opacity(0.6), radius: 4)
+                        }
+                        // Program Name and Program Time are independent
+                        // rows (Player Info Card settings), so the time
+                        // line no longer nests inside the name's `if`.
+                        if let programName, !programName.isEmpty,
+                           showCardProgramName || showCardProgramTime {
+                            VStack(alignment: .leading, spacing: 2) {
+                                if showCardProgramName {
+                                    Text(programName)
+                                        .lineLimit(1)
+                                }
+                                if showCardProgramTime {
+                                    if let programStart, let programEnd {
+                                        HStack(spacing: 3) {
+                                            Text(programStart, style: .time)
+                                            Text("-")
+                                            Text(programEnd, style: .time)
+                                        }
+                                    } else if let programEnd {
+                                        HStack(spacing: 3) {
+                                            Text("ends")
+                                            Text(programEnd, style: .time)
+                                        }
+                                    }
+                                }
+                            }
+                            .scaledFont(.system(size: 12, weight: .regular))
+                            .foregroundColor(.white.opacity(0.72))
+                            .shadow(color: .black.opacity(0.5), radius: 3)
+                        }
+
+                        // Episode title + synopsis (Android parity).
+                        // Independent toggles; an absent value draws
+                        // nothing at all, so no empty gap is reserved.
+                        if showCardProgramSubtitle,
+                           let sub = programSubtitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !sub.isEmpty {
+                            Text(sub)
+                                .scaledFont(.system(size: 13, weight: .medium).subtext())
+                                .italic()
+                                .foregroundColor(.white.opacity(0.72))
+                                .lineLimit(1)
+                                .shadow(color: .black.opacity(0.5), radius: 3)
+                        }
+                        if showCardProgramDescription,
+                           let desc = programDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !desc.isEmpty {
+                            Text(desc)
+                                .scaledFont(.system(size: 11).subtext())
+                                .foregroundColor(.white.opacity(0.62))
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .shadow(color: .black.opacity(0.5), radius: 3)
+                        }
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 10) {
+                        if canRecord {
+                            glassCircle("record.circle", tint: .red) {
+                                onInteract()
+                                onRecord()
+                            }
+                            .accessibilityLabel("Record current program")
+                        }
+                        glassCircle("plus") {
+                            onInteract()
+                            onAddStream()
+                        }
+                        .accessibilityLabel("Add stream")
+                        overflowMenu
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 18)
+                .background(
+                    LinearGradient(
+                        colors: [Color.black.opacity(0.65), Color.clear],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .ignoresSafeArea(edges: .top)
+                )
+
+                Spacer()
+
+                liveProgressBand
+            }
+
+            centerPlayPause
+        }
+        .environment(\.colorScheme, .dark)
+        .onReceive(bandTimer) { bandNow = $0 }
+    }
+
+    // MARK: pieces
+
+    /// 52pt frosted circle, the app's liquid-glass button vocabulary
+    /// (material blur over a dark underlay so it reads on bright video).
+    private func glassCircle(_ icon: String, tint: Color = .white,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundColor(tint)
+                .frame(width: 52, height: 52)
+                .background(.ultraThinMaterial, in: Circle())
+                .background(Color.black.opacity(0.35), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var overflowMenu: some View {
+        Menu {
+            Button {
+                onInteract()
+                onStreamInfo()
+            } label: {
+                Label("Stream Info", systemImage: "info.circle")
+            }
+            if progress.audioTracks.count > 1 {
+                Menu {
+                    ForEach(progress.audioTracks) { track in
+                        Button {
+                            onInteract()
+                            progress.setAudioTrackAction?(track.id)
+                        } label: {
+                            if progress.currentAudioTrackID == track.id {
+                                Label(track.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(track.displayName)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Audio", systemImage: "waveform")
+                }
+            }
+            if !progress.subtitleTracks.isEmpty {
+                Menu {
+                    Button {
+                        onInteract()
+                        progress.setSubtitleTrackAction?(0)
+                    } label: {
+                        if progress.currentSubtitleTrackID == 0 {
+                            Label("Off", systemImage: "checkmark")
+                        } else {
+                            Text("Off")
+                        }
+                    }
+                    ForEach(progress.subtitleTracks) { track in
+                        Button {
+                            onInteract()
+                            progress.setSubtitleTrackAction?(track.id)
+                        } label: {
+                            if progress.currentSubtitleTrackID == track.id {
+                                Label(track.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(track.displayName)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Subtitles", systemImage: "captions.bubble")
+                }
+            }
+            Button {
+                onInteract()
+                progress.setVideoScale(progress.aspectMode.next)
+            } label: {
+                Label("Video Scale: \(progress.aspectMode.label)",
+                      systemImage: progress.aspectMode.icon)
+            }
+            Menu {
+                ForEach([30, 60, 90, 120], id: \.self) { minutes in
+                    Button("\(minutes) minutes") {
+                        onInteract()
+                        onSleepTimer(TimeInterval(minutes * 60))
+                    }
+                }
+                Button("Off", role: .destructive) {
+                    onInteract()
+                    onSleepTimer(nil)
+                }
+            } label: {
+                Label("Sleep Timer", systemImage: "moon.zzz")
+            }
+            Button {
+                onInteract()
+                AirPlayMenuTrigger.present()
+            } label: {
+                Label("AirPlay", systemImage: "airplay.video")
+            }
+            // Auto-hide hooks ride an always-present menu item: it
+            // appears when the popover opens and disappears when it
+            // closes, so onMenuOpen/onMenuClose bracket the menu's
+            // lifetime (same trick the mpv overflow menu uses).
+            .onAppear { onMenuOpen?() }
+            .onDisappear { onMenuClose?() }
+            if let onSwitchToMPV {
+                Button {
+                    onSwitchToMPV()
+                } label: {
+                    Label("Switch to MPV Player", systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundColor(.white)
+                .frame(width: 52, height: 52)
+                .background(.ultraThinMaterial, in: Circle())
+                .background(Color.black.opacity(0.35), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+        }
+    }
+
+    private var centerPlayPause: some View {
+        Button {
+            onInteract()
+            progress.userTogglePause()
+        } label: {
+            Image(systemName: progress.isPaused ? "play.fill" : "pause.fill")
+                .font(.system(size: 30, weight: .bold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundColor(.white)
+                .frame(width: 76, height: 76)
+                .background(.ultraThinMaterial, in: Circle())
+                .background(Color.black.opacity(0.35), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.5), radius: 10, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(progress.isPaused ? "Play" : "Pause")
+    }
+
+    /// Live program band, mpv parity: program name + progress between
+    /// start/end + minutes remaining, over the bottom scrim.
+    @ViewBuilder
+    private var liveProgressBand: some View {
+        if let programStart, let programEnd, programEnd > programStart {
+            let total = programEnd.timeIntervalSince(programStart)
+            let done = min(max(bandNow.timeIntervalSince(programStart), 0), total)
+            let remaining = max(programEnd.timeIntervalSince(bandNow), 0)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    if let programName, !programName.isEmpty {
+                        Text(programName)
+                            .scaledFont(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Text("\(Int(remaining / 60)) min remaining")
+                        .scaledFont(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.75))
+                }
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.white.opacity(0.25))
+                        Capsule()
+                            .fill(ThemeManager.shared.accent)
+                            .frame(width: geo.size.width * (total > 0 ? done / total : 0))
+                    }
+                }
+                .frame(height: 4)
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 24)
+            .background(
+                LinearGradient(
+                    colors: [Color.clear, Color.black.opacity(0.6)],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .ignoresSafeArea(edges: .bottom)
+            )
+        }
+    }
+}
+
+/// Full-screen native AVPlayer playback for genuine HLS streams, presented
+/// when the Developer "AVPlayer for HLS Streams" toggle routes a .m3u8 URL
+/// here instead of the mpv pipeline (see PlayerSession.begin). Uses
+/// AVPlayerViewController for the system transport/chrome: native HDR (PQ)
+/// output, surround sound passthrough, AirPlay, and the standard
+/// scrubbing UI come along for free, which is the whole point of the test.
+/// Deliberately NOT integrated with the app's custom chrome, channel-flip,
+/// or multiview; this is an engine evaluation surface, not a replacement.
+struct NativeHLSPlayerScreen: View {
+    let item: ChannelDisplayItem
+    let userAgent: String?
+    /// When true, the stream is raw MPEG-TS: an on-device TSHLSRemuxer
+    /// ingests it and AVPlayer plays the loopback playlist it serves.
+    var useRemux = false
+    /// Ingest headers for the remuxer (Dispatcharr auth + UA); also sent
+    /// on direct playback so the server's HLS endpoints see the same
+    /// auth the TS path sends.
+    var ingestHeaders: [String: String] = [:]
+    /// Non-nil when the router upgraded the URL to the server's native
+    /// HLS output (?output_format=hls); played instead of item.streamURL.
+    var overrideURL: URL?
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var player: AVPlayer?
+    @State private var remuxer: TSHLSRemuxer?
+    @State private var statusText: String?
+    @State private var showRecordSheet = false
+    @State private var showStreamInfo = false
+    @State private var sleepWork: DispatchWorkItem?
+    /// Fires ~4s after a native AVPlayer item is built: if the item is
+    /// .failed (e.g. the server returned 415 for a non-H.264 channel) or
+    /// reached .readyToPlay with no renderable video (HEVC-in-TS that
+    /// AVFoundation decodes audio-only over a black screen), hand the
+    /// channel back to mpv. The direct-HLS path otherwise only fell back on
+    /// AVPlayerItemFailedToPlayToEndTime, which neither of those cases fires.
+    @State private var stallWatchdog: AVPStallWatchdog?
+    /// One-shot guard so the watchdog, the failure notification, and a remux
+    /// error can't each trigger a fallback into an already-dismissed screen.
+    @State private var didFallback = false
+    /// Live ingest stall state (Android parity 2026-09-14). `ingestSilent`
+    /// is the remuxer's latched 2 s silence signal; the overlay only goes
+    /// up when the player is ALSO starving (Dispatcharr delivers this
+    /// stream in 8 to 9.5 s bursts, so silence alone is not a stall).
+    @State private var ingestSilent = false
+    @State private var stallEvalToken = UUID()
+    /// Clean-close reconnect ladder (immediate, 5 s, 15 s, 30 s, then 60 s).
+    /// Only a VERIFIED session-limit reading stops it (Logan 2026-09-15).
+    @State private var cleanEndPolicy = LiveCleanEndPolicy()
+    @State private var liveSessionStartedAt = Date()
+    /// Live stream stopped on purpose (connection limit / reconnect bounce),
+    /// waiting for Retry. Nothing reconnects or falls back while set.
+    @State private var liveStopNotice: LiveStopNotice?
+    /// Pending delayed remuxer start from restartRemuxPipeline. Cancelled by
+    /// onDisappear so a dismissal inside the 0.5 s gap cannot start a
+    /// remuxer (and its upstream connection) that nothing will ever stop.
+    @State private var restartWork: DispatchWorkItem?
+    /// Switch Stream progress watch (remux path). Bumped per switch so a
+    /// newer switch or a teardown retires the in-flight watch.
+    @State private var switchWatchToken = UUID()
+    /// Unified chrome state: one store, one driver, one visibility Bool.
+    /// The store is the same observable type the mpv overlay reads, fed
+    /// by AVPlayerProgressDriver, so the chrome is engine-agnostic.
+    @StateObject private var progressStore = PlayerProgressStore()
+    @State private var driver: AVPlayerProgressDriver?
+    @State private var showControls = true
+    @State private var controlsHideTask: Task<Void, Never>?
+    @State private var selfTestTask: Task<Void, Never>?
+    /// Top-strip swipe down follow offset (Logan 2026-09-14).
+    @State private var topStripDragOffset: CGFloat = 0
+
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let player {
+                // Bare video layer + the app's own liquid-glass chrome.
+                // Replaces AVPlayerViewController so BOTH engines can
+                // share one overlay that fades as a single unit (the
+                // mounted-capsule + display-link approach this replaces
+                // could only chase Apple's fade from outside).
+                AVPlayerLayerView(
+                    player: player,
+                    videoGravity: progressStore.effectiveVideoGravity,
+                    pipStore: progressStore
+                )
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                // Toggle lives on the VIDEO layer, not the container: a
+                // tap on a chrome button hit-tests to the button (z-above
+                // the video) and never reaches here, so pressing Record /
+                // Add / overflow does not also flip the chrome. During
+                // remux warm-up the layer is absent (player == nil), so a
+                // stray tap can't pre-hide the chrome either.
+                // simultaneousGesture (not onTapGesture): the
+                // AVPlayerLayer's UIView claims raw touches at the UIKit
+                // layer and a plain tap loses that recognizer race.
+                .simultaneousGesture(TapGesture().onEnded { toggleControls() })
+                .videoScalePinch(progressStore)
+            }
+
+            if showControls, player != nil {
+                UnifiedPlayerChrome(
+                    progress: progressStore,
+                    title: item.name,
+                    programName: item.currentProgram,
+                    programSubtitle: PlayerInfoCardSettings.liveEpisodeTitle(forChannelID: item.id),
+                    programDescription: PlayerInfoCardSettings.liveSynopsis(
+                        forChannelID: item.id, itemDescription: item.currentProgramDescription),
+                    programStart: item.currentProgramStart,
+                    programEnd: item.currentProgramEnd,
+                    canRecord: item.streamURL != nil,
+                    onSwitchToMPV: { switchToMPV(openAddStream: false) },
+                    onClose: { dismiss() },
+                    onRecord: { showRecordSheet = true },
+                    onAddStream: { switchToMPV(openAddStream: true) },
+                    onStreamInfo: { showStreamInfo.toggle() },
+                    onSleepTimer: { setSleepTimer($0) },
+                    onInteract: { scheduleControlsHide() },
+                    onMenuOpen: { controlsHideTask?.cancel() },
+                    onMenuClose: { if !progressStore.isPaused { scheduleControlsHide() } }
+                )
+                .transition(.opacity)
+            }
+            if let statusText {
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text(statusText)
+                        .scaledFont(.bodyMedium)
+                        .foregroundColor(.white.opacity(0.85))
+                    // Same live "what the network is doing" line as the
+                    // AVPlayer tile: this screen shows the identical
+                    // spinner over the identical TS-remux / direct-HLS
+                    // sources (Logan 2026-09-11).
+                    LoadingDetailLine(statusText: statusText) { loadingDetailSample() }
+                }
+            }
+            if let liveStopNotice {
+                VStack(spacing: 12) {
+                    Text(liveStopNotice.title)
+                        .scaledFont(.title3.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                    Text(liveStopNotice.message)
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                    Button {
+                        retryLiveStopNotice()
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .scaledFont(.footnote.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(Color.accentPrimary))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(32)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black.opacity(0.72))
+            }
+            if showStreamInfo, let player {
+                NativeStreamInfoCard(
+                    player: player,
+                    channelName: item.name,
+                    program: item.currentProgram,
+                    engineNote: useRemux ? "AVPlayer (remuxed TS)" : "AVPlayer (direct HLS)"
+                )
+                .allowsHitTesting(false)
+                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                       alignment: .topLeading)
+                .padding(60)
+            }
+        }
+        // Record sheet over the native player. Same RecordProgramSheet
+        // the mpv chrome's Record pill presents, fed from the same
+        // ChannelDisplayItem EPG fields. tvOS: a sheet card like every
+        // other presenter (the form is sized for one).
+        .fullScreenCover(isPresented: $showRecordSheet) {
+            recordSheet
+        }
+        // Direct playback failure (e.g. a stale capability cache sent a
+        // server-side HLS request to a server that no longer answers it):
+        // fall back to mpv, same as the tile path. The per-session
+        // re-probe corrects the cache for next time.
+        // Switch Stream (remux path): the ingest keeps its connection and
+        // Dispatcharr swaps the upstream on the same socket. TSHLSRemuxer
+        // latches PAT/PMT once (parsePAT/parsePMT guard on the first PIDs and
+        // codec), so a new upstream with different PIDs or codecs would stop
+        // producing segments with bytes still flowing (no ingest silence) and
+        // wedge. If AVPlayer does not advance within ~6 s, restart the remux
+        // pipeline ONCE (restartRemuxPipeline stops the old ingest first).
+        .onReceive(NotificationCenter.default.publisher(for: .switchStreamReprime)) { note in
+            let uuid = note.userInfo?["uuid"] as? String
+            // Match on the URL the live remuxer is actually ingesting;
+            // the item/override URL is only a fallback before it exists.
+            let url = remuxer?.ingestURL ?? overrideURL ?? item.streamURL ?? item.streamURLs.first
+            let ignoreReason: String? = {
+                if !useRemux { return "not remux path" }
+                if didFallback { return "fell back to mpv" }
+                guard let uuid else { return "no uuid" }
+                guard let url else { return "no url" }
+                if !url.absoluteString.contains("/proxy/ts/stream/\(uuid)") {
+                    return "url is not /proxy/ts/stream/\(uuid)"
+                }
+                return nil
+            }()
+            if let ignoreReason {
+                DebugLogger.shared.log("[SWITCH] AVPlayer screen ignored reprime: \(ignoreReason)",
+                                       category: "Playback", level: .info)
+                return
+            }
+            let token = UUID()
+            switchWatchToken = token
+            DebugLogger.shared.log("[SWITCH] kept connection (AVPlayer remux)",
+                                   category: "Playback", level: .info)
+            // Same connection, new source: arm the remuxer's re-gate and
+            // keep the switch gap out of pacing and hold-back learning.
+            remuxer?.noteSourceSwitch()
+            let pos = player?.currentTime().seconds
+            evaluateSwitchProgress(token: token, start: Date(),
+                                   lastPosition: (pos?.isFinite ?? false) ? pos : nil,
+                                   advancingSamples: 0,
+                                   lastBytes: remuxer?.bytesIngested ?? 0,
+                                   bytesChangedAt: Date(), resumed: false)
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .AVPlayerItemFailedToPlayToEndTime)) { note in
+            guard let failed = note.object as? AVPlayerItem,
+                  failed === player?.currentItem else { return }
+            DebugLogger.shared.log(
+                "[AVP-HLS] native playback failed; falling back to mpv",
+                category: "Playback", level: .warning
+            )
+            fallbackToMPV()
+        }
+        // iOS: the bare-layer + UnifiedPlayerChrome path above. Pause
+        // pins the chrome visible; resume restarts the hide clock
+        // (mpv chrome parity).
+        .statusBarHidden()
+        // In-Player Gestures: edge slides for brightness / volume.
+        .inPlayerEdgeGestures(isEnabled: player != nil, host: "NativeHLSPlayerScreen")
+        // Top-strip swipe down (Logan 2026-09-14). This screen is a
+        // fullScreenCover whose dismissal tears the player down, so it
+        // cannot hand its layer to a foreground PiP window; it always
+        // takes the minimize fallback (the same corner mini / docked bar
+        // handoff Menu uses), on iPhone and iPad alike.
+        .offset(y: topStripDragOffset)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 10)
+                .onChanged { value in
+                    guard player != nil,
+                          PlayerTopStripSwipe.startsInStrip(
+                            value.startLocation.y, height: UIScreen.main.bounds.height) else { return }
+                    topStripDragOffset = PlayerTopStripSwipe.followOffset(value.translation)
+                }
+                .onEnded { value in
+                    guard player != nil,
+                          PlayerTopStripSwipe.startsInStrip(
+                            value.startLocation.y, height: UIScreen.main.bounds.height) else {
+                        if topStripDragOffset != 0 { topStripDragOffset = 0 }
+                        return
+                    }
+                    let commit = PlayerTopStripSwipe.commits(value)
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                        topStripDragOffset = 0
+                    }
+                    if commit { minimizeToMini() }
+                }
+        )
+        .onChange(of: progressStore.isPaused) { _, paused in
+            if paused {
+                controlsHideTask?.cancel()
+                withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+            } else {
+                scheduleControlsHide()
+            }
+        }
+        .onAppear {
+            AudioSessionRefCount.increment(caller: "native-hls")
+            IdleTimerRefCount.increment(caller: "native-hls")
+            guard let url = overrideURL ?? item.streamURL ?? item.streamURLs.first else { return }
+            NowPlayingManager.shared.lastPlayedChannelID = item.id
+
+            if useRemux {
+                // Raw TS: stand up the loopback remuxer, then play its
+                // playlist URL once two segments exist. The codec gate
+                // (H.264 + AC-3/AAC only) falls back to mpv otherwise.
+                statusText = "Preparing stream..."
+                // Live Rewind (task #145): widen the remuxed playlist to
+                // the rewind depth so AVPlayer's native seekable range IS
+                // the rewind window. Fullscreen live only; VOD/catch-up
+                // and multiview tiles keep the classic live-edge window.
+                let rewindSeconds: Double = {
+                    guard UserDefaults.standard.bool(forKey: "liveRewindEnabled") else { return 0 }
+                    let depth = UserDefaults.standard.integer(forKey: "liveRewindDepthMinutes")
+                    return Double(depth > 0 ? depth : 30) * 60
+                }()
+                let mux = TSHLSRemuxer(sourceURL: url, headers: ingestHeaders,
+                                       rewindWindowSeconds: rewindSeconds)
+                mux.onReady = { localURL in
+                    statusText = nil
+                    startPlayer(with: localURL, headers: [:])
+                    DebugLogger.shared.log(
+                        "[AVP-HLS] native engine playing REMUXED channel id=\(item.id)",
+                        category: "Playback", level: .info
+                    )
+                }
+                mux.onError = { error in
+                    handleRemuxFailure(error, context: "")
+                }
+                mux.reportsIngestStall = true
+                mux.onIngestSilence = { silent in handleIngestSilence(silent) }
+                mux.onIngestClosed = { handleUpstreamClosed() }
+                remuxer = mux
+                mux.start()
+            } else {
+                var headers = ingestHeaders
+                if headers.isEmpty, let userAgent, !userAgent.isEmpty {
+                    headers["User-Agent"] = userAgent
+                }
+                startPlayer(with: url, headers: headers)
+                DebugLogger.shared.log(
+                    "[AVP-HLS] native engine playing channel id=\(item.id)\(overrideURL != nil ? " (server-side HLS)" : "")",
+                    category: "Playback", level: .info
+                )
+            }
+        }
+        .onDisappear {
+            switchWatchToken = UUID()
+            driver?.teardown()
+            driver = nil
+            controlsHideTask?.cancel()
+            controlsHideTask = nil
+            selfTestTask?.cancel()
+            selfTestTask = nil
+            player?.pause()
+            player = nil
+            AirPlayMonitor.shared.detach()
+            // Detach remuxer callbacks BEFORE stop(): stop() only enqueues
+            // teardown, so a main-queued late onReady/onError could still
+            // land after this view is gone and start an orphan player or
+            // trigger a fallback into a dismissed screen.
+            remuxer?.onReady = nil
+            remuxer?.onError = nil
+            remuxer?.onIngestSilence = nil
+            remuxer?.onIngestClosed = nil
+            stallEvalToken = UUID()
+            ingestSilent = false
+            restartWork?.cancel()
+            restartWork = nil
+            remuxer?.stop()
+            remuxer = nil
+            sleepWork?.cancel()
+            sleepWork = nil
+            stallWatchdog?.cancel()
+            stallWatchdog = nil
+            AudioSessionRefCount.decrement(caller: "native-hls")
+            IdleTimerRefCount.decrement(caller: "native-hls")
+            DebugLogger.shared.log(
+                "[AVP-HLS] native engine closed",
+                category: "Playback", level: .info
+            )
+        }
+    }
+
+    private func toggleControls() {
+        withAnimation(.easeInOut(duration: 0.25)) { showControls.toggle() }
+        if showControls {
+            scheduleControlsHide()
+        } else {
+            // Cancel the pending auto-hide so it cannot fire a stale,
+            // duplicate hide after a manual one.
+            controlsHideTask?.cancel()
+        }
+        debugLog("[AVP-CHROME] controls \(showControls ? "VISIBLE (tap)" : "HIDDEN (tap)")")
+    }
+
+    /// One auto-hide clock for the whole chrome. Paused playback pins
+    /// the chrome visible (the onChange above cancels and re-shows).
+    private func scheduleControlsHide() {
+        controlsHideTask?.cancel()
+        guard !progressStore.isPaused else { return }
+        controlsHideTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(playerChromeFadeSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.3)) { showControls = false }
+                debugLog("[AVP-CHROME] controls HIDDEN (auto)")
+            }
+        }
+    }
+
+    // MARK: - Live ingest stall ("Reconnecting", Android parity)
+
+    private static let reconnectingStatus = "Reconnecting..."
+    /// Overlay thresholds. Silence plus a low buffer (under 1.5 s) is only
+    /// "starving" and routinely happens between Dispatcharr bursts while the
+    /// picture plays perfectly (Streamer 2026-09-14), so the overlay needs a
+    /// REAL stall: a rebuffer after playing, the playhead frozen this long
+    /// while playback is requested, or the buffer effectively empty.
+    private static let stallFrozenSeconds: Double = 1
+    private static let stallEmptyBuffer: Double = 0.25
+
+    /// The remuxer's silence signal flipped. Silence ALONE is not a stall
+    /// (Dispatcharr's proxy delivers in 8 to 9.5 s bursts with ~10 s
+    /// buffered), so the overlay waits for the player to actually starve.
+    private func handleIngestSilence(_ silent: Bool) {
+        guard player != nil, !didFallback else { return }
+        ingestSilent = silent
+        if silent {
+            stallEvalToken = UUID()
+            evaluateStallOverlay(token: stallEvalToken)
+        }
+        // Bytes resuming does not clear the overlay by itself: a running
+        // evaluator hides it once the playhead actually advances again.
+    }
+
+    private func loadedAheadSeconds() -> Double? {
+        guard let item = player?.currentItem,
+              let range = item.loadedTimeRanges.last?.timeRangeValue else { return nil }
+        let end = CMTimeGetSeconds(CMTimeAdd(range.start, range.duration))
+        let now = CMTimeGetSeconds(item.currentTime())
+        guard end.isFinite, now.isFinite else { return nil }
+        return max(0, end - now)
+    }
+
+    /// Runs every 0.5 s while the ingest is silent (the signal itself only
+    /// latches at its edges).
+    private func evaluateStallOverlay(token: UUID, lastPosition: Double? = nil,
+                                      lastAdvance: Date = Date(), sawAdvance: Bool = false) {
+        guard token == stallEvalToken, !didFallback else { return }
+        guard ingestSilent || statusText == Self.reconnectingStatus else { return }
+        guard let player else { return }
+        let ahead = loadedAheadSeconds() ?? 0
+        let position = player.currentItem.map { CMTimeGetSeconds($0.currentTime()) } ?? .nan
+        let advanced = position.isFinite && lastPosition != nil && position != lastPosition
+        let now = Date()
+        let advanceAt = (advanced || lastPosition == nil) ? now : lastAdvance
+        let wantsToPlay = player.timeControlStatus != .paused
+        let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        let frozen = wantsToPlay && !advanced && now.timeIntervalSince(advanceAt) >= Self.stallFrozenSeconds
+        let empty = wantsToPlay && ingestSilent && ahead < Self.stallEmptyBuffer
+        let stalled = (waiting && (sawAdvance || advanced)) || frozen || empty
+        if statusText == nil, stalled {
+            statusText = Self.reconnectingStatus
+            DebugLogger.shared.log(
+                "[AVP-STREAM] STALL: playback stalled (status=\(player.timeControlStatus.rawValue), frozen=\(frozen)) with "
+                + String(format: "%.1f", ahead) + "s loaded ahead; showing Reconnecting",
+                category: "Playback", level: .warning)
+        } else if statusText == Self.reconnectingStatus, advanced, !waiting {
+            statusText = nil
+            DebugLogger.shared.log(
+                "[AVP-STREAM] playback advancing with " + String(format: "%.1f", ahead)
+                + "s ahead; cleared Reconnecting",
+                category: "Playback", level: .info)
+        }
+        let next = stallEvalToken
+        let pos: Double? = position.isFinite ? position : lastPosition
+        let saw = sawAdvance || advanced
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            evaluateStallOverlay(token: next, lastPosition: pos, lastAdvance: advanceAt, sawAdvance: saw)
+        }
+    }
+
+    /// Clean upstream close (the stream was stopped server-side): the
+    /// socket closing is proof the source is gone, so re-tune at once
+    /// instead of waiting out the silent-stall ladder.
+    private func handleUpstreamClosed() {
+        guard !didFallback, liveStopNotice == nil else { return }
+        let firstEnd = cleanEndPolicy.isFirstEnd
+        let sessionStartedAt = liveSessionStartedAt
+        let delay = cleanEndPolicy.nextDelay()
+        DebugLogger.shared.log(
+            "[RECONNECT] upstream closed the live stream; reconnect attempt \(cleanEndPolicy.attempts) in \(Int(delay))s",
+            category: "Playback", level: .warning)
+        statusText = Self.reconnectingStatus
+        if !firstEnd {
+            Task { @MainActor in
+                let verdict = await DispatcharrSessionLimitVerifier.verify(sessionStartedAt: sessionStartedAt)
+                DebugLogger.shared.log("[VERIFY] clean end check: \(verdict.logText)",
+                                       category: "Playback", level: .info)
+                guard case .atLimit = verdict, liveStopNotice == nil else { return }
+                stopForLiveNotice(.streamEnded, reason: "verified session limit reached elsewhere")
+            }
+        }
+        if delay <= 0 {
+            liveSessionStartedAt = Date()
+            restartRemuxPipeline()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard liveStopNotice == nil, !didFallback else { return }
+            liveSessionStartedAt = Date()
+            restartRemuxPipeline()
+        }
+    }
+
+    /// Remux failure entry: a Dispatcharr connection-limit refusal stops
+    /// with the notice (no mpv fallback, which would only reopen the
+    /// stream); everything else falls back to mpv as before.
+    private func handleRemuxFailure(_ error: Error, context: String) {
+        if liveStopNotice != nil { return }
+        if let notice = DispatcharrConnectionLimit.fromIngestFailure("\(error)") {
+            stopForLiveNotice(notice, reason: "\(error)")
+            return
+        }
+        DebugLogger.shared.log("[AVP-HLS] remux failed\(context) (\(error)); falling back to mpv",
+                               category: "Playback", level: .warning)
+        fallbackToMPV()
+    }
+
+    /// Tears the pipeline down (connection released) and shows the notice.
+    private func stopForLiveNotice(_ notice: LiveStopNotice, reason: String) {
+        guard liveStopNotice == nil else { return }
+        DebugLogger.shared.log("[LIMIT] \(notice.kind.rawValue) (\(reason)); connection released, waiting for Retry",
+                               category: "Playback", level: .warning)
+        restartWork?.cancel()
+        restartWork = nil
+        switchWatchToken = UUID()
+        ingestSilent = false
+        stallEvalToken = UUID()
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
+        player?.pause()
+        player = nil
+        remuxer?.onReady = nil
+        remuxer?.onError = nil
+        remuxer?.onIngestSilence = nil
+        remuxer?.onIngestClosed = nil
+        remuxer?.stop()
+        remuxer = nil
+        statusText = nil
+        liveStopNotice = notice
+    }
+
+    /// Retry on the notice: one fresh tune, bounce window cleared.
+    private func retryLiveStopNotice() {
+        DebugLogger.shared.log("[LIMIT] Retry pressed (native player)", category: "Playback", level: .info)
+        liveStopNotice = nil
+        cleanEndPolicy.reset()
+        liveSessionStartedAt = Date()
+        statusText = "Tuning..."
+        restartRemuxPipeline()
+    }
+
+    /// Switch Stream progress poll (0.5 s cadence, 6 s budget). Progress is
+    /// the player position moving forward on two consecutive samples while
+    /// playing; otherwise one restartRemuxPipeline (no overlapping ingest).
+    /// The budget stretches (to `switchWatchCap`) while the remuxer is
+    /// legitimately re-acquiring the new source with bytes still arriving,
+    /// or has just stored a segment the player has not reached yet: a
+    /// reload there would throw away a source that is about to play. After
+    /// playback resumes the watch stays up to the cap to return the player
+    /// to the live edge once, if the switch left it far behind.
+    private func evaluateSwitchProgress(token: UUID, start: Date,
+                                        lastPosition: Double?, advancingSamples: Int,
+                                        lastBytes: Int64, bytesChangedAt: Date,
+                                        resumed: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard switchWatchToken == token, !didFallback, remuxer != nil || player != nil else { return }
+            let now = Date()
+            let elapsed = now.timeIntervalSince(start)
+            let bytes = remuxer?.bytesIngested ?? lastBytes
+            let changedAt = bytes != lastBytes ? now : bytesChangedAt
+            let progress = remuxer?.sourceSwitchProgress
+            if resumed {
+                if player?.timeControlStatus == .paused { return }
+                if returnToLiveAfterSwitchIfFar() || elapsed >= Self.switchWatchCap { return }
+                evaluateSwitchProgress(token: token, start: start, lastPosition: lastPosition,
+                                       advancingSamples: advancingSamples, lastBytes: bytes,
+                                       bytesChangedAt: changedAt, resumed: true)
+                return
+            }
+            let raw = player?.currentTime().seconds
+            let pos: Double? = (raw?.isFinite ?? false) ? raw : nil
+            // A user pause is not a stall; stop judging.
+            if player?.timeControlStatus == .paused { return }
+            let playing = player?.timeControlStatus == .playing
+            var samples = advancingSamples
+            if let pos, let prev = lastPosition, pos > prev, pos - prev < 5, playing {
+                samples += 1
+            } else {
+                samples = 0
+            }
+            if samples >= 2, progress?.regating != true {
+                DebugLogger.shared.log(
+                    "[SWITCH] playback resumed after \(Int(elapsed * 1000))ms (AVPlayer remux)",
+                    category: "Playback", level: .info)
+                evaluateSwitchProgress(token: token, start: start, lastPosition: pos,
+                                       advancingSamples: samples, lastBytes: bytes,
+                                       bytesChangedAt: changedAt, resumed: true)
+                return
+            }
+            if elapsed >= 6 {
+                // Dispatcharr delivers in 8 to 9.5 s bursts, so "flowing"
+                // allows a burst-sized quiet spell.
+                let flowing = now.timeIntervalSince(changedAt) < 10
+                let regating = progress?.regating == true && flowing
+                let freshSegment = progress?.lastSegmentAt.map { now.timeIntervalSince($0) < 6 } ?? false
+                if elapsed < Self.switchWatchCap, regating || freshSegment {
+                    if Int(elapsed * 2) % 4 == 0 {
+                        DebugLogger.shared.log(
+                            "[SWITCH] waiting on the new source (\(regating ? "remuxer re-gating, bytes flowing" : "segment just stored")), \(Int(elapsed))s of \(Int(Self.switchWatchCap))s",
+                            category: "Playback", level: .info)
+                    }
+                } else {
+                    switchWatchToken = UUID()
+                    DebugLogger.shared.log("[SWITCH] no progress, single reload (AVPlayer remux)",
+                                           category: "Playback", level: .warning)
+                    statusText = Self.reconnectingStatus
+                    restartRemuxPipeline()
+                    return
+                }
+            }
+            evaluateSwitchProgress(token: token, start: start,
+                                   lastPosition: pos ?? lastPosition, advancingSamples: samples,
+                                   lastBytes: bytes, bytesChangedAt: changedAt, resumed: false)
+        }
+    }
+
+    /// Hard ceiling on the Switch Stream watch, re-gate extension included.
+    private static let switchWatchCap: TimeInterval = 30
+
+    /// After a switch resumes, a player parked far behind the advertised
+    /// edge (the switch gap plus whatever pacing banked) is returned to
+    /// live once. Reuses the chrome's Return to Live (which honors the
+    /// session hold-back) where it exists. Returns true when it seeked.
+    private func returnToLiveAfterSwitchIfFar() -> Bool {
+        guard let player, let item = player.currentItem,
+              let range = item.seekableTimeRanges.last?.timeRangeValue else { return false }
+        let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+        let now = item.currentTime().seconds
+        guard end.isFinite, now.isFinite else { return false }
+        let behind = end - now
+        guard behind > 12 else { return false }
+        DebugLogger.shared.log(
+            "[SWITCH] \(String(format: "%.1f", behind))s behind the live edge after the switch; returning to live",
+            category: "Playback", level: .info)
+        if let action = progressStore.seekToLiveAction {
+            action()
+            return true
+        }
+        player.seek(to: CMTime(seconds: max(0, end - 6), preferredTimescale: 600))
+        if player.timeControlStatus == .paused { player.play() }
+        return true
+    }
+
+    /// Tears the remux pipeline down and stands a fresh one up on the same
+    /// URL, keeping this screen (and its chrome) on screen.
+    private func restartRemuxPipeline() {
+        guard let url = overrideURL ?? item.streamURL ?? item.streamURLs.first else { return }
+        ingestSilent = false
+        stallEvalToken = UUID()
+        player?.pause()
+        player = nil
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
+        remuxer?.onReady = nil
+        remuxer?.onError = nil
+        remuxer?.onIngestSilence = nil
+        remuxer?.onIngestClosed = nil
+        remuxer?.stop()
+        remuxer = nil
+        let rewindSeconds: Double = {
+            guard UserDefaults.standard.bool(forKey: "liveRewindEnabled") else { return 0 }
+            let depth = UserDefaults.standard.integer(forKey: "liveRewindDepthMinutes")
+            return Double(depth > 0 ? depth : 30) * 60
+        }()
+        restartWork?.cancel()
+        let work = DispatchWorkItem {
+            restartWork = nil
+            guard !didFallback else { return }
+            let mux = TSHLSRemuxer(sourceURL: url, headers: ingestHeaders,
+                                   rewindWindowSeconds: rewindSeconds)
+            mux.onReady = { localURL in
+                statusText = nil
+                startPlayer(with: localURL, headers: [:])
+            }
+            mux.onError = { error in
+                handleRemuxFailure(error, context: " after re-tune")
+            }
+            mux.reportsIngestStall = true
+            mux.onIngestSilence = { silent in handleIngestSilence(silent) }
+            mux.onIngestClosed = { handleUpstreamClosed() }
+            remuxer = mux
+            mux.start()
+        }
+        restartWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// Byte source for the loading detail line: the TS remux ingest when
+    /// this screen stood one up, otherwise the player item's own access
+    /// log (direct HLS). Never both.
+    private func loadingDetailSample() -> LoadingDetailSample {
+        if let mux = remuxer {
+            let at = mux.ingestConnectedAt
+            return LoadingDetailSample(connected: at != nil,
+                                       bytes: mux.bytesIngested,
+                                       connectedAt: at)
+        }
+        if let events = player?.currentItem?.accessLog()?.events, !events.isEmpty {
+            let bytes = events.reduce(Int64(0)) { $0 + max(0, $1.numberOfBytesTransferred) }
+            return LoadingDetailSample(connected: true, bytes: bytes, connectedAt: nil)
+        }
+        return LoadingDetailSample(connected: false, bytes: 0, connectedAt: nil)
+    }
+
+    private func startPlayer(with url: URL, headers: [String: String]) {
+        var options: [String: Any] = [:]
+        if !headers.isEmpty {
+            options["AVURLAssetHTTPHeaderFieldsKey"] = headers
+        }
+        let asset = AVURLAsset(url: url, options: options)
+        let playerItem = AVPlayerItem(asset: asset)
+        // Live-edge point: trust the server (parity with the multiview tile).
+        // The Dispatcharr HLS output pins the join point itself (#EXT-X-START on
+        // the standard output, PART-HOLD-BACK ~1.5s on the Low-Latency output),
+        // so we do not force configuredTimeOffsetFromLive, which would override
+        // both and pin latency at our guess on the LL path. Forward buffer stays
+        // at automatic (a forced 12s gated first frame to ~11.8s off-LAN while
+        // being invisible on LAN). See TSHLSRemuxer.startPlayer for the full
+        // rationale on both.
+        playerItem.automaticallyPreservesTimeOffsetFromLive = true
+        DebugLogger.shared.log(
+            "[AVP-HLS] live offset=server fwdBuf=automatic channel=\(item.name)",
+            category: "Playback", level: .info
+        )
+        // Feed the native info panel real channel/program names instead
+        // of whatever stale Now Playing state it can scrape.
+        playerItem.externalMetadata = Self.nativeMetadata(
+            title: item.name,
+            subtitle: item.currentProgram
+        )
+        // Startup lever resolved (v1.7.x): forward buffer left at AVPlayer's
+        // automatic default. A device run showed forcing a large forward buffer
+        // gated tune-in to ~11.8s on a bandwidth-limited path (invisible on LAN),
+        // so automatic (auto-wait=true) is the fast-start choice on every link.
+        // The 9s live offset is the only explicit live-edge lever.
+        let avPlayer = AVPlayer(playerItem: playerItem)
+        // GH #33 AirPlay: the AVPlayer engine is the video-AirPlay surface
+        // (mpv frames never leave the GPU, so mpv sessions stay audio-only).
+        // allowsExternalPlayback defaults true but is pinned explicitly, and
+        // usesExternalPlaybackWhileExternalScreenIsActive makes fullscreen
+        // playback claim the external screen outright. Probe 2026-07-16:
+        // AVFoundation REFUSES the live progressive fMP4 cast URL
+        // (-11850/-12939, no byte-range support on a growing stream), so
+        // AirPlay live rides exactly this HLS path -- never the cast URL.
+        avPlayer.allowsExternalPlayback = true
+        avPlayer.usesExternalPlaybackWhileExternalScreenIsActive = true
+        // Remote-session card (2026-09-12): the card has to know when the
+        // receiver actually took the video, and AirPlay's only honest signal
+        // is this player's isExternalPlaybackActive.
+        AirPlayMonitor.shared.attach(avPlayer)
+        avPlayer.play()
+        player = avPlayer
+
+        // No-renderable-video / rejected-playlist fallback (parity with the
+        // multiview tile guard in TSHLSRemuxer). AVFoundation cannot decode
+        // HEVC-in-MPEG-TS: depending on the server it either rejects the
+        // playlist (the native-HLS output returns 415 for non-H.264, so the
+        // item goes .failed) or reaches .readyToPlay and plays audio over a
+        // permanent black screen (presentationSize stays 0x0). Neither fires
+        // AVPlayerItemFailedToPlayToEndTime, so without this the single-stream
+        // direct-HLS path would strand the viewer. mpv decodes these fine.
+        // Stall/freeze watchdog (also covers tvOS, where the AVPlayerProgressDriver
+        // below is #if os(iOS)-gated and so its errorLog escalation does not run).
+        // Replaces the old one-shot +4s no-video check, which a single rendered
+        // frame permanently disarmed: this keeps polling, so a wedge that lands
+        // AFTER first frame (a rejected LL reload, a stuck live edge) still
+        // self-heals to mpv instead of freezing forever. Self-invalidates on item
+        // swap; onDisappear invalidates it on teardown.
+        stallWatchdog?.cancel()
+        let watchdog = AVPStallWatchdog(
+            player: avPlayer, item: playerItem, label: "native-hls \(item.name)",
+            onDead: { _ in fallbackToMPV() })
+        watchdog.start()
+        stallWatchdog = watchdog
+        // Bridge AVPlayer state into the shared store the chrome reads.
+        // Gravity is applied declaratively (the layer view reads
+        // aspectMode each render), so the driver's gravity sink is a
+        // no-op here.
+        driver = AVPlayerProgressDriver(
+            player: avPlayer,
+            store: progressStore,
+            isLive: true,
+            applyGravity: { _ in }
+        )
+        // Fast path: escalate a fatal errorLog entry (rejected playlist / failed
+        // reload) straight to mpv. The watchdog above is the universal slow net;
+        // this is the ~1s reaction when AVFoundation names the failure.
+        driver?.onUnrecoverable = { _ in fallbackToMPV() }
+        scheduleControlsHide()
+        #if DEBUG
+        // -AstralChromeSelfTest: scripted chrome exercise for simulator
+        // verification when synthetic clicks are unavailable. Drives the
+        // exact same paths a finger would: the visibility toggle and the
+        // store's pause command (which must pin the chrome visible).
+        if ProcessInfo.processInfo.arguments.contains("-AstralChromeSelfTest") {
+            // Stored + throwing sleeps so onDisappear's cancel actually
+            // aborts the script; otherwise a mid-run dismissal would
+            // resurrect controlsHideTask after teardown nil'd it.
+            selfTestTask = Task { @MainActor in
+                do {
+                    try await Task.sleep(nanoseconds: 6_000_000_000)
+                    toggleControls()
+                    try await Task.sleep(nanoseconds: 3_000_000_000)
+                    toggleControls()
+                    try await Task.sleep(nanoseconds: 3_000_000_000)
+                    debugLog("[AVP-CHROME] selftest: pausing")
+                    progressStore.togglePauseAction?()
+                    try await Task.sleep(nanoseconds: 4_000_000_000)
+                    debugLog("[AVP-CHROME] selftest: resuming")
+                    progressStore.togglePauseAction?()
+                } catch { /* cancelled on dismissal */ }
+            }
+        }
+        #endif
+    }
+
+    private static func nativeMetadata(title: String, subtitle: String?) -> [AVMetadataItem] {
+        func make(_ id: AVMetadataIdentifier, _ value: String) -> AVMetadataItem {
+            let entry = AVMutableMetadataItem()
+            entry.identifier = id
+            entry.value = value as NSString
+            entry.extendedLanguageTag = "und"
+            return entry
+        }
+        var entries = [make(.commonIdentifierTitle, title)]
+        if let subtitle, !subtitle.isEmpty {
+            entries.append(make(.iTunesMetadataTrackSubTitle, subtitle))
+        }
+        return entries
+    }
+
+    /// The app-action capsule, hosted INSIDE the player controller and
+    /// pinned to its layout-margin guides so it aligns with the native
+    /// chrome by construction in every orientation (an external overlay
+    /// could only approximate Apple's margins). Empty on tvOS, where
+    /// the actions live in the transport bar instead.
+    private var trailingAccessoryView: AnyView {
+        AnyView(
+            HStack(spacing: 22) {
+                if item.streamURL != nil {
+                    Button {
+                        showRecordSheet = true
+                    } label: {
+                        iosOverlayIcon("record.circle", tint: .red)
+                    }
+                }
+                Button {
+                    switchToMPV(openAddStream: true)
+                } label: {
+                    iosOverlayIcon("plus")
+                }
+                Menu {
+                    Button {
+                        showStreamInfo.toggle()
+                    } label: {
+                        Label("Stream Info", systemImage: "info.circle")
+                    }
+                    Menu {
+                        ForEach([30, 60, 90, 120], id: \.self) { minutes in
+                            Button("\(minutes) minutes") {
+                                setSleepTimer(TimeInterval(minutes * 60))
+                            }
+                        }
+                        Button("Off", role: .destructive) { setSleepTimer(nil) }
+                    } label: {
+                        Label("Sleep Timer", systemImage: "moon.zzz")
+                    }
+                    Button {
+                        switchToMPV(openAddStream: false)
+                    } label: {
+                        Label("Switch to MPV Player", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    Button(role: .destructive) {
+                        dismiss()
+                    } label: {
+                        Label("Stop Playback", systemImage: "stop.circle")
+                    }
+                } label: {
+                    iosOverlayIcon("slider.horizontal.3")
+                }
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 46)
+            // Material alone goes light over bright content; the native
+            // pills hold a dark tone everywhere, so blur over a dark
+            // underlay to match.
+            .background(.ultraThinMaterial, in: Capsule())
+            .background(Color.black.opacity(0.4), in: Capsule())
+            .environment(\.colorScheme, .dark)
+        )
+    }
+
+    /// Icon styling for the grouped capsule (the capsule supplies its
+    /// own material background, mirroring the native PiP+AirPlay pill).
+    @ViewBuilder
+    private func iosOverlayIcon(_ icon: String, tint: Color = .white) -> some View {
+        Image(systemName: icon)
+            .scaledFont(.system(size: 18, weight: .medium))
+            .foregroundColor(tint)
+    }
+
+    /// Remux failure path: dismiss this cover and restart the channel on
+    /// the mpv pipeline, bypassing the native router so it cannot loop.
+    private func fallbackToMPV() {
+        guard !didFallback else { return }
+        didFallback = true
+        switchToMPV(openAddStream: false)
+    }
+
+    /// Menu/Back, mpv parity: continue this channel in the corner mini
+    /// player over the guide. The unified container mounts (its per-tile
+    /// router keeps the tile on AVPlayer when eligible) and immediately
+    /// minimizes. The stream restarts across the handoff, which is the
+    /// cost of trading system chrome for the container; acceptable in
+    /// the corner mini.
+    private func minimizeToMini() {
+        // Logan 2026-09-14: second press of a double Back (the pending
+        // minimize armed below is still waiting) closes the session
+        // outright - the cover is already gone, nothing was minimized.
+        if NowPlayingManager.shared.consumeDoubleBackClose() {
+            debugLog("[AVP-HLS] double Back → cancel minimize + exit session")
+            // The deferred body never ran, so the cover is still mounted:
+            // drop it here as well as tearing the session down.
+            PlayerSession.shared.nativeHLSItem = nil
+            PlayerSession.shared.exit()
+            return
+        }
+        NowPlayingManager.shared.scheduleMinimize {
+            let session = PlayerSession.shared
+            let server = session.nativeHLSServer
+            session.nativeHLSItem = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                session.begin(item: item, server: server, bypassNativeRouter: true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    NowPlayingManager.shared.minimize()
+                }
+            }
+        }
+    }
+
+    /// Native Options parity with the mpv panel's sleep timer: nil
+    /// cancels; otherwise the native player closes when it fires.
+    private func setSleepTimer(_ seconds: TimeInterval?) {
+        sleepWork?.cancel()
+        sleepWork = nil
+        guard let seconds else {
+            debugLog("[AVP-HLS] sleep timer cancelled")
+            return
+        }
+        let work = DispatchWorkItem {
+            debugLog("[AVP-HLS] sleep timer fired; closing native player")
+            PlayerSession.shared.nativeHLSItem = nil
+        }
+        sleepWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+        debugLog("[AVP-HLS] sleep timer set: \(Int(seconds / 60))m")
+    }
+
+    /// Leave the native player and restart this channel on the mpv
+    /// pipeline (router bypassed). With `openAddStream`, additionally
+    /// asks the mounted multiview container to open its add-channel
+    /// sheet, which is what "Add Stream" means: multiview is an mpv
+    /// capability, so the engine switches first.
+    private func switchToMPV(openAddStream: Bool) {
+        let session = PlayerSession.shared
+        let server = session.nativeHLSServer
+        session.nativeHLSItem = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            session.begin(item: item, server: server, bypassNativeRouter: true)
+            if openAddStream {
+                // Give the container a beat to mount before asking it
+                // to present the sheet (same notification the iPad
+                // keyboard shortcut uses).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    NotificationCenter.default.post(
+                        name: .multiviewRequestOpenAddSheet, object: nil)
+                }
+            }
+        }
+    }
+
+    /// Mirror of the mpv chrome's Record pill payload
+    /// (MultiviewContainerView.recordSheetContent): EPG-known program
+    /// name when available, generic live-recording fallback otherwise.
+    @ViewBuilder
+    private var recordSheet: some View {
+        let now = Date()
+        RecordProgramSheet(
+            programTitle: item.currentProgram ?? "\(item.name) live recording",
+            programDescription: item.currentProgramDescription ?? "",
+            channelID: item.id,
+            channelName: item.name,
+            scheduledStart: item.currentProgramStart ?? now,
+            scheduledEnd: (item.currentProgramEnd.flatMap { $0 > now ? $0 : nil })
+                ?? now.addingTimeInterval(3600),
+            isLive: true,
+            dispatcharrChannelID: item.dispatcharrChannelID,
+            streamURL: item.streamURL
+        )
+    }
+}
+
+/// Thin AVPlayerViewController wrapper. The system controller supplies the
+/// full native transport (and on tvOS, the swipe-down info panel); the
+/// app's own actions ride the transport bar as custom items (tvOS 15+):
+/// Record, Add Stream, and an Options menu with aspect toggle and a
+/// switch-to-mpv escape hatch for A/B comparison.
+private struct NativeAVPlayerController: UIViewControllerRepresentable {
+    let player: AVPlayer
+    var canRecord: Bool = false
+    var onRecord: (() -> Void)?
+    var onAddStream: (() -> Void)?
+    var onSwitchToMPV: (() -> Void)?
+    var onStreamInfo: (() -> Void)?
+    var onSleepTimer: ((TimeInterval?) -> Void)?
+    /// iOS: the app-action capsule, mounted INSIDE the native controls
+    /// hierarchy so it inherits the chrome's fade on Apple's own clock
+    /// (a parallel show/hide state machine drifted out of phase).
+    var trailingAccessory: AnyView = AnyView(EmptyView())
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        let hosting = UIHostingController(rootView: trailingAccessory)
+        hosting.view.backgroundColor = .clear
+        hosting.view.translatesAutoresizingMaskIntoConstraints = false
+        context.coordinator.hosting = hosting
+        // The native controls hierarchy does not exist yet; attach once
+        // it does so the capsule inherits the chrome's fade.
+        context.coordinator.attachAccessory(to: controller, attempts: 20)
+        return controller
+    }
+
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        if controller.player !== player {
+            controller.player = player
+        }
+        context.coordinator.hosting?.rootView = trailingAccessory
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var hosting: UIHostingController<AnyView>?
+        private weak var controllerRef: AVPlayerViewController?
+        private weak var fadeSource: UIView?
+        private var displayLink: CADisplayLink?
+        // No deinit invalidate: the display link retains this
+        // coordinator, and tickFade invalidates itself once the player
+        // leaves the window, which releases the retain so the
+        // coordinator can deinit normally.
+
+        /// Mount the capsule on the controller's own view at the
+        /// calibrated position (decoupled from Apple's fragile control
+        /// tree, which rebuilds), then mirror the fade by SAMPLING a
+        /// real native button's on-screen opacity every frame onto the
+        /// capsule. Sampling the composited presentation opacity tracks
+        /// whatever Apple animates, on any view, with any curve, exactly
+        /// (mounting inside a guessed "fading" container kept landing on
+        /// a non-fading layer). Retries until the controls exist.
+        func attachAccessory(to controller: AVPlayerViewController, attempts: Int) {
+            guard let hostingView = hosting?.view, hostingView.superview == nil else { return }
+            controllerRef = controller
+            controller.view.layoutIfNeeded()
+            mount(hostingView, controller: controller)
+            startFadeMirror(attempts: attempts)
+        }
+
+        private func mount(_ view: UIView, controller: AVPlayerViewController) {
+            // controller.view is the AVPlayerViewController's OWN view,
+            // so declaring it the parent is consistent (the earlier
+            // crash was declaring AVPlayerViewController while mounting
+            // inside a private controls VC's view).
+            if let hosting {
+                controller.addChild(hosting)
+                controller.view.addSubview(view)
+                hosting.didMove(toParent: controller)
+            } else {
+                controller.view.addSubview(view)
+            }
+            // Leading clears the X + PiP/AirPlay cluster; centerline is
+            // the calibrated orientation-aware constant (approved on
+            // device), updated on size-class change so rotation holds.
+            view.leadingAnchor.constraint(
+                equalTo: controller.view.layoutMarginsGuide.leadingAnchor, constant: 185
+            ).isActive = true
+            let constraint = view.centerYAnchor.constraint(
+                equalTo: controller.view.safeAreaLayoutGuide.topAnchor,
+                constant: Self.fallbackCenterOffset(for: controller.traitCollection)
+            )
+            constraint.isActive = true
+            view.registerForTraitChanges([UITraitVerticalSizeClass.self]) {
+                (registered: UIView, _: UITraitCollection) in
+                constraint.constant = Self.fallbackCenterOffset(for: registered.traitCollection)
+            }
+        }
+
+        private var ticksSinceHunt = 0
+        private var lastLoggedVisible: Bool?
+
+        /// The sampler never gives up: the display link always runs,
+        /// and any tick without a usable fade source re-hunts
+        /// (throttled). The earlier one-shot hunt (8 x 150ms, then
+        /// "capsule stays visible" forever) lost on devices where the
+        /// Glass chrome finished building after the retry budget, the
+        /// exact failure seen in the field.
+        private func startFadeMirror(attempts: Int) {
+            guard displayLink == nil else { return }
+            huntFadeSource()
+            let link = CADisplayLink(target: self, selector: #selector(tickFade))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
+
+        private func huntFadeSource() {
+            guard let controller = controllerRef else { return }
+            if let source = Self.controlsReferenceView(in: controller.view, host: controller.view) {
+                fadeSource = source
+                debugLog("[AVP-FADE] mirroring \(String(describing: type(of: source)))")
+            }
+        }
+
+        @objc private func tickFade() {
+            guard let capsule = hosting?.view else { return }
+            // Player dismissed: stop sampling (releases the link's
+            // retain on this coordinator, see the deinit note above).
+            if capsule.window == nil {
+                displayLink?.invalidate()
+                displayLink = nil
+                return
+            }
+            // No usable source: re-hunt twice a second. Before the
+            // FIRST source is found the capsule keeps its current
+            // (visible) alpha, since the chrome shows at presentation
+            // and hiding here would invert the desync on devices whose
+            // chrome builds slowly. A source that DETACHES means the
+            // controls left the hierarchy, which is a hide, so the
+            // capsule hides with them instead of freezing at its last
+            // alpha, and stays hidden until a new source reports in.
+            guard let source = fadeSource, source.window != nil else {
+                if fadeSource != nil {
+                    fadeSource = nil
+                    applyFade(0, to: capsule, reason: "source detached")
+                }
+                ticksSinceHunt += 1
+                if ticksSinceHunt >= 30 {
+                    ticksSinceHunt = 0
+                    huntFadeSource()
+                }
+                return
+            }
+            ticksSinceHunt = 0
+            applyFade(Self.onScreenAlpha(of: source), to: capsule, reason: nil)
+        }
+
+        private func applyFade(_ target: CGFloat, to capsule: UIView, reason: String?) {
+            if abs(capsule.alpha - target) > 0.001 {
+                capsule.alpha = target
+            }
+            // Edge-triggered visibility log so simulator/device runs can
+            // assert the capsule tracks the native chrome.
+            let visible: Bool? = target >= 0.99 ? true : (target <= 0.01 ? false : nil)
+            if let visible, visible != lastLoggedVisible {
+                lastLoggedVisible = visible
+                let via = reason ?? "mirroring \(String(describing: type(of: fadeSource ?? UIView())))"
+                debugLog("[AVP-FADE] capsule \(visible ? "VISIBLE" : "HIDDEN") (\(via))")
+            }
+        }
+
+        /// Composited on-screen opacity of `view`: the product of every
+        /// ancestor's presentation-layer opacity up to the window, so it
+        /// reflects an in-flight fade no matter which ancestor Apple is
+        /// animating. Zero if anything in the chain is hidden.
+        private static func onScreenAlpha(of view: UIView) -> CGFloat {
+            var current: UIView? = view
+            var alpha: CGFloat = 1
+            while let v = current {
+                if v.isHidden { return 0 }
+                let opacity = v.layer.presentation()?.opacity ?? Float(v.alpha)
+                alpha *= CGFloat(opacity)
+                current = v.superview
+            }
+            return alpha
+        }
+
+        /// Native top-row center, relative to the safe-area top:
+        /// measured from device screenshots; portrait tucks the row
+        /// into the safe area band, landscape floats it lower.
+        private static func fallbackCenterOffset(for traits: UITraitCollection) -> CGFloat {
+            traits.verticalSizeClass == .compact ? 44 : 20
+        }
+
+        /// A view inside Apple's fading controls subtree to sample.
+        /// Because `onScreenAlpha` multiplies EVERY ancestor up to the
+        /// window, any descendant of the fading node reports the right
+        /// composited value, so the hunt can be loose: first a view
+        /// whose class name marks it as part of the playback controls
+        /// (device-proven names across iOS 17-26 chrome generations),
+        /// then the old top-row-button heuristic as fallback.
+        private static func controlsReferenceView(in root: UIView, host: UIView) -> UIView? {
+            let markers = ["GlassControls", "PlaybackControls", "ChromelessControls", "ControlsView", "TransportControls"]
+            var queue: [UIView] = [root]
+            while !queue.isEmpty {
+                let view = queue.removeFirst()
+                let name = String(describing: type(of: view))
+                if markers.contains(where: { name.contains($0) }) {
+                    // Sample a child if one exists: some chrome roots
+                    // pin alpha at 1 and fade only their content view.
+                    return view.subviews.first ?? view
+                }
+                queue.append(contentsOf: view.subviews)
+            }
+            return topRowReferenceControl(in: root, host: host)
+        }
+
+        /// The highest plausibly button-sized native control in the top
+        /// band of the player, i.e. a member of the chrome's top row.
+        private static func topRowReferenceControl(in root: UIView, host: UIView) -> UIView? {
+            var best: (view: UIView, midY: CGFloat)?
+            var queue: [UIView] = [root]
+            while !queue.isEmpty {
+                let view = queue.removeFirst()
+                if view is UIControl || view.accessibilityTraits.contains(.button),
+                   view.bounds.height >= 36, view.bounds.height <= 64 {
+                    let midY = view.convert(view.bounds, to: host).midY
+                    if best == nil || midY < best!.midY {
+                        best = (view, midY)
+                    }
+                }
+                queue.append(contentsOf: view.subviews)
+            }
+            guard let best, best.midY > 0, best.midY < host.bounds.height * 0.3 else {
+                return nil
+            }
+            return best.view
+        }
+    }
+
+}
+
+/// Stream-info overlay for the native player, the counterpart of the
+/// mpv Options panel's stream info. Values come straight from AVPlayer:
+/// presentation size and the HLS access log's bitrate figures, refreshed
+/// every 2 seconds while shown.
+private struct NativeStreamInfoCard: View {
+    let player: AVPlayer
+    let channelName: String
+    let program: String?
+    let engineNote: String
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            VStack(alignment: .leading, spacing: 6) {
+                Text(channelName)
+                    .scaledFont(.system(size: 28, weight: .bold))
+                if let program, !program.isEmpty {
+                    Text(program)
+                        .scaledFont(.system(size: 22, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Divider()
+                Text(engineNote)
+                let size = player.currentItem?.presentationSize ?? .zero
+                if size != .zero {
+                    Text("\(Int(size.width))x\(Int(size.height))")
+                }
+                if let event = player.currentItem?.accessLog()?.events.last {
+                    if event.indicatedBitrate > 0 {
+                        Text(String(format: "%.1f Mbps indicated", event.indicatedBitrate / 1_000_000))
+                    }
+                    if event.observedBitrate > 0 {
+                        Text(String(format: "%.1f Mbps observed", event.observedBitrate / 1_000_000))
+                    }
+                    if event.numberOfStalls > 0 {
+                        Text("\(event.numberOfStalls) stall(s)")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+            .scaledFont(.system(size: 20, weight: .regular))
+            .foregroundStyle(.white)
+            .padding(24)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(maxWidth: 480, alignment: .leading)
+        }
+    }
+}
+

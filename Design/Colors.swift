@@ -1,0 +1,194 @@
+import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+
+// MARK: - Astral Brand Colors
+// Key surface and accent colors are DYNAMIC, they read from ThemeManager.shared so
+// every view automatically reflects the user's chosen theme without needing to
+// observe ThemeManager directly.  Text/border/status colors remain static.
+extension Color {
+    // MARK: Dynamic (theme-aware) surfaces
+    /// App-level dark background, changes with selected theme.
+    static var appBackground:      Color { ThemeManager.shared.background }
+    /// Card / list row background, changes with selected theme.
+    static var cardBackground:     Color { ThemeManager.shared.card }
+    /// Slightly elevated surface (drawers, sheets), derived from card.
+    static var elevatedBackground: Color { ThemeManager.shared.card }
+    /// Sheet / modal background, mirrors app background.
+    static var sheetBackground:    Color { ThemeManager.shared.background }
+
+    // MARK: Dynamic accents
+    /// Primary accent, the brand/theme color used for highlights, icons, and tints.
+    static var accentPrimary:   Color { ThemeManager.shared.accent }
+    /// Secondary accent, slightly muted version of the primary.
+    static var accentSecondary: Color { ThemeManager.shared.accentSecondary }
+    /// Dim accent, low-opacity fill, e.g. icon badge backgrounds.
+    static var accentDim:       Color { ThemeManager.shared.accent.opacity(0.22) }
+
+    // MARK: Text, mode-aware for legibility on both dark and light grounds
+    /// Dark-mode ink for secondary/tertiary text and borders in light mode.
+    /// A near-black slate (`#0F1B24`) so accent-tinted greys don't wash out
+    /// on white; the near-white `E8F4F8` is invisible on a light ground.
+    private static let lightInk = Color(hex: "0F1B24")
+
+    /// Primary text, near-white on dark grounds, near-black slate on light.
+    static var textPrimary: Color {
+        ThemeManager.resolve(dark: Color(hex: "E8F4F8"), light: lightInk)
+    }
+    /// Secondary text, accent-tinted on dark; darker, higher-alpha ink on
+    /// light (accent-alpha greys wash out on white).
+    static var textSecondary: Color {
+        ThemeManager.resolve(dark: ThemeManager.shared.darkAccent.opacity(0.65),
+                             light: lightInk.opacity(0.60))
+    }
+    /// Tertiary text, accent-tinted at low opacity on dark; ink for hints on light.
+    static var textTertiary:  Color {
+        ThemeManager.resolve(dark: ThemeManager.shared.darkAccent.opacity(0.28),
+                             light: lightInk.opacity(0.42))
+    }
+
+    // MARK: Text Contrast
+    /// Wraps a TEXT color so Settings > Appearance > Text Contrast can blend
+    /// it toward white (dark appearance) or black (light appearance), alpha
+    /// included. At 0% the color is returned untouched. Use only for text
+    /// (and inline glyphs), never fills, surfaces, rings or progress bars.
+    static func contrastText(_ base: Color) -> Color {
+        let amount = CGFloat(ThemeManager.shared.textContrast)
+        guard amount > 0.001 else { return base }
+        #if canImport(UIKit)
+        let source = UIColor(base)
+        let mode = ThemeManager.shared.appearanceMode
+        return Color(UIColor { trait in
+            let isDark: Bool
+            switch mode {
+            case .dark: isDark = true
+            case .light: isDark = false
+            case .system: isDark = trait.userInterfaceStyle != .light
+            }
+            let c = source.resolvedColor(with: trait)
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            guard c.getRed(&r, green: &g, blue: &b, alpha: &a) else { return c }
+            let t: CGFloat = isDark ? 1 : 0
+            let k = min(1, max(0, amount))
+            return UIColor(red: r + (t - r) * k,
+                           green: g + (t - g) * k,
+                           blue: b + (t - b) * k,
+                           alpha: a + (1 - a) * k)
+        })
+        #else
+        return base
+        #endif
+    }
+
+    // Borders, accent-tinted on dark; on light, blend toward ink at a higher
+    // alpha so dividers stay visible on white without the accent washing out.
+    static var borderSubtle: Color {
+        ThemeManager.resolve(dark: ThemeManager.shared.darkAccent.opacity(0.10),
+                             light: lightInk.opacity(0.12))
+    }
+    static var borderMedium: Color {
+        ThemeManager.resolve(dark: ThemeManager.shared.darkAccent.opacity(0.18),
+                             light: lightInk.opacity(0.20))
+    }
+
+    // Status
+    static let statusLive    = Color(hex: "FF4757")
+    /// "Online" indicator, follows the accent so it matches the active theme.
+    static var statusOnline: Color { ThemeManager.shared.accent }
+    static let statusWarning = Color(hex: "FFA502")
+    /// Offline indicator, dim accent tint, always complementary to the theme.
+    static var statusOffline: Color { ThemeManager.shared.accent.opacity(0.22) }
+
+    // Server type colors, dynamic so they match the active theme
+    static var xtreamColor:      Color { ThemeManager.shared.accentSecondary }
+    static var dispatcharrColor: Color { ThemeManager.shared.accent }
+    static let plexColor        = Color(hex: "E5A00D")
+
+    // MARK: Hex conversion (used by ColorPicker → ThemeManager)
+    /// Returns an uppercase 6-character hex string, e.g. "2DD4BF".
+    func toHex() -> String {
+#if canImport(UIKit)
+        let ui = UIColor(self)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        ui.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(format: "%02X%02X%02X",
+                      Int((r * 255).rounded()),
+                      Int((g * 255).rounded()),
+                      Int((b * 255).rounded()))
+#else
+        // macOS / tvOS fallback
+        return "2DD4BF"
+#endif
+    }
+
+    // Hex initializer
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3:  (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6:  (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8:  (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default: (a, r, g, b) = (255, 0, 0, 0)
+        }
+        self.init(.sRGB,
+                  red: Double(r) / 255,
+                  green: Double(g) / 255,
+                  blue: Double(b) / 255,
+                  opacity: Double(a) / 255)
+    }
+}
+
+// MARK: - Gradients
+extension LinearGradient {
+    static var accentGradient: LinearGradient {
+        LinearGradient(
+            colors: [.accentPrimary, .accentSecondary],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+    static let cardOverlay = LinearGradient(
+        colors: [Color.clear, Color.appBackground.opacity(0.8)],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+    static let heroOverlay = LinearGradient(
+        colors: [Color.clear, Color.appBackground],
+        startPoint: .center,
+        endPoint: .bottom
+    )
+}
+
+// MARK: - Glass Effect Helper
+struct GlassBackground: ViewModifier {
+    var tint: Color = .accentPrimary
+    var opacity: Double = 0.06
+    var border: Bool = true
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                ZStack {
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                    tint.opacity(opacity)
+                }
+            }
+            .overlay {
+                if border {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(tint.opacity(0.18), lineWidth: 1)
+                }
+            }
+    }
+}
+
+extension View {
+    func glassCard(tint: Color = .accentPrimary, opacity: Double = 0.06, border: Bool = true) -> some View {
+        modifier(GlassBackground(tint: tint, opacity: opacity, border: border))
+    }
+}

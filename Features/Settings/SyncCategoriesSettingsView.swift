@@ -1,0 +1,165 @@
+//  SyncCategoriesSettingsView.swift
+//  Astral
+//
+//  v1.6.17, granular per-data-type iCloud sync controls.
+//
+//  Anchored from the iCloud Sync section of the main SettingsView.
+//  Each row pairs a "Sync this category" toggle with a destructive
+//  "Delete from iCloud" action. The master `iCloudSyncEnabled`
+//  toggle still gates everything; when it's off, every row here is
+//  disabled but the user can still hit Delete to scrub stale cloud
+//  state per category.
+
+import SwiftUI
+import SwiftData
+
+struct SyncCategoriesSettingsView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Query private var servers: [ServerConnection]
+    @ObservedObject private var theme = ThemeManager.shared
+    @AppStorage("iCloudSyncEnabled") private var iCloudSyncEnabled = true
+
+    // One @AppStorage per category, written through SyncCategory.defaultsKey,
+    // round-trips via SyncManager.buildPreferencesDict so a flip on one
+    // device propagates to the user's other devices.
+    @AppStorage(SyncCategory.servers.defaultsKey)       private var syncServers = true
+    @AppStorage(SyncCategory.watchProgress.defaultsKey) private var syncWatchProgress = true
+    @AppStorage(SyncCategory.reminders.defaultsKey)     private var syncReminders = true
+    @AppStorage(SyncCategory.preferences.defaultsKey)   private var syncPreferences = true
+    @AppStorage(SyncCategory.remoteControl.defaultsKey) private var syncRemoteControl = true
+    @AppStorage(SyncCategory.credentials.defaultsKey)   private var syncCredentials = true
+    // Default OFF: a per-device choice unless the user opts in.
+    @AppStorage(SyncCategory.radioModeDefault.defaultsKey) private var syncRadioModeDefault = false
+
+    /// The category whose Delete confirmation is currently being shown.
+    @State private var pendingDeleteCategory: SyncCategory? = nil
+
+    /// Set when a delete completes, drives the toast confirmation.
+    @State private var lastDeletedCategory: SyncCategory? = nil
+    @State private var showDeletedToast = false
+
+    private func binding(for category: SyncCategory) -> Binding<Bool> {
+        switch category {
+        case .servers:       return $syncServers
+        case .watchProgress: return $syncWatchProgress
+        case .reminders:     return $syncReminders
+        case .preferences:   return $syncPreferences
+        case .remoteControl: return $syncRemoteControl
+        case .radioModeDefault: return $syncRadioModeDefault
+        case .credentials:   return $syncCredentials
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.appBackground.ignoresSafeArea()
+            iOSBody
+        }
+        .navigationTitle("Sync Categories")
+        .navigationBarTitleDisplayMode(.inline)
+        .alert(
+            pendingDeleteCategory.map { "Remove \($0.displayName) from iCloud?" } ?? "",
+            isPresented: Binding(
+                get: { pendingDeleteCategory != nil },
+                set: { if !$0 { pendingDeleteCategory = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let category = pendingDeleteCategory {
+                    SyncManager.shared.clearCloudCategory(category, localServers: servers)
+                    lastDeletedCategory = category
+                    pendingDeleteCategory = nil
+                    withAnimation(.easeInOut(duration: 0.2)) { showDeletedToast = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                        withAnimation(.easeInOut(duration: 0.2)) { showDeletedToast = false }
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingDeleteCategory = nil }
+        } message: {
+            if let category = pendingDeleteCategory {
+                Text("This will remove your \(category.displayName) from iCloud. Other devices will keep their local copy.")
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if showDeletedToast, let category = lastDeletedCategory {
+                Text("\(category.displayName) removed from iCloud")
+                    .scaledFont(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .background(Capsule().fill(Color.statusLive))
+                    .padding(.bottom, 24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+    }
+
+    // MARK: - iOS Body
+    private var iOSBody: some View {
+        List {
+            Section {
+                ForEach(SyncCategory.allCases) { category in
+                    iOSRow(for: category)
+                        .listRowBackground(Color.cardBackground)
+                }
+            } header: {
+                Text("Categories").sectionHeaderStyle()
+            } footer: {
+                Text(footerText)
+                    .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+            }
+            .listSectionSeparator(.hidden)
+        }
+        .scrollContentBackground(.hidden)
+        // Phase 3 (Logan 2026-09-18): floating tab bar parity -
+        // content runs under the bar, the bar tucks away on scroll,
+        // and the last row clears it.
+        .settingsPhoneTabBarChrome()
+        .listStyle(.insetGrouped)
+    }
+
+    @ViewBuilder
+    private func iOSRow(for category: SyncCategory) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: binding(for: category)) {
+                SettingsRow(icon: category.icon, iconColor: theme.accent,
+                            title: category.displayName,
+                            subtitle: category.subtitle)
+            }
+            .tint(theme.accent)
+            .disabled(!iCloudSyncEnabled)
+            .opacity(iCloudSyncEnabled ? 1.0 : 0.5)
+
+            HStack {
+                Spacer()
+                Button(role: .destructive) {
+                    pendingDeleteCategory = category
+                } label: {
+                    Label("Delete from iCloud", systemImage: "icloud.slash")
+                        .scaledFont(.footnote.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+            }
+            .padding(.top, 2)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - tvOS Body
+
+    // MARK: - Copy
+
+    private var footerText: String {
+        if iCloudSyncEnabled {
+            // Discord (Glitzbr) had to ask what actually triggers a sync,
+            // which means the answer was invisible. It is: a local change
+            // pushes itself a couple of seconds later, and an incoming change
+            // from another device is applied as soon as iCloud delivers it.
+            // Sync Now only forces the round trip early.
+            return "Syncing is automatic: a change you make here is sent a few seconds later, and a change from another device is applied as soon as iCloud delivers it. Sync Now on the previous screen just forces that round trip immediately.\n\nEach toggle controls whether this device pushes and pulls that category. The category-toggle states themselves sync across your devices, so flipping one here will reach your other Apple-ID-signed-in devices. Use the Delete buttons to remove a category's cloud copy without affecting local data."
+        } else {
+            return "iCloud Sync is off. Per-category toggles take effect when you re-enable Sync at the top. The Delete buttons still work: useful for scrubbing stale iCloud state before re-enabling Sync."
+        }
+    }
+}

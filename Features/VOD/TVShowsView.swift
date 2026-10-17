@@ -1,0 +1,549 @@
+import SwiftUI
+import SwiftData
+
+// MARK: - TV Shows View
+struct TVShowsView: View {
+    @ObservedObject var vodStore: VODStore
+    @Query private var servers: [ServerConnection]
+    @Binding var isPlaying: Bool
+    @Binding var isDetailPushed: Bool
+    @Binding var popRequested: Bool
+
+    @State private var searchText = ""
+    @State private var hiddenGroups: Set<String> = []
+    @State private var showManageGroups = false
+    /// GH #20 (Android parity): auto-hide the iPhone tab bar while the
+    /// poster grid scrolls down; any upward scroll reveals it
+    /// (TabBarScrollTracker). Phone-gated in the observer, so iPad
+    /// keeps its bar.
+    @State private var gridTabBarHidden = false
+    @State private var tabBarTracker = TabBarScrollTracker()
+    @State private var navPath = NavigationPath()
+    @State private var resumePlayingURL: IdentifiableURL?
+    @State private var resumePlayingTitle = ""
+    @State private var resumePlayingHeaders: [String: String] = [:]
+    @State private var resumeVodID: String?
+    @State private var resumePosterURL: String?
+    @State private var resumeServerID: String?
+    @State private var resumePositionMs: Int32 = 0
+    // Provider copies for the resumed episode, so Switch Version works from
+    // Continue Watching the same as it does from the series page (the movie
+    // half of this shipped in 1.8.19; Logan flagged the episode gap 2026-08-19).
+    @State private var resumeVersionOptions: [VODVersionOption] = []
+    @State private var resumeVersionSelectionKey: String = ""
+
+    private let hiddenGroupsKey = "hiddenSeriesGroups"
+
+    /// User-tunable UI scale (0.85-1.5). Text scales on every idiom (VODDisplayScale);
+    /// iPad / Mac Catalyst stretch the poster minimum so the grid reads
+    /// comfortably on wider displays (see AppearanceSettingsView).
+    @AppStorage("uiScale") private var uiScale: Double = 1.0
+
+    private var columns: [GridItem] {
+        let clamped = max(0.85, min(1.5, uiScale))
+        let isRegular = UIDevice.current.userInterfaceIdiom != .phone
+        let minimum: CGFloat = isRegular ? 120 * clamped : 120
+        let maximum: CGFloat = isRegular ? 160 * clamped : 160
+        return [GridItem(.adaptive(minimum: minimum, maximum: maximum), spacing: 12)]
+    }
+    private let gridRowSpacing: CGFloat = 16
+
+    /// Auth headers for the active Dispatcharr server, used by AuthPosterImage.
+    private var dispatcharrHeaders: [String: String] {
+        guard let s = servers.first(where: { $0.supportsVOD && $0.type == .dispatcharrAPI && $0.isActive })
+                   ?? servers.first(where: { $0.supportsVOD && $0.type == .dispatcharrAPI })
+        else { return [:] }
+        return s.authHeaders
+    }
+
+    /// The library grid: a windowed view of the stored catalog, rebuilt
+    /// whenever the catalog, the group filter or the playlist changes. Only
+    /// row ids and rail buckets are resident.
+    @State private var libraryShows: VODWindowList = .empty
+    /// Search results: the catalog's own hits plus the server's, bounded.
+    @State private var searchShows: [VODDisplayItem] = []
+    @State private var searchShowsTask: Task<Void, Never>?
+
+    private var showsCount: Int { searchText.isEmpty ? libraryShows.count : searchShows.count }
+
+    private struct ShowsKey: Hashable {
+        let revision: Int
+        let count: Int
+        let catalogKey: String?
+        let hidden: Set<String>
+    }
+    private var showsKey: ShowsKey {
+        ShowsKey(revision: vodStore.catalogRevision, count: vodStore.seriesCount,
+                 catalogKey: vodStore.catalogKey, hidden: hiddenGroups)
+    }
+
+    private func refreshSearchShows() {
+        searchShowsTask?.cancel()
+        let q = searchText
+        guard !q.isEmpty else { searchShows = []; return }
+        let extra = vodStore.seriesSearchResults
+        searchShowsTask = Task { @MainActor in
+            var combined = await vodStore.searchCatalog(kind: .series, query: q, hiddenTitleKeys: [])
+            guard !Task.isCancelled else { return }
+            var ids = Set(combined.map { $0.id })
+            for r in extra where ids.insert(r.id).inserted { combined.append(r) }
+            searchShows = combined
+        }
+    }
+
+    /// Whether the navigation stack is at root (no detail pushed).
+    var isAtRoot: Bool { navPath.isEmpty }
+
+    /// Movies & TV Shows Display Scale (Android parity, Logan 2026-09-27):
+    /// multiplies the app text scale for this page on every platform, the
+    /// way Android's WithDisplayScale multiplies fontScale.
+    var body: some View {
+        vodPageContent.modifier(VODDisplayScale())
+    }
+
+    @ViewBuilder
+    private var vodPageContent: some View {
+        NavigationStack(path: $navPath) {
+            ZStack {
+                Color.appBackground.ignoresSafeArea()
+
+                if vodStore.isLoadingSeries && vodStore.seriesCount == 0 {
+                    LoadingView(message: "Loading series…")
+                } else if let err = vodStore.seriesError, vodStore.seriesCount == 0 {
+                    errorView(err)
+                } else if vodStore.seriesCount == 0 {
+                    emptyState
+                } else {
+                    content
+                }
+            }
+            .navigationDestination(for: VODDisplayItem.self) { item in
+                VODDetailView(item: item, isPlaying: $isPlaying)
+            }
+            // No .navigationTitle on iOS, OnDemandView hosts the
+            // Movies / Series pill selector above this view and the
+            // pills serve as the section identifier. A title here
+            // would duplicate the header.
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color.appBackground, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showManageGroups = true
+                    } label: {
+                        Text("Filter")
+                            .scaledFont(.headlineSmall)
+                            .foregroundColor(Color.contrastText(.accentPrimary))
+                    }
+                }
+            }
+            .searchable(text: $searchText,
+                        placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: "Search series")
+            // Leaving this tab, or entering the fullscreen player, cancels
+            // and closes search (Logan 2026-09-16).
+            .onDismissSearch {
+                if !searchText.isEmpty { searchText = "" }
+            }
+            .onAppear {
+                hiddenGroups = HiddenGroupsStore.load(forKey: hiddenGroupsKey)
+                // v1.6.22: only auto-refresh when we genuinely have
+                // no data for the active server. The previous
+                // `series.isEmpty && !isLoadingSeries` guard re-fired
+                // every time SwiftUI rebuilt this view after a load
+                // that legitimately returned zero series, producing
+                // an infinite refresh loop on servers whose API
+                // returns empty (Freyguy1975's Synology Dispatcharr
+                // repro). Comparing the active server's id against
+                // `currentSeriesServerID` (set the moment a load
+                // begins) lets us tell "fresh server we haven't
+                // tried yet" from "already loaded, nothing came
+                // back". Pull-to-refresh and the empty-state
+                // Try Again button still bypass this guard since
+                // they call `refreshSeries` directly.
+                let activeServerID = (servers.first(where: { $0.isActive }) ?? servers.first)?.id
+                let alreadyTriedThisServer = activeServerID != nil
+                    && vodStore.currentSeriesServerID == activeServerID
+                if vodStore.seriesCount == 0
+                    && !vodStore.isLoadingSeries
+                    && !alreadyTriedThisServer {
+                    vodStore.refreshSeries(servers: servers)
+                }
+            }
+            .sheet(isPresented: $showManageGroups) {
+                ManageGroupsSheet(
+                    title: "Manage Groups",
+                    allGroups: vodStore.seriesCategories.map(\.name),
+                    storageKey: hiddenGroupsKey,
+                    onDismiss: { updated in
+                        hiddenGroups = updated
+                    }
+                )
+            }
+            .refreshable {
+                vodStore.refreshSeries(servers: servers)
+                // Allow the task one tick to start so isLoadingSeries flips to true first.
+                try? await Task.sleep(for: .milliseconds(50))
+                while vodStore.isLoadingSeries {
+                    try? await Task.sleep(for: .milliseconds(150))
+                }
+            }
+            .onChange(of: searchText) { _, query in
+                vodStore.searchSeries(query: query, servers: servers)
+                refreshSearchShows()
+            }
+            .onChange(of: vodStore.seriesSearchResults.count) { _, _ in refreshSearchShows() }
+            .task(id: showsKey) {
+                libraryShows = await vodStore.library(kind: .series, hiddenGroups: hiddenGroups,
+                                                      hiddenTitleKeys: [], genre: nil,
+                                                      onlyHidden: false, sortRaw: MoviesSortOrder.titleAZ.rawValue)
+            }
+            .onChange(of: navPath) { _, path in
+                isDetailPushed = !path.isEmpty
+            }
+            .onChange(of: popRequested) { _, pop in
+                if pop && !navPath.isEmpty {
+                    navPath.removeLast()
+                    popRequested = false
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .syncManagerDidApplyPreferences)) { _ in
+                hiddenGroups = HiddenGroupsStore.load(forKey: hiddenGroupsKey)
+            }
+            .fullScreenCover(item: $resumePlayingURL) { wrapper in
+                PlayerView(
+                    urls: [wrapper.url],
+                    title: resumePlayingTitle,
+                    headers: resumePlayingHeaders,
+                    isLive: false,
+                    artworkURL: resumePosterURL.flatMap { URL(string: $0) },
+                    vodID: resumeVodID,
+                    vodPosterURL: resumePosterURL,
+                    vodServerID: resumeServerID,
+                    vodType: "episode",
+                    resumePositionMs: resumePositionMs,
+                    vodVersionOptions: resumeVersionOptions,
+                    vodSelectedVersionID: VODVersionSelectionStore
+                        .selection(forKey: resumeVersionSelectionKey),
+                    vodVersionSelectionKey: resumeVersionSelectionKey
+                )
+                .onDisappear { isPlaying = false }
+            }
+        }
+    }
+
+    /// The poster grid. Generic over the collection, walking INDEXES so a
+    /// catalog-backed list never has to read every row just to build the
+    /// ForEach; LazyVGrid materializes only what it draws.
+    private func showsGrid<C: RandomAccessCollection>(_ items: C) -> some View
+    where C.Element == VODDisplayItem, C.Index == Int {
+        LazyVGrid(columns: columns, spacing: gridRowSpacing) {
+            ForEach(items.startIndex..<items.endIndex, id: \.self) { index in
+                let item = items[index]
+                NavigationLink(value: item) {
+                    VODPosterCard(item: item, headers: dispatcharrHeaders)
+                }
+                .buttonStyle(.plain)
+                .id(VODWindowList.anchorID(index))
+            }
+        }
+    }
+
+
+    /// Continue Watching resume: asks Play Here / Play on <receiver> while a
+    /// remote session is active (PlayWhereRouter).
+    private func resumeFromContinueWatching(_ progress: WatchProgress) {
+        guard progress.streamURL.flatMap(URL.init(string:)) != nil else {
+            resumePicked(progress)
+            return
+        }
+        PlayWhereRouter.shared.request(title: progress.title, item: .nonLive) {
+            resumePicked(progress)
+        }
+    }
+
+    private func resumePicked(_ progress: WatchProgress) {
+        if let urlStr = progress.streamURL, let url = URL(string: urlStr) {
+            resumePlayingTitle = progress.title
+            resumeVodID = progress.vodID
+            resumePosterURL = progress.posterURL
+            resumeServerID = progress.serverID
+            resumePositionMs = progress.positionMs
+            if let sid = progress.serverID,
+               let serverUUID = UUID(uuidString: sid),
+               let server = servers.first(where: { $0.id == serverUUID }) {
+                resumePlayingHeaders = server.authHeaders
+            } else {
+                resumePlayingHeaders = dispatcharrHeaders
+            }
+            // ATV log 2026-08-17: same defect as MoviesView's resume path -
+            // mounting the cover directly skipped the teardown VODDetailView
+            // does, so a minimized live channel kept decoding (and playing
+            // audio) underneath the episode.
+            PlayerSession.shared.exit()
+            // Same second symptom as MoviesView's resume: no version options
+            // meant Switch Version was empty in the player even when the
+            // series page shows several sources. Best-effort; never gates
+            // playback. The selection key is the SERIES key (itemType
+            // "series", series id) - identical to VODDetailView's, so a pin
+            // made on the series page and one made mid-play in this resume
+            // read and write the same stored choice.
+            resumeVersionOptions = []
+            let resumeServer: ServerConnection? = progress.serverID
+                .flatMap(UUID.init(uuidString:))
+                .flatMap { uuid in servers.first(where: { $0.id == uuid }) }
+            if let serverUUID = progress.serverID.flatMap(UUID.init(uuidString:)),
+               let seriesID = progress.seriesID {
+                resumeVersionSelectionKey = VODVersionSelectionStore
+                    .storageKey(serverID: serverUUID,
+                                itemType: "series",
+                                itemID: seriesID)
+            } else {
+                resumeVersionSelectionKey = ""
+            }
+            loadResumeVersionOptions(progress: progress, resumeURL: url, server: resumeServer)
+            // TEST (AVPlayer VOD): unified container first; false = engine
+            // off or non-VOD shape, legacy cover mounts unchanged.
+            if PlayerSession.shared.beginVOD(
+                title: progress.title,
+                streamURL: url,
+                headers: resumePlayingHeaders,
+                posterURL: progress.posterURL.flatMap { URL(string: $0) },
+                vodID: progress.vodID,
+                serverID: progress.serverID,
+                vodType: "episode",
+                resumePositionMs: progress.positionMs,
+                versionSelectionKey: resumeVersionSelectionKey.isEmpty ? nil : resumeVersionSelectionKey) {
+                isPlaying = true
+                return
+            }
+            resumePlayingURL = IdentifiableURL(url: url)
+            isPlaying = true
+            return
+        }
+        // Fallback: find the series in the catalog and push to its detail view
+        let wanted = progress.vodID
+        Task { @MainActor in
+            if let item = await vodStore.items(kind: .series, ids: [wanted])[wanted] {
+                navPath.append(item)
+            }
+        }
+    }
+
+    /// Fetch the parent series' provider copies so the resumed episode can
+    /// offer Switch Version. Mirrors MoviesView.loadResumeVersionOptions with
+    /// the episode differences from VODDetailView.buildVersionOptions:
+    /// providers come from the SERIES id (progress.seriesID - an episode
+    /// progress row's vodID is the episode's own id), episodes pin by
+    /// m3u_account_id only (a series relation id does not address an episode
+    /// row), so options dedupe to one per distinct account with the ACCOUNT
+    /// id as the option id, and labels are the plain account name.
+    private func loadResumeVersionOptions(progress: WatchProgress,
+                                          resumeURL: URL,
+                                          server: ServerConnection?) {
+        // Fall back to the active Dispatcharr server: a watch-progress row
+        // synced from another device can carry a serverID this install does
+        // not have, and the resume itself already falls back the same way.
+        let resolved = server ?? servers.first(where: {
+            $0.isActive && $0.type == .dispatcharrAPI
+        }) ?? servers.first(where: { $0.type == .dispatcharrAPI })
+        guard let resolved, resolved.type == .dispatcharrAPI,
+              let seriesID = progress.seriesID, let numericID = Int(seriesID) else {
+            debugLog("[VOD-VERSION] episode resume skipped: no dispatcharr server or series id (vodID=\(progress.vodID))")
+            return
+        }
+        // The episode's Dispatcharr UUID comes straight out of the resume URL
+        // (/proxy/vod/episode/<uuid>[/<session>]), same lesson as the movie
+        // path: the catalog may not hold this episode yet (mid-sync, or a
+        // synced row from another device), but the URL is always present
+        // because it is what we are about to play.
+        let comps = resumeURL.pathComponents
+        let uuid = comps.firstIndex(of: "episode")
+            .flatMap { i in i + 1 < comps.count ? comps[i + 1] : nil } ?? ""
+        guard !uuid.isEmpty else {
+            debugLog("[VOD-VERSION] episode resume skipped: no uuid in \(resumeURL.path)")
+            return
+        }
+        let server = resolved
+        let api = DispatcharrAPI(baseURL: server.effectiveBaseURL,
+                                 auth: .apiKey(server.effectiveApiKey),
+                                 userAgent: server.effectiveUserAgent,
+                                 authMode: server.dispatcharrHeaderMode)
+        Task { @MainActor in
+            guard let providers = try? await api.getSeriesProviders(seriesID: numericID) else {
+                debugLog("[VOD-VERSION] episode resume \(progress.vodID): providers fetch failed")
+                return
+            }
+            var seen = Set<Int>()
+            let options: [VODVersionOption] = providers.compactMap { rel in
+                guard seen.insert(rel.account.id).inserted,
+                      let url = api.proxyEpisodeURL(uuid: uuid,
+                                                    m3uAccountID: rel.account.id) else { return nil }
+                var label = rel.account.name ?? "Source \(rel.account.id)"
+                if let note = AVPlayerSupportNote.note(
+                    containerExtension: rel.containerExtension, videoCodec: nil) {
+                    label += " · ⚠️ \(note)"
+                }
+                return VODVersionOption(id: rel.account.id, label: label, url: url)
+            }
+            guard options.count > 1 else {
+                debugLog("[VOD-VERSION] episode resume \(progress.vodID): \(options.count) distinct account(s), no picker")
+                return
+            }
+            resumeVersionOptions = options
+            debugLog("[VOD-VERSION] episode resume \(progress.vodID): \(options.count) provider accounts")
+            // Container path (beginVOD): see MoviesView's matching push.
+            MultiviewStore.shared.updateVODVersionContext(
+                vodID: progress.vodID,
+                options: options,
+                selectedID: VODVersionSelectionStore.selection(forKey: resumeVersionSelectionKey),
+                selectionKey: resumeVersionSelectionKey.isEmpty ? nil : resumeVersionSelectionKey)
+        }
+    }
+
+    // MARK: - Content
+    private var content: some View {
+        VStack(spacing: 0) {
+
+            // Hidden groups indicator
+            if !hiddenGroups.isEmpty && searchText.isEmpty {
+                HStack(spacing: 6) {
+                    Text("\(hiddenGroups.count) group\(hiddenGroups.count == 1 ? "" : "s") hidden")
+                        .scaledFont(.labelMedium.subtext())
+                        .foregroundColor(Color.contrastText(.textSecondary))
+                    Button {
+                        hiddenGroups.removeAll()
+                        HiddenGroupsStore.save(hiddenGroups, forKey: hiddenGroupsKey)
+                    } label: {
+                        Text("Show All")
+                            .scaledFont(.labelMedium)
+                            .foregroundColor(Color.contrastText(.accentPrimary))
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            }
+
+            if !searchText.isEmpty && vodStore.isSearchingSeries && showsCount == 0 {
+                ProgressView("Searching server…")
+                    .tint(.accentPrimary)
+                    .padding(.top, 60)
+                Spacer()
+            } else {
+                ScrollView {
+                    // Continue Watching section
+                    ContinueWatchingSection(
+                        vodType: "episode",
+                        activeServerID: (servers.first(where: { $0.isActive }) ?? servers.first)?.id.uuidString,
+                        headers: dispatcharrHeaders,
+                        onPlay: { progress in resumeFromContinueWatching(progress) },
+                        onOpenSeries: { item in navPath.append(item) }
+                    )
+
+                    Group {
+                        if searchText.isEmpty {
+                            showsGrid(libraryShows)
+                        } else {
+                            showsGrid(searchShows)
+                        }
+                    }
+                    .padding(16)
+
+                    // TMDB asks for the logo and the required line wherever
+                    // their data or images are shown, so it rides under the
+                    // library grid as well as on the detail page. Appended
+                    // only: no focus or scroll behavior changes.
+                    if TMDBPosters.isEnabled {
+                        TMDBAttributionView(style: .long)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 24)
+                    }
+
+                    // Bottom content padding for the under-bar extension
+                    // (ignoresSafeArea below) - last poster row scrolls
+                    // clear of the floating tab bar + home indicator.
+                    Color.clear.frame(height: 96)
+                }
+                // GH #20 (Android parity): auto-hide the iPhone tab bar on
+                // grid scroll. Direction-based (2026-07-12): hide on a
+                // deliberate downward scroll, full bar back on any upward
+                // scroll. Same tracker + phone gate as Live TV.
+                .onScrollGeometryChange(for: CGFloat.self) { scrollGeo in
+                    scrollGeo.contentOffset.y
+                } action: { oldY, y in
+                    guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+                    if let hidden = tabBarTracker.update(oldY: oldY, newY: y,
+                                                         hidden: gridTabBarHidden) {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            gridTabBarHidden = hidden
+                        }
+                    }
+                }
+                .scrollAwayTabBar(collapsed: gridTabBarHidden)
+                // GH #20 follow-up (see ChannelListView's twin): extend the
+                // grid's frame under the floating iOS 26 tab bar so content
+                // shows behind/below it instead of a dead band.
+                .ignoresSafeArea(.container, edges: .bottom)
+                // ...and keep the iOS 26 bottom scroll-edge effect from
+                // painting an opaque platter over that region.
+                .astralContentUnderTabBar()
+            }
+        }
+    }
+
+    // MARK: - Empty / Error
+    @ViewBuilder
+    private var emptyState: some View {
+        if servers.isEmpty {
+            EmptyStateView(
+                icon: "tv",
+                title: "No Series",
+                message: "Add an Xtream Codes or Dispatcharr server to browse TV shows."
+            )
+        } else if servers.first(where: { $0.isActive })?.supportsVOD == false {
+            EmptyStateView(
+                icon: "tv",
+                title: "Series Unavailable",
+                message: "M3U playlists do not include VOD content. Switch to an Xtream Codes or Dispatcharr API playlist in Settings > Playlists to browse TV shows."
+            )
+        } else {
+            EmptyStateView(
+                icon: "tv",
+                title: "No Series",
+                message: serverContext("No series were returned by"),
+                action: { vodStore.refreshSeries(servers: servers) },
+                actionTitle: "Retry"
+            )
+        }
+    }
+
+    private func errorView(_ msg: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .scaledFont(.system(size: 40)).foregroundColor(.statusWarning)
+            Text("Failed to load TV shows")
+                .scaledFont(.headlineLarge).foregroundColor(.textPrimary)
+            if let serverName = vodStore.lastSeriesServerName {
+                Text("Server: \(serverName)")
+                    .scaledFont(.labelMedium.subtext()).foregroundColor(Color.contrastText(.textSecondary))
+            }
+            Text(msg)
+                .scaledFont(.bodyMedium.subtext()).foregroundColor(Color.contrastText(.textSecondary))
+                .multilineTextAlignment(.center)
+            PrimaryButton("Try Again") { vodStore.refreshSeries(servers: servers) }
+                .frame(maxWidth: 200)
+        }
+        .padding(32)
+    }
+
+    private func serverContext(_ prefix: String) -> String {
+        if let name = vodStore.lastSeriesServerName {
+            return "\(prefix) \(name). Tap the retry button to try again."
+        }
+        return "The server returned no series. Tap the retry button to try again."
+    }
+}
+
+// TVCategoryPill is defined in Components.swift

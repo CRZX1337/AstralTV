@@ -1,0 +1,900 @@
+import SwiftUI
+
+// MARK: - Release-notes data
+//
+// One curated entry per release that should surface a What's New
+// pop-up. Entries are kept indefinitely so a user upgrading from an
+// older version directly to a newer one (e.g. 1.6.10 → 1.6.13) still
+// sees the latest highlights, the matching rule is "current bundle
+// version has an entry **and** the user hasn't already seen this
+// version's prompt." Older versions just sit dormant in the array.
+//
+// Keep bullets short, under ~60 chars each, so the sheet stays
+// glanceable on iPhone and readable from a couch on Apple TV.
+
+/// Per-version release-notes record consumed by `WhatsNewStore`.
+struct WhatsNewRelease {
+    /// `CFBundleShortVersionString` value this entry targets, e.g. "1.6.12".
+    let version: String
+
+    /// Headline shown at the top of the sheet (e.g. "What's new in 1.6.12").
+    let title: String
+
+    /// Bullet list, keep each line short (under ~60 chars).
+    let bullets: [String]
+
+    /// Tap target on the "Read full release notes" link. `nil` hides the link.
+    let releaseURL: URL?
+}
+
+// MARK: - Store
+//
+// Persistence + decision logic for the What's New pop-up. Two
+// UserDefaults keys back the behavior:
+//
+// - `whatsNew.lastSeenVersion`, the version string the user last
+//   acknowledged (or that we silently set on a fresh install). The
+//   pop-up surfaces only when the **current** version doesn't match
+//   this value.
+// - `whatsNew.permanentlyDisabled`, opt-out flag. Once set, the
+//   pop-up never appears again on this device, regardless of
+//   subsequent updates. Stored locally; not synced to iCloud, since
+//   this is a per-device UI preference and a user might want it
+//   different on iPad vs Apple TV.
+//
+// The first-launch case (`lastSeenVersion == nil`) is treated as a
+// fresh install: we set the marker silently and skip the prompt, so
+// new users don't see a "what's new" sheet for a release they never
+// experienced an "old" version of.
+
+enum WhatsNewStore {
+    private static let lastSeenKey = "whatsNew.lastSeenVersion"
+    private static let disabledKey = "whatsNew.permanentlyDisabled"
+
+    /// Curated list of release-notes entries. Append a new entry per
+    /// release that warrants surfacing, keep older entries so that
+    /// users who skipped a few versions still get the latest one's
+    /// summary on their next launch.
+    static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(
+            version: "1.8.41",
+            title: "What's new in 1.8.41",
+            bullets: [
+                "Multiview: Show Channel Logos, with corner position and size",
+                "Switch Stream: Dispatcharr Direct Connect admins can reorder a channel's streams",
+                "Apple TV: Skip Without Controls, and two-step Back on DVR, Movies, TV Shows and Settings",
+                "Kept Live: see the channels kept live and stop them",
+                "iPad: floating bottom tab bar and the phone-style Live TV layout",
+                "AirPlay reconnects in place after a network blip and flips channels without leaving the stream",
+                "Pulling down Control Center no longer restarts playback",
+                "Faster guide on Apple TV, and focus returns to the playing channel after the player closes"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.40",
+            title: "What's new in 1.8.40",
+            bullets: [
+                "Movies and TV Shows show your whole library with no cap, stored on the device and resumed after a restart",
+                "Switching playlists keeps each playlist's guide and library, and permissions refresh on switch",
+                "Refresh Everything rebuilds the library from scratch",
+                "Rounded corners are separate toggles for List view and Guide view",
+                "Apple TV: the guide is the only Live TV view, with the channel number and icons in a band above a larger logo",
+                "Season and episode now appear with the program details instead of in the guide cells",
+                "iPhone: smoother channel list scrolling",
+                "In-player brightness and volume gestures"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.39",
+            title: "What's new in 1.8.39",
+            bullets: [
+                "Switch Stream keeps a single connection, so switching no longer drops the channel",
+                "Dispatcharr permissions now follow your own account instead of assuming admin, so DVR, Movies and TV Shows match what your account can do",
+                "Clear notices when a stream is refused because your account or the provider is out of connections",
+                "A stream that keeps ending backs off instead of fighting other devices for the slot",
+                "Live TV waits longer for a slow channel to start before trying another stream",
+                "Player Info Card: choose what shows on the info card in the player",
+                "Program art in the guide keeps its own shape and scales with Text Size",
+                "Changing a playlist's credentials now signs in as that account",
+                "Apple TV: focus outlines match the rows they highlight",
+                "iCloud Push and Pull now show progress"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.38",
+            title: "What's new in 1.8.38",
+            bullets: [
+                "Text Size: scale text app-wide from 85% to 150%",
+                "Subtext Size: scale secondary text from 85% to 150%",
+                "Text Contrast: make dimmed and theme-colored text easier to read",
+                "Channel logos grow to use the space when numbers or names are hidden",
+                "Apple TV: mini player stays attached to the program art after visiting Settings"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.37",
+            title: "What's new in 1.8.37",
+            bullets: [
+                "Guide banner and On Demand hero: square and wide art fill the full slot again"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.36",
+            title: "What's new in 1.8.36",
+            bullets: [
+                "Recently Watched: your last 25 channels as a group",
+                "Hide any movie or series with a long press",
+                "Video Scale replaces Aspect Ratio: Fit, Fill, Stretch",
+                "Pinch to change Video Scale on iPhone and iPad",
+                "Apple TV: Video Scale now highlights and sticks",
+                "Apple TV: double Back closes playback",
+                "iPhone Live TV: header actions behind a three-dot button",
+                "Live TV: hero banner shows portrait posters whole",
+                "iPhone: swipe down or minimize for Picture in Picture",
+                "Skip Intervals: pick your skip back and forward amounts",
+                "Apple TV guide: Sidebar layout and six remappable keys",
+                "Live TV: Reconnecting only shows on a real stall"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.35",
+            title: "What's new in 1.8.35",
+            bullets: [
+                "Multiview: adding a second stream no longer locks up the app",
+                "Apple TV Multiview: X closes the stream you have selected",
+                "Live TV: channels from bursty servers start cleanly"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.34",
+            title: "What's new in 1.8.34",
+            bullets: [
+                "Apple TV Live TV: moving through the group sidebar shows each group's channels as you go"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.33",
+            title: "What's new in 1.8.33",
+            bullets: [
+                "Apple TV Live TV: with the hero banner off, the mini player sits above the guide timeline",
+                "Apple TV Live TV: the group sidebar widens to fit your longest group name"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.32",
+            title: "What's new in 1.8.32",
+            bullets: [
+                "Live feeds that arrive in bursts rebuild a buffer sized to the gap they measured",
+                "A feed that keeps stalling now rejoins from the local buffer instead of stalling again"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.31",
+            title: "What's new in 1.8.31",
+            bullets: [
+                "Movies, TV Shows and DVR redesigned on iPhone, iPad and Apple TV",
+                "Google Cast: send a channel to a Chromecast or Google TV, with surround sound where the TV supports it",
+                "iPhone: a compact cast card above the tab bar, tap it for controls",
+                "Apple TV: faster launch, smoother guide scrolling and quicker channel tunes",
+                "Guide, Movies and DVR open from cache and refresh quietly in the background",
+                "Live TV rides out server busy replies and moves to another stream on its own",
+                "Live channels that arrive in bursts now rebuild a bigger buffer after a stall instead of stalling again",
+                "Multiview: the tile menu on Apple TV no longer reopens on its own"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.30",
+            title: "What's new in 1.8.30",
+            bullets: [
+                "MKV movies: no more stalls on high-bitrate 4K copies, and scrubbing no longer breaks playback",
+                "DVR: recordings of live channels stay in sync for the whole program",
+                "Apple TV: the DVR hero pages through Continue Watching like Movies and TV Shows",
+                "Details on every DVR hero page, with recording date, quality, size and bitrate",
+                "Apple TV: hero cards stay put while moving across their buttons, and Left returns to the previous card",
+                "Settings: choose how often Movies and TV Shows re-sweep the provider (daily by default)"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.29",
+            title: "What's new in 1.8.29",
+            bullets: [
+                "DVR, Movies and TV Shows redesigned on Apple TV and iPhone",
+                "iPhone: swipeable card decks and poster grids with an alphabet rail",
+                "iPhone Live TV: one control row, groups in a sidebar drawer",
+                "Record a series: every episode or new episodes only",
+                "Guide: tap the clock for now, hold it to jump to a day and time",
+                "Manage Groups: move any group to the very top",
+                "Program Info on recordings and on channel long press",
+                "Catch-up: seek controls and a clear archive-unavailable message",
+                "Faster tab switches and smoother scrolling on iPhone"
+            ],
+            releaseURL: nil
+        ),
+        WhatsNewRelease(
+            version: "1.8.9",
+            title: "What's new in 1.8.9",
+            bullets: [
+                "Xtream Codes playlists get their LIVE and NEW badges and category colours back. On servers reachable only over plain HTTP the full guide download was being blocked before it started, so the app quietly fell back to a smaller guide feed that carries no categories or badges at all",
+                "When you turn on iCloud Sync, AstralTV now asks what should come across before anything is pulled down, and each device chooses for itself. Your customised Apple TV remote button assignments are their own category and stay on the TV that made them, so a TV with a different remote no longer inherits the wrong map",
+                "Turning on sync as a brand-new user with nothing to restore now leaves sync switched on, so everything from that point forward keeps in step",
+                "The TV Guide has its own Manage Groups button again on Apple TV, next to the group pills and beside the Groups heading in the sidebar",
+                "Live Rewind now releases a channel's buffer as soon as you leave it instead of holding on to it, which could add up to gigabytes over an evening of channel surfing",
+                "A playlist that answers with an empty response is reported as an error instead of appearing as a playlist with no channels",
+                "Fixed the gesture hint in the top-left of the TV Guide running into the tab bar"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.9")
+        ),
+        WhatsNewRelease(
+            version: "1.8.8",
+            title: "What's new in 1.8.8",
+            bullets: [
+                "Fixed glitches and audio dropouts after pausing or rewinding live TV. When the app reconnected to your server it could throw away several seconds of video it had already received and leave a hole in the buffer, which is what broke the picture and sound where playback crossed that point",
+                "Guide accuracy on Direct Connect: channels that share a placeholder guide entry no longer show each other's schedule, and programs from one guide provider no longer appear on another provider's channels"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.8")
+        ),
+        WhatsNewRelease(
+            version: "1.8.7",
+            title: "What's new in 1.8.7",
+            bullets: [
+                "The guide now appears as soon as your server sends it, instead of waiting behind large guide-history downloads. Deeper catch-up history still arrives; it fills in quietly in the background a minute or two later"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.7")
+        ),
+        WhatsNewRelease(
+            version: "1.8.6",
+            title: "What's new in 1.8.6",
+            bullets: [
+                "Fixed the guide sitting empty with the sync indicator spinning forever. Pulling extra catch-up history from your server's guide sources now runs on a strict time budget instead of holding up the guide",
+                "Customizable Remote Control on Apple TV: remap what each Siri Remote button and hold does in the player and the guide, with hints that follow your mapping. Settings > Remote Control",
+                "Redesigned Settings: sidebar layout on Apple TV, split view on iPad, cleaner detail and edit flow everywhere",
+                "Hold Left in the TV guide for a docked channel-group menu with live preview",
+                "Mini-tune from the guide: Select tunes the channel in the corner mini-player, Select again goes fullscreen",
+                "Recording and reminder markers in the guide",
+                "One output button on iPhone and iPad for AstralTV Remote, Google Cast, and AirPlay",
+                "CarPlay: fixed a crash when picking a channel, and fixed the app reaching for your home server's local address while you are away from home"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.6")
+        ),
+        WhatsNewRelease(
+            version: "1.8.4",
+            title: "What's new in 1.8.4",
+            bullets: [
+                "Dispatcharr: deeper catch-up history. The guide now pulls past programming straight from your server's EPG sources, so catch-up reaches as far back as your provider's guide data goes instead of the couple of days Dispatcharr retains",
+                "Multiview now works in portrait: tiles stack top to bottom, and rotating the phone re-flows them side by side. On Apple TV, a new Stacked layout gives you the same top/bottom split from the layout picker",
+                "SVG channel logos and artwork now display",
+                "Xtream Codes: subchannels like 6.1 and 6.2 now appear with their real numbers",
+                "Fixed movie and series artwork not loading on some setups",
+                "Faster channel tunes on Apple TV for Xtream Codes playlists",
+                "Ad-break fades and dark scenes no longer trigger periodic stream reloads",
+                "DVR: tap an in-progress recording to watch from the beginning, plus clearer program info"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.4")
+        ),
+        WhatsNewRelease(
+            version: "1.8.3",
+            title: "What's new in 1.8.3",
+            bullets: [
+                "Fixes the app holding two connections to your provider when Live Rewind is on (pausing live TV or a brief stream hiccup left a second stream running)",
+                "Fixes a memory build-up during long Live Rewind sessions on high-bitrate channels that could make the app restart"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.3")
+        ),
+        WhatsNewRelease(
+            version: "1.8.2",
+            title: "What's new in 1.8.2",
+            bullets: [
+                "Apple TV: the display now matches the stream's frame rate (50fps content switches your TV to 50Hz, ending the judder on European channels)",
+                "Honors your Apple TV's Match Content setting - if matching is off there, nothing changes",
+                "The display returns to its normal mode when you leave the player"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.2")
+        ),
+        WhatsNewRelease(
+            version: "1.8.1",
+            title: "What's new in 1.8.1",
+            bullets: [
+                "Apple TV guide overhaul: focus stays visible, opens at now, and never wanders into the past",
+                "Menu now also snaps the guide timeline back to now",
+                "Channels without guide data are selectable again",
+                "New Audio Sync control in the player audio menu",
+                "Catch-up: smarter program windows, and paused sessions stay alive"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.1")
+        ),
+        WhatsNewRelease(
+            version: "1.8.0",
+            title: "What's new in 1.8.0",
+            bullets: [
+                "Control your TV from your phone: open AstralTV on your iPhone and tap the TV button to run your Apple TV or Google TV as a remote",
+                "Browse the guide, change channels, pause and rewind, switch stream sources, and start a recording - all from your phone",
+                "New remote options: Sleep Timer, Audio Only (screen off, sound keeps playing), and full audio, subtitle, speed, and aspect controls",
+                "iPhone: send live video to AirPlay from the player",
+                "Long-press the Controlling pill to disconnect"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.8.0")
+        ),
+        WhatsNewRelease(
+            version: "1.7.12",
+            title: "What's new in 1.7.12",
+            bullets: [
+                "iPhone: view Live TV as a full program Guide, not just a list. Toggle from the top bar, and pick your default in Settings, App Behaviors",
+                "The Guide now adapts to your screen width, so it is ready for the larger and folding iPhones on the way",
+                "Fixed a rare crash while scrolling or searching very large channel lists",
+                "iPhone: removed a solid bar that could appear behind the tab bar underneath the Guide"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.12")
+        ),
+        WhatsNewRelease(
+            version: "1.7.11",
+            title: "What's new in 1.7.11",
+            bullets: [
+                "Live Rewind: pause and rewind live TV, with a Keep Available setting for how far back you can go",
+                "Catch-up TV: replay already-aired programs straight from the guide on supported servers, with a scrubbable timeline",
+                "Apple TV: one unified player for live, rewind, and catch-up - hold left/right to scrub with smooth acceleration",
+                "iPhone: swipe between channel groups with a fluid drag animation, and the list now fills the whole screen under the tab bar",
+                "Better playback errors: see what actually went wrong, auto-reconnect every 5 seconds, and a Retry control in the player",
+                "Fixed no-audio on some surround sound receivers and other audio reliability improvements"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.11")
+        ),
+        WhatsNewRelease(
+            version: "1.7.10",
+            title: "What's new in 1.7.10",
+            bullets: [
+                "Channel Collections: group channels into your own custom collections and filter Live TV to them with quick pills",
+                "More multiview layouts to choose from",
+                "Xtream Codes guide now pulls the full standard EPG: more program data, accurate dummy-EPG titles, and category colors",
+                "Apple TV: refreshed native-style player controls, plus smoother guide navigation and mini-player gestures",
+                "Recorded playback no longer restarts at commercial breaks"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.10")
+        ),
+        WhatsNewRelease(
+            version: "1.7.9",
+            title: "What's new in 1.7.9",
+            bullets: [
+                "Lower memory use on Apple TV during long sessions, for steadier playback",
+                "Saved DVR recordings download more reliably",
+                "Security and privacy hardening across credential handling and EPG parsing"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.9")
+        ),
+        WhatsNewRelease(
+            version: "1.7.8",
+            title: "What's new in 1.7.8",
+            bullets: [
+                "4K and UHD channels are far more stable: fixed a memory buildup that could garble audio or, during a long session, run the app out of memory on a demanding stream",
+                "No more stalls right after launch on a UHD channel: the first-run catalog and guide sync no longer competes with live video, so a 4K stream keeps playing while On Demand and the guide load in the background"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.8")
+        ),
+        WhatsNewRelease(
+            version: "1.7.7",
+            title: "What's new in 1.7.7",
+            bullets: [
+                "Switch Stream: on a Dispatcharr server connected with an admin Direct Connect account, pick which upstream a channel pulls from straight from the player's Options menu, handy when one source is buffering or down",
+                "New Stream Buffer setting adds a configurable live cushion that smooths stutter on bursty streams",
+                "Apple TV: the player controls now appear on the first Menu press, can be summoned with Select as well as Menu, match the rounded pill shape when focused, and hide on their own after you back out",
+                "Apple TV: fixed On Demand focus and navigation, including the cast row jumping to Play and the tab bar not restoring after leaving a title",
+                "Live TV: stopped a reload loop that could interrupt over-the-air channels at commercial breaks"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.7")
+        ),
+        WhatsNewRelease(
+            version: "1.7.6",
+            title: "What's new in 1.7.6",
+            bullets: [
+                "Automatic local/remote switching: AstralTV uses your server's local URL whenever it is reachable and your remote URL otherwise, with no Home WiFi setup and no location permission. Leave home mid-stream and playback re-tunes to the remote URL on its own",
+                "iPhone: a new player button rotates video into fullscreen landscape even when rotation lock is on, and returns to portrait when you exit",
+                "Add favorites right from the guide by tapping the star on a channel, now available on iPad as well",
+                "Live TV groups can be sorted Default, A-Z, or in your own manual order, and the channels inside follow the order you choose",
+                "Recordings now show full program details so episodes are easier to tell apart",
+                "Apple TV: fixed a crash when scrolling the Live TV guide, and fixed no audio when surround sound output is enabled in tvOS Settings"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.6")
+        ),
+        WhatsNewRelease(
+            version: "1.7.5",
+            title: "What's new in 1.7.5",
+            bullets: [
+                "Fixed a playback stutter on standard (SDR) channels, most noticeable around 30fps content, that crept in when HDR color correction was added. HDR channels still tone-map to correct colors",
+                "Live streams now recover on their own if the picture freezes after an audio glitch, instead of staying stuck on the last frame",
+                "Apple TV: fixed a multi-second freeze right after launch while the app finished syncing",
+                "Apple TV: debug logging (Settings, Developer) now saves to disk, and a Share Log File option lets you send the log to support over your local network"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.5")
+        ),
+        WhatsNewRelease(
+            version: "1.7.4",
+            title: "What's new in 1.7.4",
+            bullets: [
+                "Watch an in-progress recording from the beginning. Start a program that is still recording from the top instead of the live edge, and the rewindable window keeps growing as it records",
+                "New aspect-ratio control in the player. Switch between Fit (see the whole picture, letterboxed) and Fill (crop to fill the screen) from the player menu",
+                "Multiview: spotlight a tile to make it the big one. Pick any tile and it grows to a large panel with the rest stacked beside it, then tap again to return to the even grid",
+                "Multiview tiles now have a gap between them by default so each stream stands on its own. Turn it off in Settings, Multiview if you prefer the flush look",
+                "iPhone: a full-screen button in the player rotates to landscape for an edge-to-edge view",
+                "Option to hide channel logos for a cleaner, more compact channel list (Settings, Appearance)",
+                "The guide now refreshes itself when it has gone stale, and a Refresh Everything action was added to a playlist's settings for a full rebuild",
+                "Apple TV: guide focus now lands where you expect. Menu jumps to the top channel, and returning from a stream puts focus back on the channel you were watching",
+                "Fixed a launch crash that could hit servers with duplicate category or group IDs",
+                "Fixed local recordings that could be corrupted by out-of-order writes to disk",
+                "Fixed editing the same server twice in a row doing nothing on Apple TV",
+                "Fixed a brief freeze when leaving an in-progress recording, and play, pause, and scrub no longer freeze the UI if a stream stalls",
+                "Security and reliability hardening: credentials are scrubbed from logs, server-provided image URLs are validated, and saved credentials are written more safely"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.4")
+        ),
+        WhatsNewRelease(
+            version: "1.7.3",
+            title: "What's new in 1.7.3",
+            bullets: [
+                "Compressed XMLTV guides are now supported. AstralTV can load gzipped .xml.gz EPG feeds, including large Gracenote-style guides, by streaming and decompressing them on the fly so your guide fills in without the app running out of memory. Only the programs for channels you actually have are kept",
+                "Xtream Codes: add an optional custom XMLTV URL per server to color-tint your channels by category (Sports, News, Movies, Kids)",
+                "Continue Watching now advances to the next episode of a series. When you finish an episode, the next one shows up automatically, so you don't have to search for the show again to keep going",
+                "Smoother channel changes. Flipping channels now swaps the stream in place instead of tearing down and rebuilding the player, removing the brief frame-rate wobble after a flip",
+                "Apple TV: HDR channels (like UHD sports) no longer look green and washed out. They now display with correct colors, tone-mapped to SDR",
+                "Apple TV: returning to the Guide after watching now puts focus back on the channel you were watching, not the top of the list",
+                "M3U playlists: favorites now stick across a playlist refresh",
+                "Multiview staging from the Guide gained a Play button, and the Done button is now reachable on Apple TV",
+                "Fixed channels that share an EPG ID (tvg-id) so they all show their guide data, not just the first one",
+                "You can now enter a server address without typing https://",
+                "Apple TV: press and hold Select on a Continue Watching series for Open Series, jumping straight to all its seasons and episodes",
+                "Apple TV: the focused cell in the guide is now clearly outlined, so you can always tell where you are while scrolling, even on colored or live cells",
+                "Apple TV: fixed the top menu bar becoming unreachable after pressing Menu to leave On Demand, the DVR, or Settings"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.3")
+        ),
+        WhatsNewRelease(
+            version: "1.7.2",
+            title: "What's new in 1.7.2",
+            bullets: [
+                "Build a Multiview setup directly from the Guide. Long-press a channel and pick Add to Multiview. AstralTV switches to staging mode where every tap on a channel adds or removes a tile in the pile, with a count plus Done banner pinned at the top. Especially helpful on Apple TV where you can assemble four games or news streams before any of them starts playing",
+                "Apple TV: pressing Menu or Back during playback now lands focus on the + Add Stream pill, so a single Select adds another stream regardless of which tile you were on",
+                "Decimal channel numbers (ATSC over-the-air formats like 2.1 / 5.1) now display correctly on Dispatcharr and M3U playlists"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.2")
+        ),
+        WhatsNewRelease(
+            version: "1.7.1",
+            title: "What's new in 1.7.1",
+            bullets: [
+                "Fixed a race that could leave a second Dispatcharr Direct Connect server unable to authenticate when iCloud sync is enabled. Adding multiple Dispatcharr servers now reliably persists credentials across devices",
+                "Deleting a server now also removes its watch progress and server-side recording rows from this device. Local recordings are preserved"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.1")
+        ),
+        WhatsNewRelease(
+            version: "1.7.0",
+            title: "What's new in 1.7.0",
+            bullets: [
+                "Dispatcharr Direct Connect: sign in with your Dispatcharr admin username and password instead of pasting a 32-character API key. Especially helpful on Apple TV where typing a long API key on the Siri Remote keyboard is painful",
+                "Fixed occasional black-frame flashes during UHD HEVC HDR live playback",
+                "Smoother startup on UHD HEVC live channels (about 1-2 seconds longer to first frame, in exchange for stable playback)",
+                "Multiview: fixed the brief red 'Decoder unavailable' card that occasionally appeared when adding a tile",
+                "Multiview: fixed silent audio when switching audio focus to a freshly-added tile",
+                "Apple TV: fixed the channel info banner occasionally getting stuck visible after a stream starts"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.7.0")
+        ),
+        WhatsNewRelease(
+            version: "1.6.23",
+            title: "What's new in 1.6.23",
+            bullets: [
+                "Channel logos now load on Dispatcharr-API playlists. Auth headers are applied to logo URLs so they no longer fail silently with 401 errors",
+                "Live TV stops cleanly when you start a movie, TV episode, or recording. Previously a minimized Live TV channel could keep streaming in the background, occasionally causing brief black flickers in your On Demand playback",
+                "Servers added on a second device via iCloud sync now authenticate. Credentials ride along in the iCloud sync payload as a fallback for users who don't have iCloud Keychain enabled (common on Apple TV)",
+                "Skip on the Setting Up screen now actually dismisses it. Previously the cover could re-appear right after dismissal in some sync scenarios",
+                "Live TV channel rows on iPhone now have a visible button for favorites and program info, so you don't have to long-press to discover them",
+                "In-progress Dispatcharr recordings now show a Watch Live pill, making it obvious you can play a recording while it captures",
+                "iPad channel search no longer wipes your filter when you collapse the search bar. The button stays highlighted while the filter is active",
+                "Tightened security around server-provided URLs. Image URLs from your server are now validated before fetching, redirects no longer leak credentials across hosts, and playback URLs are sanitized in diagnostic logs",
+                "Added a privacy manifest for App Review compliance",
+                "Xtream EPG enrichment now backs off when the server is slow or rate-limited instead of hammering for minutes",
+                "Onboarding form now tells you exactly what's missing instead of just greying out the Test Connection button"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.23")
+        ),
+        WhatsNewRelease(
+            version: "1.6.22",
+            title: "What's new in 1.6.22",
+            bullets: [
+                "Series now show up on Dispatcharr servers that don't tag VOD items with a category. Movies already had this fallback; series now mirrors it",
+                "Stopped a refresh loop where the Movies and TV Shows tabs would keep retrying after a server returned zero items",
+                "Dispatcharr EPG now uses the official REST API exclusively. Channels with mismatched IDs populate correctly, and program categories are pulled per-program so channel cards stay tinted",
+                "Watch in-progress Dispatcharr recordings via the new HLS DVR pipeline. Tap the row or use Watch Live in the context menu",
+                "Faster VOD loading on large libraries. Bumped page size 4x to match the Dispatcharr server cap"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.22")
+        ),
+        WhatsNewRelease(
+            version: "1.6.21",
+            title: "What's new in 1.6.21",
+            bullets: [
+                "Plain-HTTP Dispatcharr servers (http:// URLs) now connect reliably",
+                "Initial sync no longer freezes Dispatcharr containers with large libraries",
+                "Live TV fills in first while the guide and On Demand load in the background",
+                "Movies and TV Shows cap at 5,000 items per type for very large libraries",
+                "API request timeout bumped from 20s to 60s for large EPG and VOD payloads",
+                "iCloud Keychain credentials now sync correctly across multiple devices",
+                "Apple TV: cleaner focus styling on the welcome, Add Playlist, and Configure screens",
+                "Apple TV: Connect a Server now matches the Sync via iCloud card style",
+                "Apple TV: typed text in Configure-screen text fields is now readable and centered when focused",
+                "Test Connection error messages updated for Dispatcharr 0.23.0's new User Settings layout",
+                "Cloudflare Tunnel errors are now detected and surfaced with a clear \"your origin is unreachable\" message"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.21")
+        ),
+        WhatsNewRelease(
+            version: "1.6.20",
+            title: "What's new in 1.6.20",
+            bullets: [
+                "Test Connection no longer fails with HTTP 401 on Dispatcharr deployments that need the legacy auth header. AstralTV now auto-detects which header shape your Dispatcharr instance accepts (X-API-Key alone, dual headers, or bearer token) and remembers the working shape for next time. Fixes the \"Dispatcharr rejected this request\" error that hit users on private LAN deployments even with valid Admin API keys",
+                "Auto-detection runs silently in the background on first launch after upgrade, so existing users don't have to re-tap Test Connection. AstralTV figures out the right header shape on its own and persists it",
+                "The discovered auth shape syncs across your devices via iCloud. Once one device figures out what your server wants, every other device on the same Apple ID inherits it without having to re-test",
+                "Dispatcharr server recordings now play back reliably. Auth headers are passed to the server's recording-playback endpoint so it stops returning HTTP 503 on builds that tightened the route from \"AllowAny\" to authenticated",
+                "Tap a completed recording on iPhone / iPad to play it. Long-press still brings up the full context menu (Play, Stop / Cancel, Delete, Download). Standard interaction now matches everywhere else in the app",
+                "Auth headers now survive HTTP redirects (301/302/307/308) so reverse-proxy setups that rewrite paths or upgrade HTTP→HTTPS no longer strip the API key mid-request",
+                "Dispatcharr URL handling is more robust around non-default ports and IPv6 hosts. Moved from naive string concatenation to URLComponents internally",
+                "Test Connection error messages rewritten to actually tell you what to try when something goes wrong. Distinguishes \"every shape rejected\" from \"got the SPA login page\" from \"couldn't reach the server at all\""
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.20")
+        ),
+        WhatsNewRelease(
+            version: "1.6.19",
+            title: "What's new in 1.6.19",
+            bullets: [
+                "Stream Info now shows the same client-side stats on every server type, what your device is actually decoding. The Dispatcharr server-side fetch added in v1.6.18 is gone; mpv-derived numbers are more useful for confirming your local playback is healthy",
+                "Stream Info card is back to the larger 6-row layout, VIDEO codec + size, FPS + pixel format, hwdec mode, AUDIO codec + sample rate + channel count, CACHE + bitrate, SYNC + dropped-frame count"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.19")
+        ),
+        WhatsNewRelease(
+            version: "1.6.18",
+            title: "What's new in 1.6.18",
+            bullets: [
+                "Swipe up or down to change channels on iPhone and iPad, tap the player to show the chrome, then swipe to flip through live channels (mirrors the Apple TV Siri Remote up/down channel-flip)",
+                "Stream Info now shows live server-side stats from your Dispatcharr server when available (Dispatcharr API playlists only), resolution, FPS, codec, output bitrate, and viewer count. Plain M3U / Xtream playlists still get the same five fields from the local player",
+                "Apple TV: returning to the guide after watching a channel now focuses on that channel's row, no more random scrolling to the top",
+                "iPhone portrait: Close / Options / Add buttons now hug the Dynamic Island instead of sitting too far below it, fixes a positioning regression introduced by the v1.6.17 multiview safe-area work",
+                "Channel info banner no longer covers the Stream Info card on iPhone, banner hides itself while Stream Info is open, then comes back when you close it",
+                "iPhone landscape: channel info banner now sits to the right of the Close button instead of below it (matching iPad), reclaiming the vertical room",
+                "Live channel audio no longer keeps playing underneath when you start a recording or open a movie / TV episode, the live stream now stops cleanly the moment the new playback begins",
+                "Live TV List view on iPhone no longer jitters up and down when you scroll to the spot where the group filter pills snap out of view"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.18")
+        ),
+        WhatsNewRelease(
+            version: "1.6.17",
+            title: "What's new in 1.6.17",
+            bullets: [
+                "Multiview no longer leaves video tiles black after switching apps with 9 streams active, every tile now resumes cleanly when you return",
+                "On Demand tab now reliably shows your movies and TV shows on a wider range of Dispatcharr server configurations, fixed both the per-playlist VOD-toggle relaunch bug AND a stricter-Dispatcharr-build category-filter bug that was leaving the tab empty (Dispatcharr API playlists only)",
+                "New Sync Categories sub-page in Settings → iCloud Sync lets you opt out of syncing specific data types, Playlists, Watch Progress, Reminders, App Preferences, or Credentials, with a per-category Delete option that scrubs only that data from iCloud",
+                "Reorder your Playlists in Settings: drag-to-reorder on iPhone/iPad (tap Edit), Move Up/Move Down via long-press on Apple TV. Order syncs across all your devices via iCloud",
+                "Multiview on iPhone now respects the notch and Dynamic Island, video tiles stay inside the safe area instead of sliding behind the cutout"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.17")
+        ),
+        WhatsNewRelease(
+            version: "1.6.16",
+            title: "What's new in 1.6.16",
+            bullets: [
+                "Apple TV: opening Options right after channel-flipping no longer freezes the UI",
+                "Stream Info overlay redesigned: bottom-left on Apple TV, clears the Dynamic Island on iPhone, with a close button on iPad/iPhone",
+                "Channel info banner now correctly clears the player's close button on iPad and iPhone, and stays hidden when the player is minimized",
+                "VOD series episodes now load reliably on the first open, no more back-out-and-reopen workaround (Dispatcharr API playlists only)",
+                "Episode rows now show artwork, duration, air date, and TMDB rating (Dispatcharr API playlists only)",
+                "Movies and series open instantly on second visit"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.16")
+        ),
+        WhatsNewRelease(
+            version: "1.6.15",
+            title: "What's new in 1.6.15",
+            bullets: [
+                "Apple TV: Up/Down on Siri Remote changes channels",
+                "New channel info banner shows logo, number, name, program, and airing time on every stream start",
+                "On Apple TV, press Menu/Back to lock the channel and reach Options, Record, and Add Stream"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.15")
+        ),
+        WhatsNewRelease(
+            version: "1.6.14",
+            title: "What's new in 1.6.14",
+            bullets: [
+                "Record Program pop-up updated for clarity",
+                "Text added to clarify comskip is only available via Dispatcharr API playlist and only when recording to Dispatcharr server",
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.14")
+        ),
+        WhatsNewRelease(
+            version: "1.6.13",
+            title: "What's new in 1.6.13",
+            bullets: [
+                "Added 'Skip Loading Screen' toggle in Settings > Appearance > App Behaviors",
+                "Added 'Resume Last Channel' toggle in Settings > Appearance > App Behaviors",
+                "Persistent search field has been changed to a button on iPad in Guide view to reduce wasted space",
+                "Pinch-to-zoom-out has been added to iPad. This shrinks the currently playing channel to a miniplayer",
+                "When present, the miniplayer no longer covers channel group names",
+                "Significantly reduced app launch time by better utilizing existing persistent cache"
+            ],
+            releaseURL: URL(string: "https://github.com/CRZX1337/AstralTV/releases/tag/v1.6.13")
+        )
+    ]
+
+    /// Bundle's `CFBundleShortVersionString`, falling back to "0" so
+    /// the comparison against `lastSeen` is well-defined even on a
+    /// hypothetically broken Info.plist.
+    static var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    /// Release-notes entry matching `currentVersion`, or `nil` when
+    /// the running build doesn't ship a What's New blurb (release
+    /// versions without a curated bullet list silently skip the
+    /// prompt).
+    static var currentRelease: WhatsNewRelease? {
+        releases.first { $0.version == currentVersion }
+    }
+
+    /// Whether the user has permanently opted out.
+    static var isPermanentlyDisabled: Bool {
+        UserDefaults.standard.bool(forKey: disabledKey)
+    }
+
+    /// True when launch should pop the What's New sheet:
+    /// 1. The user hasn't permanently disabled the prompt.
+    /// 2. We have a release-notes entry for the current version.
+    /// 3. The user hasn't already seen this version's prompt.
+    /// 4. **Either** there's a recorded `lastSeenVersion` (so we know
+    ///    this device has been running AstralTV before), **or** the
+    ///    caller has passed `isExistingUser: true`, meaning the
+    ///    user has servers / completed onboarding from a prior
+    ///    version, even though this is the first launch since we
+    ///    started tracking `lastSeenVersion` (which itself only
+    ///    came in with v1.6.12).
+    ///
+    /// The 4th gate is what distinguishes a genuine fresh install
+    /// (no servers, no onboarding, no recorded version → silently
+    /// initialise the marker, don't show notes for a release the
+    /// user never lived through) from a v1.6.11 → v1.6.12 upgrade
+    /// (no recorded marker because the marker didn't exist in
+    /// v1.6.11, but the user has servers → show the notes).
+    ///
+    /// `isExistingUser` should be `true` when the device has any
+    /// pre-existing app state that proves AstralTV ran here before
+    /// the simplest signal is "any servers configured **or**
+    /// onboarding flag is set."
+    static func shouldShow(isExistingUser: Bool) -> Bool {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: disabledKey) else { return false }
+        guard let release = currentRelease else { return false }
+        if let lastSeen = defaults.string(forKey: lastSeenKey) {
+            return lastSeen != release.version
+        }
+        // No recorded marker. Distinguish fresh install vs upgrade.
+        if isExistingUser {
+            // Upgraded from a pre-tracking version. Show the prompt
+            // caller will mark seen on dismiss.
+            return true
+        }
+        // Genuine fresh install. Set the marker silently so future
+        // updates surface notes against this baseline, and skip.
+        defaults.set(release.version, forKey: lastSeenKey)
+        return false
+    }
+
+    /// User dismissed via "Dismiss". Mark the **current** version as
+    /// seen so the prompt won't reappear until a *new* version with
+    /// curated notes ships. The next update's notes will still
+    /// surface, `Dismiss` is per-version, not permanent.
+    static func markSeen() {
+        guard let v = currentRelease?.version else { return }
+        UserDefaults.standard.set(v, forKey: lastSeenKey)
+    }
+
+    /// User opted out via "Never show again". This is the **permanent
+    /// opt-out** for *all* future updates on this device, the
+    /// `disabledKey` flag becomes the first guard in `shouldShow`,
+    /// so subsequent releases skip the sheet regardless of what
+    /// version we're on. The user can only re-enable by uninstalling
+    /// or by clearing the `whatsNew.permanentlyDisabled` UserDefault.
+    ///
+    /// We also stamp `lastSeenKey` with the current version so that
+    /// if a future build ever exposes a "re-enable" toggle, the user
+    /// won't be presented with notes for the version they already
+    /// chose to ignore.
+    static func disable() {
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: disabledKey)
+        if let v = currentRelease?.version {
+            defaults.set(v, forKey: lastSeenKey)
+        }
+    }
+}
+
+// MARK: - Sheet view
+//
+// Compact modal presented over `MainTabView` on the first launch
+// after an update. Two action paths:
+// - Got it          → calls `WhatsNewStore.markSeen()` and dismisses.
+//                     Re-appears next time a newer version lands.
+// - Don't show again → calls `WhatsNewStore.disable()` and dismisses.
+//                     Permanent opt-out for this device.
+//
+// On iOS the GitHub release link is a real `Link` (opens Safari).
+// On tvOS there's no system browser, so we hide the link entirely
+// rather than rendering a dead button, users on Apple TV can't act
+// on a URL anyway, and showing one as plain text invites confusion.
+//
+// The view is intentionally small, no scroll, no images, no
+// per-bullet emojis. The "additional splash screen" framing in the
+// product spec means it should feel lighter than a settings page,
+// closer to a system-level "Welcome to <new version>" alert.
+
+struct WhatsNewSheet: View {
+    let release: WhatsNewRelease
+    let onPermanentlyDisable: () -> Void
+
+    /// Driven by the parent's `.sheet(isPresented:)`. Flipping it to
+    /// false from inside the "Never show again" button closes the modal
+    /// in one tap after the opt-out callback fires. Every other way out
+    /// (swipe down on iOS, Menu/Back on tvOS) is handled by
+    /// `WhatsNewSheetModifier`, which marks the version seen.
+    @Binding var isPresented: Bool
+
+
+    var body: some View {
+        phoneBody
+    }
+
+    // MARK: Subviews
+
+    /// iPhone/iPad: a standard system sheet. `NavigationStack` + large
+    /// title + inset-grouped `List` gives the native look and makes the
+    /// content scroll for free once the bullets overflow the detent
+    /// (the current release ships six multi-line bullets, which already
+    /// overflow `.medium` on iPhone). No toolbar button: the sheet is
+    /// dismissed with a swipe down (Logan 2026-09-12), so the drag
+    /// indicator is the only affordance.
+    private var phoneBody: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(Array(release.bullets.enumerated()), id: \.offset) { _, bullet in
+                        bulletRow(bullet)
+                    }
+                } header: {
+                    Text(release.title)
+                } footer: {
+                    Text("AstralTV \(release.version)")
+                }
+
+                if let url = release.releaseURL {
+                    Section {
+                        Link(destination: url) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.up.forward.app")
+                                Text("Read full release notes")
+                            }
+                            .scaledFont(.subheadline.weight(.medium))
+                        }
+                    }
+                }
+
+                // Last row of the list: the ONLY control on the sheet
+                // (Logan 2026-09-12). There is no Dismiss/Done button;
+                // swiping the sheet down closes it and marks the version
+                // seen, wired in `WhatsNewSheetModifier`.
+                Section {
+                    // Permanent opt-out for all future updates.
+                    // Sets `whatsNew.permanentlyDisabled` so `shouldShow`'s
+                    // first guard short-circuits forever on this device.
+                    Button {
+                        onPermanentlyDisable()
+                        isPresented = false
+                    } label: {
+                        Text("Never show again for any future updates.")
+                            .scaledFont(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 36)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.clear)
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("What's New")
+            .navigationBarTitleDisplayMode(.large)
+        }
+        .preferredColorScheme(ThemeManager.shared.resolvedColorScheme)
+    }
+
+    /// One bullet as a native list row. Bullets stay short by policy
+    /// (see the data comment at the top of this file) but wrap cleanly
+    /// when they do not.
+    private func bulletRow(_ bullet: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(Color.accentPrimary)
+                .scaledFont(bulletIconFont)
+            Text(bullet)
+                .scaledFont(bulletTextFont)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 2)
+    }
+
+
+    // MARK: Platform sizing
+
+    private var bulletIconFont: AstralFont { .body }
+    private var bulletTextFont: AstralFont { .body }
+}
+
+// MARK: - Modifier
+//
+// Convenience `.whatsNewSheet()` wrapper that the root view applies
+// once. Encapsulates the `currentRelease` lookup + `shouldShow()`
+// gating + dismiss-callback wiring so the call site is a single
+// modifier and not a 25-line `.sheet { ... }` block sitting in the
+// middle of `RootView`.
+
+extension View {
+    /// Attach the What's New sheet. Reads `WhatsNewStore.shouldShow()`
+    /// once on the binding's initial flip from false → true; the
+    /// caller is responsible for setting that binding from its own
+    /// `.onAppear` (gives the splash + onboarding flow priority).
+    func whatsNewSheet(isPresented: Binding<Bool>) -> some View {
+        modifier(WhatsNewSheetModifier(isPresented: isPresented))
+    }
+}
+
+private struct WhatsNewSheetModifier: ViewModifier {
+    @Binding var isPresented: Bool
+
+    func body(content: Content) -> some View {
+        // Resolve the current release once. If there isn't one
+        // (e.g. dev build before we curated this version's bullets),
+        // the modifier becomes a no-op even if `isPresented` flips.
+        let release = WhatsNewStore.currentRelease
+
+        // `onDismiss:` is what makes the swipe-down gesture an
+        // acknowledge: with no Dismiss button on the sheet, the drag is
+        // the normal way out, so it must stamp the current version as
+        // seen exactly like tapping Dismiss used to.
+        return content.sheet(isPresented: $isPresented, onDismiss: { WhatsNewStore.markSeen() }) {
+            if let release {
+                WhatsNewSheet(
+                    release: release,
+                    onPermanentlyDisable: { WhatsNewStore.disable() },
+                    isPresented: $isPresented
+                )
+                // `.large` always; `.medium` is offered only when the
+                // release is short enough to read without scrolling at
+                // half height. The current release's six bullets
+                // overflow `.medium` on iPhone, so it resolves to
+                // `.large` alone there.
+                .presentationDetents(
+                    release.bullets.count <= 4 ? [.medium, .large] : [.large]
+                )
+                .presentationDragIndicator(.visible)
+            }
+        }
+    }
+}

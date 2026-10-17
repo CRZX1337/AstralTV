@@ -1,0 +1,302 @@
+//
+//  MoviesTVSettingsView.swift
+//  Astral
+//
+//  Settings redesign Phase 1 (regroup, 2026-09-17). The on-demand page:
+//  how often the library re-sweeps, the TMDB poster fallback, and the
+//  poster-grid scale. All three rows moved here from App Behaviors and
+//  Appearance with their copy and their persisted keys unchanged.
+//
+
+import SwiftUI
+
+struct MoviesTVSettingsView: View {
+    @ObservedObject private var theme = ThemeManager.shared
+
+    /// How often a launch re-sweeps the Movies and TV Shows libraries.
+    @AppStorage(VODStore.refreshHoursKey)
+    private var vodRefreshHours = 24
+    private static let vodRefreshChoices: [(hours: Int, title: String)] = [
+        (0, "Every Launch"), (24, "Daily"), (168, "Weekly")
+    ]
+    /// Shared explanation for the refresh choices, on both platforms.
+    private static let vodRefreshFootnote = "Live TV channels refresh on every launch. Movies and TV Shows open from the saved library and re-sweep the provider on this schedule. Pull down on either tab to refresh right away."
+    /// Phase 3: one option list for both platforms. The subtitles used
+    /// to be tvOS-only; folding them into the shared choices means the
+    /// iOS choice page finally explains what each interval does too.
+    private static var vodRefreshOptions: [SettingsChoice<Int>] {
+        vodRefreshChoices.map { choice in
+            SettingsChoice(
+                choice.hours,
+                choice.title,
+                subtitle: choice.hours == 0
+                    ? "Re-sweep the provider library on every launch"
+                    : "Open from the saved library; re-sweep the provider \(choice.hours == 24 ? "once a day" : "once a week")",
+                icon: choice.hours == 0 ? "arrow.clockwise" : "calendar"
+            )
+        }
+    }
+
+    /// Master toggle for the TMDB-by-title poster fallback.
+    @AppStorage(TMDBPosters.enabledDefaultsKey)
+    private var tmdbPostersEnabled = false
+    /// Editable draft of the API key; loaded from / saved to the
+    /// Keychain (never persisted in @AppStorage).
+    @State private var tmdbKeyDraft = ""
+    @State private var tmdbTestState: TMDBKeyTestState = .idle
+
+    enum TMDBKeyTestState: Equatable { case idle, testing, valid, invalid, saved }
+
+    /// VOD (Movies / TV Shows) poster-grid scale multiplier. Storage key
+    /// retained as `"uiScale"`.
+    @AppStorage("uiScale") private var vodScale: Double = 1.0
+
+    var body: some View {
+        ZStack {
+            Color.appBackground.ignoresSafeArea()
+            iOSBody
+        }
+        .navigationTitle("Movies & TV Shows")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color.appBackground, for: .navigationBar)
+        .onAppear {
+            tmdbKeyDraft = TMDBPosters.loadAPIKey()
+            // Logan 2026-09-18: the range is 85-125% on every platform now.
+            // Anyone who saved 150% or 175% under the old range would get a
+            // slider value outside its bounds, so fold it back on entry.
+            let bounded = min(max(vodScale, 0.85), 1.5)
+            if bounded != vodScale { vodScale = bounded }
+        }
+    }
+
+    // MARK: - TMDB key actions
+
+    @MainActor
+    private func testTMDBKey() async {
+        let key = tmdbKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { tmdbTestState = .invalid; return }
+        tmdbTestState = .testing
+        let ok = await TMDBService.validateKey(key)
+        tmdbTestState = ok ? .valid : .invalid
+    }
+
+    private func saveTMDBKey() {
+        TMDBPosters.saveAPIKey(tmdbKeyDraft)
+        TMDBService.clearCache()
+        tmdbTestState = .saved
+    }
+
+    @ViewBuilder
+    private var tmdbStatusView: some View {
+        switch tmdbTestState {
+        case .idle, .testing:
+            EmptyView()
+        case .valid:
+            Label("Valid key", systemImage: "checkmark.circle.fill")
+                .scaledFont(.labelSmall).foregroundColor(.green)
+        case .invalid:
+            Label("Invalid key", systemImage: "xmark.circle.fill")
+                .scaledFont(.labelSmall).foregroundColor(.red)
+        case .saved:
+            Label("Saved", systemImage: "checkmark.circle.fill")
+                .scaledFont(.labelSmall).foregroundColor(.green)
+        }
+    }
+
+    // MARK: - iOS Body
+
+    private var iOSBody: some View {
+        List {
+            // MARK: Refresh Library
+            Section {
+                // Phase 3: the inline check list became one row that
+                // pushes the choice page; its footer moved onto the
+                // picker, so the Section footer would only repeat it.
+                SettingsChoicePicker("Refresh Library",
+                                     options: Self.vodRefreshOptions,
+                                     selection: $vodRefreshHours,
+                                     footer: Self.vodRefreshFootnote,
+                                     icon: "arrow.clockwise")
+                    .listRowBackground(Color.cardBackground)
+            }
+            // Phase 3: no Section header. The picker row already says
+            // "Refresh Library".
+            .listSectionSeparator(.hidden)
+
+            // MARK: Posters
+            Section {
+                Toggle(isOn: $tmdbPostersEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Use TMDB for Movies and TV Shows")
+                            .scaledFont(.bodyMedium)
+                            .foregroundColor(.textPrimary)
+                        Text("Posters, backdrops, descriptions, cast and crew, episode details, and recommendations from The Movie Database, plus program artwork your provider does not supply.")
+                            .scaledFont(.labelSmall.subtext())
+                            .foregroundColor(Color.contrastText(.textTertiary))
+                    }
+                }
+                .tint(theme.accent)
+                .listRowBackground(Color.cardBackground)
+
+                if tmdbPostersEnabled {
+                    // Phase 3: one shared field for both platforms. It
+                    // owns the reveal eye, so the ad-hoc eye button and
+                    // its visibility state are gone.
+                    SettingsTextField("TMDB API Key",
+                                      placeholder: "API Key or Read Access Token",
+                                      text: $tmdbKeyDraft,
+                                      isSecure: true)
+                        .onChange(of: tmdbKeyDraft) { _, _ in tmdbTestState = .idle }
+                        .listRowBackground(Color.cardBackground)
+
+                    HStack(spacing: 12) {
+                        Button {
+                            Task { await testTMDBKey() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if tmdbTestState == .testing {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Text("Test")
+                            }
+                        }
+                        .buttonStyle(SettingsGhostButtonStyle(accent: theme.accent))
+                        .disabled(tmdbKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty
+                                  || tmdbTestState == .testing)
+
+                        tmdbStatusView
+
+                        Spacer()
+
+                        Button("Save") { saveTMDBKey() }
+                            .buttonStyle(SettingsPrimaryButtonStyle(accent: theme.accent))
+                            .disabled(tmdbTestState == .testing)
+                    }
+                    .listRowBackground(Color.cardBackground)
+                }
+            } header: {
+                Text("The Movie Database").sectionHeaderStyle()
+            } footer: {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("If iCloud Sync is enabled, your key is saved to your iCloud Keychain and syncs to your other devices. Get a free key at themoviedb.org under Settings, then API; paste either the API Key or the Read Access Token. With a key, artwork and details for Movies and TV Shows come from TMDB first and your provider fills any gaps.")
+                        .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+                    TMDBAttributionView(style: .short)
+                }
+            }
+            .listSectionSeparator(.hidden)
+
+            // MARK: Display Scale
+            // Every idiom (Android parity, Logan 2026-09-27): the Movies and
+            // TV Shows pages multiply their text by `uiScale` everywhere
+            // (VODDisplayScale), and iPad / Mac also stretch the grid.
+            Section {
+                scaleSliderRow_iOS(title: "Movies & TV Shows", binding: $vodScale)
+            } header: {
+                Text("Display Scale").sectionHeaderStyle()
+            } footer: {
+                Text("Independent scale for Movies & Series. 100% matches the default; 85-150% lets you trade density for readability. Changes apply live, no restart needed.")
+                    .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+            }
+            .listSectionSeparator(.hidden)
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        // Phase 3 (Logan 2026-09-18): floating tab bar parity -
+        // content runs under the bar, the bar tucks away on scroll,
+        // and the last row clears it.
+        .settingsPhoneTabBarChrome()
+    }
+
+    private func scaleSliderRow_iOS(title: String, binding: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(title)
+                    .scaledFont(.bodyMedium)
+                    .foregroundColor(.textPrimary)
+                Spacer()
+                Text("\(Int((binding.wrappedValue * 100).rounded()))%")
+                    .scaledFont(.labelSmall.subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+            }
+            HStack(spacing: 12) {
+                Image(systemName: "textformat.size.smaller")
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                    .scaledFont(.system(size: 12))
+                Slider(value: binding, in: 0.85...1.5, step: 0.05)
+                    .tint(theme.accent)
+                Image(systemName: "textformat.size.larger")
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                    .scaledFont(.system(size: 14))
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.cardBackground)
+    }
+
+    // MARK: - tvOS Body
+
+}
+
+/// Shared geometry for the two Settings action-button styles below, so a
+/// primary and a ghost button sitting side by side are the same height
+/// and the same corner radius.
+private enum SettingsActionButtonMetrics {
+    static let horizontalPadding: CGFloat = 18
+    static let verticalPadding: CGFloat = 8
+    static let minHeight: CGFloat = 34
+    static let cornerRadius: CGFloat = 10
+}
+
+/// Filled primary action (Save). Phase 3 (Logan 2026-09-18): the system
+/// `.borderedProminent` capsule resolved to a pale near-white glass pill
+/// inside a Settings card, so the primary action draws its own accent
+/// fill instead.
+struct SettingsPrimaryButtonStyle: ButtonStyle {
+    let accent: Color
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaledFont(.bodyMedium.weight(.semibold))
+            .foregroundColor(.appBackground)
+            .padding(.horizontal, SettingsActionButtonMetrics.horizontalPadding)
+            .padding(.vertical, SettingsActionButtonMetrics.verticalPadding)
+            .frame(minHeight: SettingsActionButtonMetrics.minHeight)
+            .background(
+                RoundedRectangle(cornerRadius: SettingsActionButtonMetrics.cornerRadius,
+                                 style: .continuous)
+                    .fill(accent)
+            )
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.4)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+/// Secondary / ghost action (Test): accent label on a hairline accent
+/// outline, same height and radius as the primary button.
+struct SettingsGhostButtonStyle: ButtonStyle {
+    let accent: Color
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaledFont(.bodyMedium.weight(.medium))
+            .foregroundColor(Color.contrastText(accent))
+            .tint(accent)
+            .padding(.horizontal, SettingsActionButtonMetrics.horizontalPadding)
+            .padding(.vertical, SettingsActionButtonMetrics.verticalPadding)
+            .frame(minHeight: SettingsActionButtonMetrics.minHeight)
+            .background(
+                RoundedRectangle(cornerRadius: SettingsActionButtonMetrics.cornerRadius,
+                                 style: .continuous)
+                    .fill(accent.opacity(0.10))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: SettingsActionButtonMetrics.cornerRadius,
+                                 style: .continuous)
+                    .strokeBorder(accent.opacity(0.55), lineWidth: 1)
+            )
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.4)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}

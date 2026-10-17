@@ -1,0 +1,824 @@
+//
+//  EditServerSheet.swift
+//  Astral
+//
+//  Extracted verbatim from SettingsView.swift (Settings redesign Phase 1,
+//  SettingsUIRedesign.md A4). No behavior change intended in this move.
+//
+
+import SwiftUI
+import SwiftData
+
+struct EditServerSheet: View {
+    @Bindable var server: ServerConnection
+    @Environment(\.dismiss) private var dismiss
+    /// See SettingsView for rationale.
+    @ObservedObject private var theme = ThemeManager.shared
+
+    // XMLTV validation state for the Dispatcharr EPG Source row. Mirrors
+    // AddServerView's XMLTVTestState so the edit flow can also validate
+    // before save.
+    @State private var xmltvTestState: XMLTVEditTestState = .idle
+
+    enum XMLTVEditTestState: Equatable {
+        case idle
+        case testing
+        case success(Int)
+        case failure(String)
+    }
+
+    // v1.7.x: Direct Connect "Refresh Session" button state.
+    @State private var isRefreshingSession: Bool = false
+    @State private var sessionRefreshMessage: String? = nil
+    @State private var sessionRefreshSucceeded: Bool = false
+
+    /// v1.7.x (Round 1 review): credential mode is staged in
+    /// SwiftUI state instead of writing through to SwiftData
+    /// immediately. Pre-fix the picker used a Binding that wrote
+    /// `server.dispatcharrCredentialTypeRaw` directly, so flipping
+    /// the picker and then tapping Cancel still persisted the new
+    /// mode, leaving servers in a half-configured state if the
+    /// user explored the picker without intending to commit.
+    /// `nil` means "user hasn't touched the picker"; non-nil means
+    /// "staged change pending Save". Persisted in `commitEdits()`.
+    @State private var pendingCredentialType: DispatcharrCredentialType? = nil
+
+    /// Oki's debug log (2026-08-16 12:51:54): the URL TextField bound
+    /// `$server.baseURL` directly, so EVERY keystroke persisted to
+    /// SwiftData, changed `channelServerKey`, and restarted MainTabView's
+    /// `.task(id: orchestratorKey)` - a full channels + EPG + recordings +
+    /// VOD reload against each half-typed host (`:919`, `:91`, `:9`, `:5`,
+    /// `:56`, `:565` as he retyped a port), each hanging to an 8s timeout.
+    /// Same staging pattern as `pendingCredentialType` above: the edit
+    /// lives in @State until Save, so intermediate keystrokes never reach
+    /// the model or its observers, and Cancel discards for free.
+    @State private var pendingBaseURL: String? = nil
+
+    /// Which account this playlist was connected as when the sheet opened.
+    /// Save diffs against it so a credential swap triggers a full
+    /// re-authentication while a rename or an EPG-URL edit costs nothing.
+    /// See `ServerCredentialChange` for what a swap has to invalidate.
+    @State private var originalCredentials: DispatcharrCredentialSnapshot? = nil
+    /// Local URL when the edit surface opened. The field binds straight to
+    /// the row, so Save needs this to tell a host change apart.
+    @State private var originalLocalURL: String? = nil
+
+    /// Save is no longer fire-and-forget. A credential change is verified
+    /// against the server BEFORE anything is persisted or dropped; the
+    /// sheet shows "Saving…", stays open with the typed values when the
+    /// server rejects them, and dismisses only once the save went through.
+    @State private var isSaving = false
+    @State private var saveErrorMessage: String? = nil
+
+    /// Stage source for the "Saving Changes" cover: the same staged screen
+    /// the Add Playlist flow shows, so a save is never a bare label over an
+    /// editable form. See `PlaylistSaveRunner`.
+    @StateObject private var saveProgress = PlaylistSaveProgress()
+
+    /// Anchor for scrolling the "Save Failed" section back into view after a
+    /// rejected save: the cover was covering the form, so the message has to
+    /// come to the user rather than wait to be found.
+    private enum FormAnchor: Hashable { case saveError }
+    @State private var formScrollAnchor: FormAnchor? = nil
+
+    /// Binds the URL TextField. Reads through to the model until the user
+    /// types; writes stage into `pendingBaseURL` only.
+    private var baseURLBinding: Binding<String> {
+        Binding(
+            get: { pendingBaseURL ?? server.baseURL },
+            set: { pendingBaseURL = $0 }
+        )
+    }
+
+    /// Apply the staged URL to the model. Called from Save, before the
+    /// credential commit, so `saveCredentialsSynced` sees the final URL.
+    private func commitBaseURLIfStaged() {
+        guard let pending = pendingBaseURL else { return }
+        server.baseURL = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingBaseURL = nil
+    }
+
+    /// v1.7.x: read view of the credential mode that respects any
+    /// staged change. Body switches on this so revealing the
+    /// alternate fields is immediate while the model write is
+    /// deferred to Save.
+    private var effectiveCredentialType: DispatcharrCredentialType {
+        pendingCredentialType ?? server.dispatcharrCredentialType
+    }
+
+    /// v1.7.x: binds the credential-mode segmented picker. Stages
+    /// the pick into `pendingCredentialType`; the actual SwiftData
+    /// write happens in `commitEdits()` if the user taps Save.
+    /// Tapping Cancel discards the staged value because it's
+    /// SwiftUI @State, not bound to the model.
+    private var directConnectModeBinding: Binding<DispatcharrCredentialType> {
+        Binding(
+            get: { effectiveCredentialType },
+            set: { newValue in
+                pendingCredentialType = newValue
+                // Clear the refresh-session message when the user
+                // pivots so a stale "Refreshed at 12:34" pill
+                // doesn't linger on the wrong mode.
+                sessionRefreshMessage = nil
+            }
+        )
+    }
+
+    /// v1.7.x: apply staged credential-mode change to the model.
+    /// Called from the Save action of the edit sheet. Keeps the
+    /// SwiftData write in one place so the no-op default (`""`
+    /// raw) is preserved when the user picks `.apiKey` (forward-
+    /// compat with older AstralTV builds receiving this server via
+    /// iCloud sync, they ignore unknown KVS keys).
+    private func commitCredentialModeIfStaged() {
+        guard let pending = pendingCredentialType else { return }
+        server.dispatcharrCredentialTypeRaw = (pending == .apiKey) ? "" : pending.rawValue
+        pendingCredentialType = nil
+    }
+
+    /// Save Playlist.
+    ///
+    /// Bug (Android parity audit, 2026-09-18): Save used to persist and
+    /// dismiss in the same tap while the re-login ran detached, so wrong
+    /// credentials closed the sheet, wiped the cached identity and left
+    /// the playlist visibly broken with the failure only in the debug log.
+    /// Now a credential change is VERIFIED first: nothing is persisted or
+    /// dropped until the server accepts the typed values, the sheet shows
+    /// "Saving…" meanwhile, a rejection keeps the sheet open with what was
+    /// typed, and dismiss happens only on success.
+    @MainActor
+    private func saveEdits() async {
+        guard !isSaving else { return }
+        saveErrorMessage = nil
+        // Raises the "Saving Changes" cover over the form: nothing can be
+        // edited, and no gesture dismisses it, until the save resolves.
+        // Cleared explicitly (not in a `defer`) so the cover is gone BEFORE
+        // the sheet itself dismisses on success.
+        isSaving = true
+
+        let typedBaseURL = (pendingBaseURL ?? server.baseURL)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let mode = effectiveCredentialType
+        let message = await PlaylistSaveRunner.run(
+            server: server,
+            typedBaseURL: typedBaseURL,
+            credentialType: mode,
+            originalCredentials: originalCredentials,
+            originalLocalURL: originalLocalURL,
+            progress: saveProgress,
+            commitStaged: {
+                commitBaseURLIfStaged()
+                commitCredentialModeIfStaged()
+            }
+        )
+        isSaving = false
+        if let message {
+            // Back to the form with everything typed still in place, and the
+            // "Save Failed" section brought into view at the top.
+            saveErrorMessage = message
+            formScrollAnchor = .saveError
+            return
+        }
+        originalCredentials = DispatcharrCredentialSnapshot.capture(from: server)
+        originalLocalURL = server.localURL
+        dismiss()
+    }
+
+    /// v1.7.x: render the cached api_key as `i_•••••cudvh13H1A`
+    /// (first 2 chars + dots + last 8). Long enough to identify if
+    /// it matches the one shown in Dispatcharr's admin UI; redacted
+    /// enough that a screenshot doesn't leak it. Mirrors how
+    /// 1Password and similar apps surface secrets.
+    private func maskedAPIKey(_ key: String) -> String {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 12 else { return String(repeating: "•", count: trimmed.count) }
+        let prefix = trimmed.prefix(2)
+        let suffix = trimmed.suffix(8)
+        return "\(prefix)\(String(repeating: "•", count: 6))\(suffix)"
+    }
+
+    /// v1.7.x: force-refresh a Direct Connect server's JWT pair.
+    /// Performs a fresh login against /api/accounts/token/, then
+    /// re-fetches /api/accounts/users/me/ to update the cached
+    /// api_key (covers the admin-rotated-the-key case where Astral's
+    /// Keychain copy is stale and downstream long-lived consumers
+    /// like mpv stream playback would 401).
+    @MainActor
+    private func refreshDirectConnectSession() async {
+        let username = server.username
+        // Use what the user just TYPED, not the Keychain copy:
+        // `effectivePassword` is Keychain-first, so validating with it
+        // would test the OLD password on a sheet where the user is
+        // replacing it -- reporting success for credentials that are on
+        // their way out, or failure for correct new ones.
+        let password = server.password.isEmpty ? server.effectivePassword : server.password
+        // Staged-URL aware: if the user retyped the URL and taps Refresh
+        // Session before Save, log in against the visible value.
+        let baseURL  = pendingBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? server.effectiveBaseURL
+        let userAgent = server.effectiveUserAgent
+        let serverID = server.id
+        guard !username.isEmpty, !password.isEmpty else {
+            sessionRefreshMessage = "Username and password required."
+            sessionRefreshSucceeded = false
+            return
+        }
+
+        isRefreshingSession = true
+        sessionRefreshMessage = nil
+        defer { isRefreshingSession = false }
+
+        do {
+            let pair = try await DispatcharrAPI.login(
+                baseURL: baseURL,
+                username: username,
+                password: password,
+                userAgent: userAgent
+            )
+            DispatcharrTokenStore.shared.store(
+                serverID: serverID,
+                access: pair.access,
+                refresh: pair.refresh
+            )
+
+            // Re-fetch the user record so we pick up any rotated
+            // api_key. Update the SwiftData record + Keychain so
+            // every downstream consumer sees the fresh value.
+            // v1.7.x (Round 1 review): differentiate the success
+            // message based on whether the api_key actually
+            // changed. Pre-fix the message was the same regardless,
+            // which made the button feel like a no-op even when it
+            // actively rescued a stale-Keychain situation.
+            let bearerAPI = DispatcharrAPI(baseURL: baseURL, auth: .bearer(pair.access))
+            var apiKeyRotated = false
+            if let user = try? await bearerAPI.fetchCurrentUser(),
+               !user.apiKey.isEmpty,
+               user.apiKey != server.effectiveApiKey {
+                server.apiKey = user.apiKey
+                SyncManager.shared.saveCredentialsSynced(for: server)
+                apiKeyRotated = true
+            }
+
+            sessionRefreshSucceeded = true
+            sessionRefreshMessage = apiKeyRotated
+                ? "Session refreshed. Cached API key updated."
+                : "Session refreshed. API key unchanged."
+        } catch {
+            sessionRefreshSucceeded = false
+            sessionRefreshMessage = DispatcharrDirectConnectError.userMessage(
+                for: error, step: "sign-in")
+        }
+    }
+
+    var body: some View {
+        // Guard against the server being deleted mid-edit by an iCloud sync merge
+        // (SwiftData detached-model crash; same root cause as ServerDetailView).
+        // Pop instead of reading @Persisted props off a detached model.
+        Group {
+            if server.modelContext == nil {
+                Color.appBackground.ignoresSafeArea()
+            } else {
+                editContent
+            }
+        }
+        .onChange(of: server.modelContext == nil) { _, deleted in
+            if deleted { dismiss() }
+        }
+        .onAppear {
+            guard server.modelContext != nil, originalCredentials == nil else { return }
+            originalCredentials = DispatcharrCredentialSnapshot.capture(from: server)
+            originalLocalURL = server.localURL
+        }
+    }
+
+    private var editContent: some View {
+        NavigationStack {
+            ZStack {
+                Color.appBackground.ignoresSafeArea()
+                iOSEditForm
+            }
+            .navigationTitle("Edit Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color.appBackground, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundColor(.accentPrimary)
+                        .disabled(isSaving)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    // The inline "Saving…" label is gone: the staged
+                    // "Saving Changes" cover below reports progress now.
+                    Button("Save") { Task { await saveEdits() } }
+                        .foregroundColor(.accentPrimary)
+                        .fontWeight(.semibold)
+                        .disabled(isSaving ||
+                                  server.name.trimmingCharacters(in: .whitespaces).isEmpty ||
+                                  (pendingBaseURL ?? server.baseURL)
+                                      .trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+        // The same staged screen the Add Playlist flow shows, titled "Saving
+        // Changes". Covers the form so nothing can be edited mid-save, and
+        // carries no dismissal affordance.
+        .fullScreenCover(isPresented: $isSaving) {
+            ServerSyncView(mode: .saving(stages: saveProgress.stages),
+                           title: "Saving Changes")
+        }
+    }
+
+    // MARK: - iOS Form
+    private var iOSEditForm: some View {
+        ScrollViewReader { proxy in
+            iOSEditFormBody
+                .onChange(of: formScrollAnchor) { _, anchor in
+                    guard let anchor else { return }
+                    withAnimation { proxy.scrollTo(anchor, anchor: .top) }
+                    formScrollAnchor = nil
+                }
+        }
+    }
+
+    private var iOSEditFormBody: some View {
+        Form {
+            // Save Failed: the server rejected the new credentials (or the
+            // verification fetch failed). Standard Settings section chrome
+            // so it reads as part of the form, not as an alert.
+            if let saveErrorMessage {
+                Section {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundColor(.statusLive)
+                        Text(saveErrorMessage)
+                            .scaledFont(.bodySmall)
+                            .foregroundColor(.statusLive)
+                    }
+                    .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("Save Failed").sectionHeaderStyle()
+                } footer: {
+                    Text("Your entries are still here. Fix them and tap Save again.")
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+                .id(FormAnchor.saveError)
+            }
+
+            Section {
+                // Phase 3 item 2: one field style across Settings. The bare
+                // Form TextField/SecureField rows are now SettingsTextField,
+                // which carries the label, helper line, focus outline and
+                // (for secure fields) the reveal eye. The per-field modifiers
+                // move into the initializer; the row backgrounds stay.
+                SettingsTextField("Name", text: $server.name)
+                    .listRowBackground(Color.cardBackground)
+                SettingsTextField("URL", text: baseURLBinding,
+                                  keyboardType: .URL)
+                    .listRowBackground(Color.cardBackground)
+            } header: {
+                Text("Connection").sectionHeaderStyle()
+            }
+
+            if server.type == .xtreamCodes {
+                Section {
+                    SettingsTextField("Username", text: $server.username)
+                        .listRowBackground(Color.cardBackground)
+                    SettingsTextField("Password", text: $server.password,
+                                      isSecure: true)
+                        .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("Credentials").sectionHeaderStyle()
+                }
+                Section {
+                    // Phase 3 item 2: this footer described only the XMLTV
+                    // field, so it is the field's helper now (same string on
+                    // tvOS and Android).
+                    SettingsTextField("Custom XMLTV URL (Optional)",
+                                      placeholder: "https://example.com/xmltv.xml",
+                                      text: $server.xtreamXMLTVURL,
+                                      helper: "Optional. Adds Sports/News/Movies/Kids color tints from this XMLTV feed's category tags. Xtream Codes doesn't expose categories on its own. Leave blank to skip.",
+                                      keyboardType: .URL)
+                        .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("EPG Source").sectionHeaderStyle()
+                }
+            } else if server.type == .dispatcharrAPI {
+                Section {
+                    // v1.7.x: credential mode picker. Mirrors
+                    // AddServerView's segmented control. Persists
+                    // the user's choice to
+                    // `dispatcharrCredentialTypeRaw` on the
+                    // SwiftData record so it syncs cross-device
+                    // via SyncManager.serialize.
+                    Picker("Sign-in method", selection: directConnectModeBinding) {
+                        Text("Username & Password").tag(DispatcharrCredentialType.usernamePassword)
+                        Text("API Key").tag(DispatcharrCredentialType.apiKey)
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowBackground(Color.cardBackground)
+
+                    switch effectiveCredentialType {
+                    case .usernamePassword:
+                        SettingsTextField("Username", text: $server.username)
+                            .listRowBackground(Color.cardBackground)
+                        // v1.7.x: same Dashboard-vs-XC password hint as the
+                        // Add Server flow. Phase 3 item 2: it is the password
+                        // field's helper now instead of its own Form row, so
+                        // iOS, tvOS and Android read identically.
+                        SettingsTextField("Password", text: $server.password,
+                                          helper: "Use your Dispatcharr Dashboard password (System → Users → Account tab), not your Dispatcharr XC password.\nYour Dispatcharr account must already have an API key. In Dispatcharr, open System, then Users, edit the user, and generate an API key before signing in here.",
+                                          isSecure: true)
+                            .listRowBackground(Color.cardBackground)
+                        // Show the cached API key (read-only) so the
+                        // user can see it was fetched from
+                        // /api/accounts/users/me/ and is keeping
+                        // long-lived connections (mpv, logos)
+                        // working. Hidden in this row when empty
+                        // (e.g. server was just switched and warmup
+                        // hasn't completed yet).
+                        if !server.effectiveApiKey.isEmpty {
+                            HStack {
+                                Text("API Key (cached)")
+                                    .foregroundColor(Color.contrastText(.textTertiary))
+                                Spacer()
+                                Text(maskedAPIKey(server.effectiveApiKey))
+                                    .scaledFont(.system(.footnote, design: .monospaced).subtext())
+                                    .foregroundColor(Color.contrastText(.textSecondary))
+                            }
+                            .listRowBackground(Color.cardBackground)
+                        }
+                    case .apiKey:
+                        SettingsTextField("Admin API Key", text: $server.apiKey,
+                                          isSecure: true)
+                            .listRowBackground(Color.cardBackground)
+                    }
+
+                    // Refresh Session button, only shown in
+                    // Username & Password mode. Forces an immediate
+                    // /api/accounts/token/ login to refresh the JWT
+                    // pair AND re-fetches /api/accounts/users/me/
+                    // to update the cached api_key (covers the
+                    // server-side rotation case where an admin
+                    // rolled the key and Astral's cached copy is
+                    // stale).
+                    if effectiveCredentialType == .usernamePassword {
+                        Button {
+                            Task { await refreshDirectConnectSession() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if isRefreshingSession {
+                                    ProgressView().tint(.accentPrimary).scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                Text(isRefreshingSession ? "Refreshing…" : "Refresh Session")
+                            }
+                            .scaledFont(.labelMedium.weight(.semibold))
+                            .foregroundColor(.accentPrimary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(server.username.isEmpty
+                                  || server.effectivePassword.isEmpty
+                                  || isRefreshingSession)
+                        .listRowBackground(Color.cardBackground)
+                        if let msg = sessionRefreshMessage {
+                            Text(msg)
+                                .scaledFont(.labelSmall)
+                                .foregroundColor(sessionRefreshSucceeded ? .statusOnline : .statusLive)
+                                .listRowBackground(Color.cardBackground)
+                        } else {
+                            // v1.7.x (Round 1 review): caption
+                            // explaining when to tap. Pre-fix the
+                            // button was unlabeled and most users
+                            // would never know what it did.
+                            Text("Use if streaming or logos suddenly fail. Re-fetches the API key from your Dispatcharr account.")
+                                .scaledFont(.labelSmall.subtext())
+                                .foregroundColor(Color.contrastText(.textTertiary))
+                                .listRowBackground(Color.cardBackground)
+                        }
+                    }
+                } header: {
+                    Text("Authentication").sectionHeaderStyle()
+                }
+                Section {
+                    // The placeholder URL is passed as a plain `String`, not a
+                    // `LocalizedStringKey`, so SwiftUI does not
+                    // Markdown-auto-linkify it into a blue underlined
+                    // hyperlink. The localized-key initializer parses its
+                    // argument as markdown and the data-detector turns bare
+                    // URL patterns into clickable autolinks, on iOS and on Mac
+                    // Catalyst alike (user-reported v1.6.8).
+                    // Phase 3 item 2: the section footer described only this
+                    // field, so it is the helper now.
+                    SettingsTextField("Custom XMLTV URL (Optional)",
+                                      placeholder: "https://example.com/xmltv.xml",
+                                      text: $server.dispatcharrXMLTVURL,
+                                      helper: "EPG is loaded via Dispatcharr's REST API by default. This optional override is reserved for environments where you want AstralTV to fetch a different XMLTV feed directly. Leave blank for normal use.",
+                                      keyboardType: .URL)
+                        .listRowBackground(Color.cardBackground)
+                        .onChange(of: server.dispatcharrXMLTVURL) { _, _ in
+                            // Reset test result whenever the URL changes so
+                            // a stale "Valid" pill doesn't mislead the user.
+                            xmltvTestState = .idle
+                        }
+
+                    // Test button + status. Mirrors AddServerView's validation
+                    // affordance so editing a server feels consistent with
+                    // adding one.
+                    HStack(spacing: 10) {
+                        Button {
+                            Task { await testEditXMLTVURL() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if case .testing = xmltvTestState {
+                                    ProgressView().tint(.accentPrimary).scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "checkmark.seal")
+                                }
+                                Text("Test XMLTV URL")
+                            }
+                            .scaledFont(.labelMedium.weight(.semibold))
+                            .foregroundColor(.accentPrimary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(editXMLTVTrimmed.isEmpty ||
+                                  { if case .testing = xmltvTestState { return true } else { return false } }())
+
+                        xmltvEditStatusPill
+
+                        Spacer(minLength: 0)
+                    }
+                    .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("EPG Source").sectionHeaderStyle()
+                }
+            } else if server.type == .m3uPlaylist {
+                Section {
+                    SettingsTextField("EPG URL (Optional)", text: $server.epgURL,
+                                      keyboardType: .URL)
+                        .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("EPG Guide").sectionHeaderStyle()
+                }
+            }
+
+            if server.type != .m3uPlaylist {
+                Section {
+                    // Phase 3 item 2: single-field footer folded into the
+                    // field's helper; tvOS and Android carry the same string.
+                    SettingsTextField("Local URL", text: $server.localURL,
+                                      helper: "Used automatically whenever the server is reachable on your local network. No setup needed. Leave blank to always use the main URL.",
+                                      keyboardType: .URL)
+                        .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("Local Network").sectionHeaderStyle()
+                }
+            }
+
+            if server.type == .dispatcharrAPI {
+                Section {
+                    // Phase 3 item 2: the default-User-Agent footer described
+                    // only this field, so it is the helper now, worded exactly
+                    // as tvOS and Android word it.
+                    SettingsTextField("User-Agent",
+                                      placeholder: DeviceInfo.defaultUserAgent,
+                                      text: $server.customUserAgent,
+                                      helper: "Shown in Dispatcharr's admin Stats panel to identify this device. Leave blank for default: \(DeviceInfo.defaultUserAgent)")
+                        .listRowBackground(Color.cardBackground)
+                    Button("Reset to Default") {
+                        server.customUserAgent = ""
+                    }
+                    .foregroundColor(.accentPrimary)
+                    .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("User-Agent").sectionHeaderStyle()
+                }
+            }
+
+            // v1.6.12: per-server VOD toggle. Only shown for server
+            // types that actually support VOD, M3U-only playlists
+            // don't carry it.
+            if server.supportsVOD {
+                Section {
+                    Toggle("Fetch On Demand from This Playlist", isOn: $server.vodEnabled)
+                        .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("On Demand").sectionHeaderStyle()
+                } footer: {
+                    Text("When off, this playlist's movies and TV shows aren't loaded into On Demand. Useful if you only want Live TV from this server, or if you have a second playlist that already provides On Demand.")
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+            }
+
+            // Catch-up: how far back guide data is retained. Bounds the
+            // "Previously aired" history in the List view and the
+            // replay window shown in the Guide.
+            Section {
+                // Choice row, not a menu (Logan 2026-10-02); labels as Android.
+                SettingsChoicePicker("Guide Days",
+                                     options: GuideDayChoices.all,
+                                     selection: $server.epgRetentionDays)
+                .listRowBackground(Color.cardBackground)
+            } header: {
+                Text("Guide Days").sectionHeaderStyle()
+            } footer: {
+                Text("How many days of guide data to load, back and ahead. Dispatcharr only; other sources show what their guide carries.")
+                    .scaledFont(.labelSmall.subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+            }
+
+            // GH Android#129: catch-up request time offset. Catch-up is
+            // built for Dispatcharr and Xtream Codes only.
+            if server.type == .dispatcharrAPI || server.type == .xtreamCodes {
+                Section {
+                    CatchupTimeOffsetPicker(serverID: server.id)
+                        .listRowBackground(Color.cardBackground)
+                } header: {
+                    Text("Catch-Up").sectionHeaderStyle()
+                } footer: {
+                    Text(CatchupOffsetChoices.helpText)
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+            }
+
+            // Task #189 (Android parity): user-chosen Channel Profile.
+            if server.type == .dispatcharrAPI {
+                ChannelProfilePickerSection(server: server)
+            }
+
+            Section {
+                HStack {
+                    Text("Type")
+                        .foregroundColor(Color.contrastText(.textSecondary))
+                    Spacer()
+                    Text(server.type.displayName)
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+                .listRowBackground(Color.cardBackground)
+            } header: {
+                Text("Info").sectionHeaderStyle()
+            }
+        }
+        .scrollContentBackground(.hidden)
+    }
+
+    // MARK: - tvOS Layout
+
+    // MARK: - XMLTV Edit Test Helpers (iOS only, tvOS editor omits the button)
+
+    private var editXMLTVTrimmed: String {
+        server.dispatcharrXMLTVURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @ViewBuilder
+    private var xmltvEditStatusPill: some View {
+        switch xmltvTestState {
+        case .idle, .testing:
+            EmptyView()
+        case .success(let count):
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.statusOnline)
+                Text(count > 0 ? "Valid: \(count) programs" : "Valid XMLTV")
+                    .scaledFont(.labelSmall.weight(.semibold))
+                    .foregroundColor(.statusOnline)
+                    .lineLimit(1)
+            }
+        case .failure(let err):
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundColor(.statusLive)
+                Text(err)
+                    .scaledFont(.labelSmall)
+                    .foregroundColor(.statusLive)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    @MainActor
+    private func testEditXMLTVURL() async {
+        let urlString = editXMLTVTrimmed
+        guard !urlString.isEmpty else { return }
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            xmltvTestState = .failure("URL must start with http:// or https://")
+            return
+        }
+        xmltvTestState = .testing
+        do {
+            let programs = try await XMLTVParser.fetchAndParse(url: url)
+            xmltvTestState = .success(programs.count)
+        } catch {
+            let raw = error.localizedDescription
+            let trimmed = raw.count > 120 ? String(raw.prefix(120)) + "…" : raw
+            xmltvTestState = .failure(trimmed.isEmpty ? "Couldn't parse as XMLTV" : trimmed)
+        }
+    }
+}
+
+
+// MARK: - tvOS Edit Server (full page, no modal)
+/// Task #189 (Android parity): "Channel Profile" section of the iOS/iPad
+/// edit form. Lists the Dispatcharr server's Channel Profiles
+/// (`/api/channels/profiles/`) and stores the user's pick on
+/// `server.dispatcharrSelectedProfileID` (nil = All Channels). The filter
+/// itself is applied fail-open at channel sync in
+/// `ChannelStore.fetchDispatcharr`. Mirrors Android
+/// EditPlaylistScreen's Channel Profile section.
+private struct ChannelProfilePickerSection: View {
+    @Bindable var server: ServerConnection
+    @State private var profiles: [DispatcharrAPI.ChannelProfileSummary] = []
+    @State private var loadFailed = false
+
+    var body: some View {
+        Section {
+            Picker("Channel Profile", selection: $server.dispatcharrSelectedProfileID) {
+                Text("All Channels").tag(Int?.none)
+                ForEach(profiles) { profile in
+                    Text("\(profile.name) (\(profile.channels.count) channels)")
+                        .tag(Int?.some(profile.id))
+                }
+            }
+            .listRowBackground(Color.cardBackground)
+        } header: {
+            Text("Channel Profile").sectionHeaderStyle()
+        } footer: {
+            Text(loadFailed
+                 ? "Couldn't load this server's Channel Profiles. All Channels stays in effect; check the connection and reopen this page to retry."
+                 : "Sync only the channels in a Dispatcharr Channel Profile. Changes apply on the next channel refresh.")
+                .scaledFont(.labelSmall.subtext())
+                .foregroundColor(Color.contrastText(.textTertiary))
+        }
+        .task { await loadProfiles() }
+    }
+
+    private func loadProfiles() async {
+        let api = DispatcharrAPI(baseURL: server.effectiveBaseURL,
+                                 auth: .apiKey(server.effectiveApiKey),
+                                 userAgent: server.effectiveUserAgent,
+                                 authMode: server.dispatcharrHeaderMode)
+        do {
+            profiles = try await api.listChannelProfiles()
+            loadFailed = false
+        } catch {
+            loadFailed = true
+            debugLog("[PROFILE-PICKER] listChannelProfiles failed: \(error.localizedDescription)")
+        }
+    }
+}
+
+
+
+/// Guide Days choices shared by the TV page and the phone sheet; 0 = All
+/// Available. Labels match Android's picker. Lives here because
+/// EditServerPage is tvOS-only.
+enum GuideDayChoices {
+    static var all: [SettingsChoice<Int>] { [
+        SettingsChoice(1, "1 Day"),
+        SettingsChoice(3, "3 Days"),
+        SettingsChoice(7, "7 Days (Default)"),
+        SettingsChoice(14, "14 Days"),
+        SettingsChoice(0, "All Available"),
+    ] }
+}
+
+/// GH Android#129: per-playlist Catch-Up Time Offset choices, in minutes.
+/// Stored under `catchupTimeOffsetMinutes.<playlist UUID>` (see
+/// `CatchupSupport.timeOffsetKey`). Applied to catch-up request times only,
+/// never to the guide.
+enum CatchupOffsetChoices {
+    static let helpText = "Shift catch-up start times when your EPG and your provider's catch-up server disagree."
+    static var all: [SettingsChoice<Int>] {
+        [-180, -120, -90, -60, -45, -30, -15, -10, -5, 0, 5, 10, 15, 30, 45, 60, 90, 120, 180].map {
+            SettingsChoice($0, label(for: $0))
+        }
+    }
+    static func label(for minutes: Int) -> String {
+        if minutes == 0 { return "0 Minutes (Default)" }
+        let sign = minutes > 0 ? "+" : "-"
+        let m = abs(minutes)
+        return "\(sign)\(m) \(m == 1 ? "Minute" : "Minutes")"
+    }
+}
+
+/// Catch-Up Time Offset row, shared by the iOS sheet and the tvOS page.
+struct CatchupTimeOffsetPicker: View {
+    @AppStorage private var minutes: Int
+
+    init(serverID: UUID) {
+        _minutes = AppStorage(wrappedValue: 0, CatchupSupport.timeOffsetKey(serverID: serverID))
+    }
+
+    var body: some View {
+        SettingsChoicePicker("Catch-Up Time Offset",
+                             options: CatchupOffsetChoices.all,
+                             selection: $minutes,
+                             footer: CatchupOffsetChoices.helpText)
+    }
+}
+

@@ -1,0 +1,967 @@
+import SwiftUI
+
+// MARK: - Program Info Target
+//
+// Minimal value type that carries everything `ProgramInfoView` needs
+// to render a program detail modal. Callers build one of these from
+// whichever richer program object they have on hand, `GuideProgram`
+// in the guide grid, `EPGEntry` + channel context in the list-view
+// expanded panel, or `ChannelDisplayItem.currentProgram*` fields for
+// the always-visible "now airing" card.
+//
+// `Identifiable` so call sites can use the `.sheet(item:)` /
+// `.fullScreenCover(item:)` form, which presents / dismisses based on
+// whether the state is non-nil. Cleaner than tracking a separate Bool
+// + a payload that has to survive the dismiss animation.
+//
+// The `id` is built from the same title+start+end triple `EPGEntry`
+// uses so switching programs in rapid succession doesn't fight
+// SwiftUI's identity diffing.
+/// DVR extras shown under the program facts when Program Info opens from
+/// a recording (Logan 2026-09-08: "recording date, quality, etc.").
+struct RecordingFacts: Equatable {
+    let recordedOn: Date
+    let windowStart: Date
+    let windowEnd: Date
+    let fileSizeBytes: Int64
+    let format: String?
+    let location: String
+    let status: String
+    /// From Dispatcharr's stream_info when present.
+    var videoCodec: String? = nil
+    var resolution: String? = nil
+    var frameRate: Double? = nil
+    var videoBitrateKbps: Double? = nil
+    var audioCodec: String? = nil
+    var audioChannels: String? = nil
+
+    /// "1920x1080 H.264 59.94 fps" from whatever stream_info carried.
+    var qualityLabel: String? {
+        var parts: [String] = []
+        if let resolution, !resolution.isEmpty { parts.append(resolution) }
+        if let videoCodec, !videoCodec.isEmpty { parts.append(Self.codecName(videoCodec)) }
+        if let frameRate, frameRate > 0 { parts.append(String(format: frameRate.rounded() == frameRate ? "%.0f fps" : "%.2f fps", frameRate)) }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+    var audioLabel: String? {
+        var parts: [String] = []
+        if let audioCodec, !audioCodec.isEmpty { parts.append(Self.codecName(audioCodec)) }
+        if let audioChannels, !audioChannels.isEmpty { parts.append(audioChannels) }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+    static func codecName(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "h264", "avc": return "H.264"
+        case "hevc", "h265": return "HEVC"
+        case "mpeg2video": return "MPEG-2"
+        case "aac": return "AAC"
+        case "ac3": return "AC-3"
+        case "eac3": return "E-AC-3"
+        case "mp2": return "MP2"
+        default: return raw.uppercased()
+        }
+    }
+
+    var sizeLabel: String? {
+        guard fileSizeBytes > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: fileSizeBytes, countStyle: .file)
+    }
+    /// Average bitrate from file size over the recording window: the
+    /// closest thing to a quality figure the recording itself carries.
+    var bitrateLabel: String? {
+        if let kbps = videoBitrateKbps, kbps > 0 {
+            let mbps = kbps / 1000
+            return String(format: mbps >= 10 ? "%.0f Mbps" : "%.1f Mbps", mbps)
+        }
+        let seconds = windowEnd.timeIntervalSince(windowStart)
+        guard fileSizeBytes > 0, seconds > 60 else { return nil }
+        let mbps = Double(fileSizeBytes) * 8 / seconds / 1_000_000
+        return String(format: mbps >= 10 ? "%.0f Mbps" : "%.1f Mbps", mbps)
+    }
+    var rows: [(String, String)] {
+        var out: [(String, String)] = []
+        let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .none
+        out.append(("Recorded", df.string(from: recordedOn)))
+        let tf = DateFormatter(); tf.dateStyle = .none; tf.timeStyle = .short
+        out.append(("Window", "\(tf.string(from: windowStart)) to \(tf.string(from: windowEnd))"))
+        if let qualityLabel { out.append(("Quality", qualityLabel)) }
+        if let audioLabel { out.append(("Audio", audioLabel)) }
+        if let sizeLabel { out.append(("Size", sizeLabel)) }
+        if let bitrateLabel { out.append(("Bitrate", bitrateLabel)) }
+        if let format, !format.isEmpty { out.append(("Format", format.uppercased())) }
+        out.append(("Location", location))
+        out.append(("Status", status))
+        return out
+    }
+}
+
+struct ProgramInfoTarget: Identifiable, Equatable {
+    let channelName: String
+    let title: String
+    let start: Date
+    let end: Date
+    let description: String
+    /// Raw XMLTV `<category>` string. May contain multiple categories
+    /// separated by `,`, `/`, or `;` (e.g. `"Drama, Sci-Fi"`). The
+    /// pill renderer splits on those separators and colours each
+    /// token independently so users can see both how the feed tagged
+    /// the program AND how each tag resolves into Astral's category
+    /// palette.
+    let category: String
+
+    /// v1.7.x: Dispatcharr's per-program primary key, used by
+    /// `ProgramInfoView` to lazy-load category data from
+    /// `/api/epg/programs/<id>/` when the bulk `/api/epg/grid/`
+    /// response stripped it (which it does for every program except
+    /// the now-airing one we already enriched). Nil for XMLTV /
+    /// Xtream / M3U sources whose bulk feed already carries categories
+    /// inline; lazy-load is a no-op in those cases.
+    let programID: Int?
+
+    /// Program art straight from the EPG feed (XMLTV `<icon>`, Dispatcharr
+    /// grid icon). The guide cell and `GuidePreviewBanner` use this as the
+    /// FIRST link in their art chain, so Program Info must too: a program
+    /// whose title cannot be matched by TMDB (e.g. an XMLTV sports feed
+    /// sending "Tomorrow at 21:00 - Villarreal v Real Betis") has art in the
+    /// grid and had none in this sheet before it was threaded through.
+    let posterURLString: String?
+
+    // EPG badge metadata (info-sheet badges + episode line). Defaults so
+    // the callers that lack the data compile unchanged.
+    let subTitle: String?
+    let season: Int?
+    let episode: Int?
+    let isNew: Bool
+    let isLiveBroadcast: Bool
+    let isPremiere: Bool
+    let isFinale: Bool
+    let isRepeat: Bool
+    let recording: RecordingFacts?
+
+    var id: String {
+        "\(title)-\(start.timeIntervalSinceReferenceDate)-\(end.timeIntervalSinceReferenceDate)"
+    }
+
+    init(channelName: String, title: String, start: Date, end: Date,
+         description: String, category: String, programID: Int? = nil,
+         posterURLString: String? = nil,
+         subTitle: String? = nil, season: Int? = nil, episode: Int? = nil,
+         isNew: Bool = false, isLiveBroadcast: Bool = false,
+         isPremiere: Bool = false, isFinale: Bool = false, isRepeat: Bool = false,
+         recording: RecordingFacts? = nil) {
+        self.channelName = channelName
+        self.title = title
+        self.start = start
+        self.end = end
+        self.description = description
+        self.category = category
+        self.programID = programID
+        self.posterURLString = posterURLString
+        self.subTitle = subTitle
+        self.season = season
+        self.episode = episode
+        self.isNew = isNew
+        self.isLiveBroadcast = isLiveBroadcast
+        self.isPremiere = isPremiere
+        self.isFinale = isFinale
+        self.isRepeat = isRepeat
+        self.recording = recording
+    }
+}
+
+// MARK: - Program Info View
+//
+// Read-only modal that surfaces everything Astral knows about a
+// single program. Opened from the long-press / context-menu on any
+// program cell (guide grid) or row (list view). Purpose is twofold:
+//
+//   1. Let users read the description + category metadata without
+//      needing to start playback.
+//   2. Expose the category tagging behind the v1.6.4 guide-cell tint
+//      so users can audit their EPG feed quality from inside the app.
+//      Matching colour between the info pill and the guide tint is
+//      intentional, the pill IS the legend for the grid.
+//
+// Missing fields are surfaced, not hidden. A program whose XMLTV
+// entry has no `<desc>` shows a "No description…" placeholder
+// instead of a gap; a missing category renders a neutral-grey pill
+// labeled with the raw token. This matches Archie's "audit from
+// inside the app" requirement, a silent empty field teaches the
+// user nothing about why a program isn't tinted.
+struct ProgramInfoView: View {
+    let target: ProgramInfoTarget
+    /// Phone: the tvOS card layout at phone scale in a glass system sheet,
+    /// instead of the navigation form (Logan 2026-09-05).
+    var cardLayout = false
+    /// True when the sheet was opened FROM THE GUIDE. The art then clips on
+    /// Settings > Appearance > "Rounded corners in Guide view"; reached from
+    /// the Live TV list (or the DVR) it stays on the List toggle (Logan
+    /// 2026-09-16). Same radius rule either way.
+    var usesGuideCorners = false
+    @Environment(\.dismiss) private var dismiss
+
+    /// v1.7.x: lazy-loaded category result for Dispatcharr programs
+    /// whose `target.category` arrived empty. The bulk
+    /// `/api/epg/grid/` endpoint deliberately strips `<category>`
+    /// data server-side, so only the now-airing program per channel
+    /// (which `enrichDispatcharrCategories` proactively fetches) lands
+    /// here with a non-empty `target.category`. For everything else,
+    /// we fire a single `/api/epg/programs/<id>/` request when the
+    /// modal appears and update the pills as it returns. ~40ms on a
+    /// healthy server, so the user perceives "pills appear right
+    /// after the sheet slides in" rather than an obvious loading
+    /// spinner.
+    @State private var loadedCategory: String? = nil
+    /// Rerun flag lazily enriched from /api/epg/programs/<id>/ - the bulk
+    /// grid Direct Connect guides ride carries no repeat field (mikec79).
+    @State private var enrichedRepeat = false
+    @State private var isLoadingCategory: Bool = false
+
+    /// Program poster, resolved from the Dispatcharr program detail
+    /// (Schedules Direct poster proxy, XMLTV `<image>`/`<icon>`), or
+    /// from TMDB-by-title when that opt-in is enabled and the server
+    /// has no artwork. nil = no poster, render nothing.
+    @State private var posterURL: URL? = nil
+    /// Android parity order: detail icon, feed icon, TMDB. The feed icon
+    /// shows while detail resolves and is replaced by detail art.
+    @State private var posterIsFeed = false
+    /// TMDB is allowed only after detail answered with no art (or no
+    /// Dispatcharr detail exists for this program at all).
+    @State private var detailAllowsTMDB = false
+    // The loaded bitmap's aspect no longer drives the layout: art goes into
+    // the height-locked ProgramArtSlot shared with the guide preview
+    // banner, so nothing is cropped and nothing resizes as art lands
+    // (supersedes the GH #53 posterRatio frame, Logan 2026-09-15).
+
+    /// Auth headers for the active Dispatcharr server, in case a
+    /// program icon is a protected `/media/` URL. The Schedules-Direct
+    /// poster proxy and TMDB CDN are both auth-free, so this is
+    /// usually unused but harmless.
+    private var posterAuthHeaders: [String: String] {
+        ChannelStore.shared.activeServer?.authHeaders ?? [:]
+    }
+
+    /// Display category, prefers the loaded value over the target's
+    /// initial value so a successful detail fetch wins. Empty string
+    /// when neither source has data; the pills sections then hide
+    /// entirely (matches the pre-v1.7.x behaviour for unenriched
+    /// XMLTV / Xtream programs whose feed has no category tags).
+    private var effectiveCategory: String {
+        if let loaded = loadedCategory, !loaded.isEmpty { return loaded }
+        return target.category
+    }
+
+    // Shared between platforms: a formatter for the start/end time
+    // row. 12-hour on iOS (user locale), short style on tvOS.
+    private static var timeFormatter: DateFormatter { ClockFormat.short() }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .none
+        f.dateStyle = .medium
+        return f
+    }()
+
+    /// Duration label, "45 min", "1 h 30 min", "2 h". Duration of 0
+    /// or negative (malformed EPG) falls back to "-".
+    private var durationLabel: String {
+        let seconds = end.timeIntervalSince(start)
+        guard seconds > 0 else { return "-" }
+        let totalMinutes = Int((seconds / 60).rounded())
+        if totalMinutes < 60 {
+            return "\(totalMinutes) min"
+        }
+        let hours = totalMinutes / 60
+        let mins = totalMinutes % 60
+        if mins == 0 {
+            return "\(hours) h"
+        }
+        return "\(hours) h \(mins) min"
+    }
+
+    private var start: Date { target.start }
+    private var end: Date { target.end }
+    private var isLive: Bool { start <= Date() && end > Date() }
+
+    /// User toggle: hide the LIVE/NEW/season-episode pills. Synced per
+    /// device type (tv vs mobile) via `epgBadgesVisibleKey`.
+    @AppStorage(epgBadgesVisibleKey) private var showEpgBadges = true
+
+    /// Feed-driven flag badges (LIVE / NEW / PREMIERE / FINALE / REPEAT).
+    private var feedFlags: [EPGFlag] {
+        epgFlagBadges(isLiveBroadcast: target.isLiveBroadcast, isNew: target.isNew,
+                      isPremiere: target.isPremiere, isFinale: target.isFinale,
+                      isRepeat: target.isRepeat || enrichedRepeat)
+    }
+
+    /// Badges shown next to the title: the feed flags plus an "ON NOW"
+    /// pill for a program airing right now that is NOT itself flagged a
+    /// live broadcast. Suppressing "ON NOW" when `isLiveBroadcast` avoids
+    /// a double LIVE-style pill (the feed LIVE badge already covers it).
+    /// When the user hides program badges, we keep the app-generated
+    /// "ON NOW" status pill but drop the feed-driven flags (parity with
+    /// the Android ProgramInfoSheet).
+    private var titleBadges: [EPGFlag] {
+        var out: [EPGFlag] = []
+        if isLive && !target.isLiveBroadcast {
+            out.append(EPGFlag(label: "ON NOW", color: .statusLive))
+        }
+        if showEpgBadges {
+            out.append(contentsOf: feedFlags)
+        }
+        return out
+    }
+
+    /// "S3 E5" episode label from the feed season/episode numbers, or nil.
+    private var episodeLabel: String? {
+        seasonEpisodeLabel(season: target.season, episode: target.episode)
+    }
+
+    /// Time range + date header. Collapses "same day" to just the
+    /// time range; adds the date only when the program spans or
+    /// starts on a different calendar day than today (late-night
+    /// programs that start at 23:45 and end at 00:30 still read
+    /// as "today" here, that's fine, the date row is an
+    /// affordance for overnight / future recording scheduling
+    /// more than strict precision).
+    private var timeRangeLabel: String {
+        let start = Self.timeFormatter.string(from: target.start)
+        let end = Self.timeFormatter.string(from: target.end)
+        return "\(start) – \(end)"
+    }
+
+    private var dateLabel: String {
+        Self.dateFormatter.string(from: target.start)
+    }
+
+    /// Split raw category string on XMLTV's common separators. Empty
+    /// tokens (double-commas, trailing separators) are filtered out.
+    /// Reads `effectiveCategory` so a Dispatcharr lazy-load result
+    /// flows into the pill rendering as soon as it lands.
+    private var categoryTokens: [String] {
+        let separators = CharacterSet(charactersIn: ",/;")
+        return effectiveCategory
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// XMLTV program-type/format words that describe HOW a program is
+    /// packaged rather than WHAT it contains. Shown in a separate
+    /// "Metadata" pill row so users can see the content categories
+    /// on their own without the format-indicator noise drowning
+    /// them out. These are the words Archie specifically called out
+    /// as not being genres, "Episode", "Series", etc. The match
+    /// is case-insensitive and exact (not substring) so "Comedy"
+    /// never accidentally lands in Metadata.
+    private static let metadataTokens: Set<String> = [
+        "episode",
+        "series",
+        "movie",
+        "film",
+        "feature",
+        "feature film",
+        "short",
+        "short film",
+        "special",
+        "premiere",
+        "season premiere",
+        "series premiere",
+        "finale",
+        "season finale",
+        "series finale",
+        "rerun",
+        "repeat",
+        "live",
+        "pilot",
+        "made-for-tv movie",
+        "made for tv movie",
+        "miniseries",
+        "limited series"
+    ]
+
+    /// Category tokens classified as XMLTV metadata (format/type).
+    private var metadataPills: [String] {
+        categoryTokens.filter { Self.metadataTokens.contains($0.lowercased()) }
+    }
+
+    /// Category tokens that are actual genres, everything not
+    /// claimed by `metadataPills`. These are the tokens the category
+    /// colour palette tries to resolve into buckets (Sports, News,
+    /// Drama, etc.) for the pill tint.
+    private var genrePills: [String] {
+        categoryTokens.filter { !Self.metadataTokens.contains($0.lowercased()) }
+    }
+
+    var body: some View {
+        if cardLayout {
+            // Same chrome as RecordProgramSheet: NavigationStack, inline
+            // title, capsule Done, the system sheet's own glass and grouped
+            // cards (Logan 2026-09-05).
+            NavigationStack {
+                phoneCard
+                    .navigationTitle("Program Info")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { dismiss() }
+                        }
+                    }
+            }
+            .task(id: target.id) {
+                seedFeedPosterIfNeeded()
+                await loadCategoryIfNeeded()
+                await loadTMDBPosterIfNeeded()
+            }
+        } else {
+        NavigationStack {
+            iOSForm
+                // Suppress the system grouped-list background so the
+                // sheet stays on the app's black theme at both
+                // `.medium` and `.large` detents. Without this the
+                // Form renders its default "grouped list" grey,
+                // which looks off against the rest of Astral's dark
+                // chrome (user-reported: expanded sheet turns gray).
+                .scrollContentBackground(.hidden)
+                .background(Color.appBackground)
+                .navigationTitle("Program Info")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+                .toolbarBackground(Color.appBackground, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(Color.appBackground)
+        .task(id: target.id) {
+            seedFeedPosterIfNeeded()
+            await loadCategoryIfNeeded()
+            await loadTMDBPosterIfNeeded()
+        }
+        }
+    }
+
+    // MARK: - Phone card layout (glass sheet)
+
+    /// The tvOS card at phone scale: art beside the copy, facts row,
+    /// description, pills. Scrolls only when it must.
+    private var phoneCard: some View {
+        Form {
+            Section {
+                HStack(alignment: .top, spacing: 14) {
+                    if let posterURL {
+                        // Shared height-locked slot (ProgramArtSlot): whole
+                        // art, no crop, aspect-shaped (Logan 2026-09-15).
+                        ProgramArtSlot(url: posterURL,
+                                       headers: posterAuthHeaders,
+                                       metrics: ProgramArtSlotMetrics.compactSlot,
+                                       usesGuideCorners: usesGuideCorners)
+                    }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(target.channelName.uppercased())
+                            .scaledFont(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Color.contrastText(.textSecondary))
+                            .tracking(1.2)
+                        Text(target.title)
+                            .scaledFont(.system(size: 21, weight: .bold))
+                            .foregroundColor(.textPrimary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let sub = target.subTitle,
+                           !EPGText.subtitleIsRedundant(sub, title: target.title, description: target.description) {
+                            Text(sub)
+                                .scaledFont(.system(size: 14).subtext())
+                                .foregroundColor(Color.contrastText(.textSecondary))
+                                .italic()
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if !titleBadges.isEmpty {
+                            CategoryPillsLayout(spacing: 6) {
+                                ForEach(titleBadges.indices, id: \.self) { i in
+                                    EPGFlagBadge(flag: titleBadges[i])
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.vertical, 4)
+            }
+            Section {
+                HStack(alignment: .top, spacing: 18) {
+                    phoneFact(title: "Airs", value: timeRangeLabel)
+                    phoneFact(title: "Date", value: dateLabel)
+                    phoneFact(title: "Duration", value: durationLabel)
+                    if let episodeLabel {
+                        phoneFact(title: "Episode", value: episodeLabel)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            if let rec = target.recording {
+                Section("Recording") {
+                    ForEach(rec.rows, id: \.0) { row in
+                        LabeledContent(row.0, value: row.1)
+                            .scaledFont(.system(size: 14))
+                    }
+                }
+            }
+            Section {
+                descriptionText
+                    .scaledFont(.system(size: 15))
+                    .foregroundColor(.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !metadataPills.isEmpty || !genrePills.isEmpty {
+                Section {
+                    if !metadataPills.isEmpty {
+                        CategoryPillsLayout(spacing: 6) {
+                            ForEach(metadataPills, id: \.self) { token in
+                                CategoryPill(rawToken: token, forceNeutral: true)
+                            }
+                        }
+                    }
+                    if !genrePills.isEmpty {
+                        CategoryPillsLayout(spacing: 6) {
+                            ForEach(genrePills, id: \.self) { token in
+                                CategoryPill(rawToken: token)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func phoneFact(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .scaledFont(.system(size: 10, weight: .medium))
+                .foregroundColor(Color.contrastText(.textTertiary))
+                .tracking(1)
+            Text(value)
+                .scaledFont(.system(size: 13, weight: .medium))
+                .foregroundColor(.textPrimary)
+                .lineLimit(2)
+        }
+    }
+
+    // MARK: - Lazy Category Load (Dispatcharr only)
+    //
+    // Fires when the modal appears with an empty `target.category`
+    // and a non-nil `programID`. Hits `/api/epg/programs/<id>/` to
+    // pull the rich detail Dispatcharr's bulk grid strips, then
+    // populates `loadedCategory` so the pill sections re-render.
+    //
+    // Silently no-ops when:
+    //   • `target.category` is already populated (now-airing program
+    //     enriched at guide-load time, or any XMLTV / Xtream source
+    //     that includes categories inline). One less network call.
+    //   • `target.programID` is nil (XMLTV / Xtream / M3U sources
+    //     that don't carry Dispatcharr's per-program primary key).
+    //   • `ChannelStore.shared.activeServer` is missing or isn't a
+    //     `dispatcharrAPI` server. Defensive, the modal is only
+    //     reached via channel rows whose server is by definition
+    //     the active one, but a server switch mid-presentation
+    //     shouldn't crash the lookup.
+    //   • The fetch fails (timeout, 401, decode error). Pills just
+    //     don't appear, same outcome as if the program genuinely
+    //     had no categories. No banner, no error state. The user
+    //     can dismiss + reopen to retry.
+    @MainActor
+    private func loadCategoryIfNeeded() async {
+        // v1.7.x diagnostic: log every guard outcome and the API
+        // result so a user with empty Program Info pills can capture
+        // exactly which step is breaking. Each branch tags its reason
+        // so the log greps cleanly.
+        let pidStr = target.programID.map(String.init) ?? "nil"
+        debugLog("📺 ProgramInfo lazy-load entry: title='\(target.title.prefix(40))' category.empty=\(target.category.isEmpty) programID=\(pidStr)")
+        // Fetch the detail when EITHER the category pills are still
+        // missing OR we don't yet have a poster (the detail call
+        // carries both, so one request serves both needs).
+        let categoryNeeded = target.category.isEmpty && loadedCategory == nil
+        let posterNeeded = posterURL == nil || posterIsFeed
+        guard categoryNeeded || posterNeeded else {
+            debugLog("📺 ProgramInfo lazy-load SKIP: category + poster already resolved")
+            return
+        }
+        guard let pid = target.programID else {
+            detailAllowsTMDB = true
+            debugLog("📺 ProgramInfo lazy-load SKIP: programID is nil (target wasn't built from a Dispatcharr-grid program, XMLTV/Xtream/dummy source, or the construction site didn't thread programID)")
+            return
+        }
+        guard let server = ChannelStore.shared.activeServer else {
+            debugLog("📺 ProgramInfo lazy-load SKIP: ChannelStore.activeServer is nil")
+            return
+        }
+        guard server.type == .dispatcharrAPI else {
+            detailAllowsTMDB = true
+            debugLog("📺 ProgramInfo lazy-load SKIP: activeServer.type=\(server.type) (not dispatcharrAPI)")
+            return
+        }
+        let baseURL = server.effectiveBaseURL
+        let apiKey = server.effectiveApiKey
+        guard !baseURL.isEmpty, !apiKey.isEmpty else {
+            debugLog("📺 ProgramInfo lazy-load SKIP: baseURL.empty=\(baseURL.isEmpty) apiKey.empty=\(apiKey.isEmpty)")
+            return
+        }
+        isLoadingCategory = true
+        defer { isLoadingCategory = false }
+        // v1.7.x: pass serverID + savedUsername so a 401 from a
+        // rotated api_key triggers silent re-bootstrap rather than
+        // leaving the modal pill-less.
+        let api = DispatcharrAPI(baseURL: baseURL,
+                                  auth: .apiKey(apiKey),
+                                  userAgent: server.effectiveUserAgent,
+                                  authMode: server.dispatcharrHeaderMode,
+                                  serverID: server.id,
+                                  savedUsername: server.dispatcharrCredentialType == .usernamePassword
+                                      ? server.username : nil)
+        // Stale Teamarr ids 404: re-resolve by start time (the channel is
+        // found by name, the only channel key this target carries).
+        let channelID = ChannelStore.shared.channels.first { $0.name == target.channelName }?.id
+        let outcome = await DispatcharrProgramDetailResolver.load(
+            api: api, programID: pid, start: target.start, channelID: channelID, title: target.title)
+        guard case .found(let loaded, let rawPoster) = outcome else {
+            debugLog("📺 ProgramInfo lazy-load FAIL: pid=\(pid) (404 without match or request failed)")
+            return
+        }
+        if posterNeeded, loaded == nil, let raw = rawPoster,
+           let u = VODService.resolveImageURL(raw, base: baseURL, size: "w500") {
+            posterURL = u
+            posterIsFeed = false
+        }
+        // Detail answered: TMDB may fill in only when it carried no art.
+        detailAllowsTMDB = rawPoster == nil
+        guard let detail = loaded else { return }
+        let cats = detail.categories.joined(separator: ",")
+        debugLog("📺 ProgramInfo lazy-load OK: pid=\(pid) returned \(detail.categories.count) categories: '\(cats.prefix(80))'")
+        // Only assign if we got something, avoids triggering a
+        // pointless re-render on empty results, and leaves the
+        // door open for a future retry path.
+        if categoryNeeded, !cats.isEmpty {
+            loadedCategory = cats
+        }
+        // Server-provided poster (SD proxy / XMLTV image / icon).
+        // resolveImageURL validates the host (SSRF guard) and maps
+        // bare TMDB slugs to the CDN, same as the VOD path.
+        if posterNeeded, let raw = detail.bestPosterString,
+           let u = VODService.resolveImageURL(raw, base: baseURL, size: "w500") {
+            posterURL = u
+            posterIsFeed = false
+            debugLog("📺 ProgramInfo poster: \(posterURL?.absoluteString ?? "rejected/none")")
+        }
+        // The bulk grid has no repeat field, but this endpoint does:
+        // surface REPEAT on Direct Connect (mikec79, 2026-08-19).
+        if detail.isPreviouslyShown { enrichedRepeat = true }
+    }
+
+    /// Feed art, first link in the chain and the same one
+    /// `GuidePreviewBanner.state(for:)` uses: an absolute icon URL from the
+    /// EPG entry wins outright, a relative one is resolved against the
+    /// active Dispatcharr base (and host-validated) exactly like the
+    /// detail-call poster below.
+    @MainActor
+    private func seedFeedPosterIfNeeded() {
+        guard posterURL == nil,
+              let raw = target.posterURLString?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return }
+        if let direct = URL(string: raw), direct.scheme != nil {
+            posterURL = direct
+        } else if let base = ChannelStore.shared.activeServer?.effectiveBaseURL, !base.isEmpty {
+            posterURL = VODService.resolveImageURL(raw, base: base, size: "w500")
+        }
+        posterIsFeed = posterURL != nil
+        debugLog("📺 ProgramInfo feed poster: \(posterURL?.absoluteString ?? "rejected/none")")
+    }
+
+    /// TMDB-by-title poster fallback. Runs after the server-poster
+    /// attempt; only fires when the program has no server poster, the
+    /// user enabled TMDB posters (Settings > App Behaviors), and a key
+    /// is stored. Works for every source (no Dispatcharr programID
+    /// required) since it keys off the title.
+    @MainActor
+    private func loadTMDBPosterIfNeeded() async {
+        guard posterURL == nil, detailAllowsTMDB,
+              TMDBPosters.isEnabled,
+              let apiKey = TMDBPosters.apiKey,
+              !target.title.trimmingCharacters(in: .whitespaces).isEmpty
+        else { return }
+        if let url = await TMDBService.posterURL(forTitle: target.title, apiKey: apiKey) {
+            // Detail art landed first: it outranks TMDB.
+            guard posterURL == nil else { return }
+            posterURL = url
+            debugLog("📺 ProgramInfo TMDB poster: \(url.absoluteString)")
+        }
+    }
+
+    // MARK: - iOS Layout
+
+    @ViewBuilder
+    private var iOSForm: some View {
+        Form {
+            if let posterURL {
+                Section {
+                    HStack {
+                        Spacer()
+                        // Shared height-locked slot (ProgramArtSlot): art of
+                        // any aspect (16:9 title card, 2:3 poster, square
+                        // logo) is drawn WHOLE at one locked height, the width
+                        // following its own aspect, with the sheet showing
+                        // through around it. Supersedes the
+                        // GH #53 ratio-derived frame, which still cropped
+                        // anything outside its clamped ratio range and made
+                        // the row jump when the bitmap landed.
+                        ProgramArtSlot(url: posterURL,
+                                       headers: posterAuthHeaders,
+                                       usesGuideCorners: usesGuideCorners)
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
+                }
+            }
+
+            Section {
+                LabeledContent("Channel", value: target.channelName)
+                // Program row: title on its OWN full-width line (soft-wraps,
+                // so a long single-word title can never mid-word-break), with
+                // the feed badges wrapping in a flow layout underneath rather
+                // than a horizontal run that squeezes the title. Episode
+                // sub-title as a secondary italic line beneath.
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(target.title)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !titleBadges.isEmpty {
+                        CategoryPillsLayout(spacing: 4) {
+                            ForEach(titleBadges.indices, id: \.self) { i in
+                                EPGFlagBadge(flag: titleBadges[i])
+                            }
+                        }
+                    }
+                    if let sub = target.subTitle,
+                       !EPGText.subtitleIsRedundant(sub, title: target.title, description: target.description) {
+                        Text(sub)
+                            .scaledFont(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .italic()
+                    }
+                }
+                LabeledContent("Airs", value: timeRangeLabel)
+                LabeledContent("Date", value: dateLabel)
+                LabeledContent("Duration", value: durationLabel)
+                if let episodeLabel {
+                    LabeledContent("Episode", value: episodeLabel)
+                }
+            }
+            if let rec = target.recording {
+                Section("Recording") {
+                    ForEach(rec.rows, id: \.0) { row in
+                        LabeledContent(row.0, value: row.1)
+                    }
+                }
+            }
+
+            Section("Description") {
+                descriptionText
+                    .textSelection(.enabled)
+            }
+
+            // Metadata pills, XMLTV format indicators. Rendered as
+            // neutral grey pills regardless of palette state because
+            // they're not genres (no tint mapping applies).
+            if !metadataPills.isEmpty {
+                Section("Metadata") {
+                    CategoryPillsLayout(spacing: 6) {
+                        ForEach(metadataPills, id: \.self) { token in
+                            CategoryPill(rawToken: token, forceNeutral: true)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+
+            // Genre pills, tokens that may resolve to a palette
+            // bucket (Sports, Drama, etc.). Unresolved tokens still
+            // render as neutral grey pills so the user can audit
+            // what their feed tagged.
+            if !genrePills.isEmpty {
+                Section("Categories") {
+                    CategoryPillsLayout(spacing: 6) {
+                        ForEach(genrePills, id: \.self) { token in
+                            CategoryPill(rawToken: token)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+
+    // MARK: - tvOS Layout
+
+
+    // MARK: - Shared Chrome
+
+    @ViewBuilder
+    private var descriptionText: some View {
+        if target.description.isEmpty {
+            Text("No program description provided in XMLTV.")
+                .foregroundStyle(.secondary)
+                .italic()
+        } else {
+            Text(target.description)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - Category Pill
+//
+// Colour comes from the same `CategoryColor` palette the guide grid
+// uses for cell tint, so a pill in this modal matches the tint on
+// the cell the user long-pressed to open the modal. Resolution
+// order matches `CategoryColor.backgroundColor`:
+//
+//   1. User-defined custom category (from Settings), hex wins.
+//   2. Built-in bucket whose aliases contain the token, bucket's
+//      current (possibly user-overridden) colour wins.
+//   3. Neither, neutral grey pill so the token is still visible,
+//      teaching the user that this tag doesn't resolve to any
+//      colour in their palette. Part of the "audit EPG quality"
+//      goal.
+//
+// The label is always the RAW token from the XMLTV feed, not the
+// resolved bucket's display name. Users asked for "how did my feed
+// tag this program", showing the bucket name would hide the raw
+// data behind Astral's canonicalisation.
+struct CategoryPill: View {
+    let rawToken: String
+    /// When true, skip palette resolution entirely and render as a
+    /// neutral grey pill. Used for the "Metadata" section in
+    /// `ProgramInfoView`, whose tokens (Episode / Series / Movie
+    /// etc.) aren't genres and shouldn't falsely pick up a bucket
+    /// colour via substring match (e.g., "Special" wouldn't hit a
+    /// bucket today but a future palette change shouldn't surprise
+    /// us).
+    var forceNeutral: Bool = false
+
+    /// Resolved (color, opacity) pair. `nil` background → use the
+    /// neutral-grey fallback handled below.
+    private var fill: Color {
+        if forceNeutral { return Color.textTertiary }
+        if let hex = CategoryColor.customHex(for: rawToken) {
+            return Color(hex: hex)
+        }
+        if let bucket = CategoryColor.bucket(for: rawToken) {
+            return bucket.baseColor
+        }
+        return Color.textTertiary
+    }
+
+    /// Whether the palette actually matched this token. Used to dim
+    /// the "unmatched" pills slightly so matched ones read as the
+    /// visually-active state.
+    private var isResolved: Bool {
+        guard !forceNeutral else { return false }
+        return CategoryColor.customHex(for: rawToken) != nil ||
+               CategoryColor.bucket(for: rawToken) != nil
+    }
+
+    var body: some View {
+        Text(rawToken)
+            .scaledFont(.system(size: 13, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .foregroundColor(isResolved ? .white : .textSecondary)
+            .background(
+                Capsule().fill(fill.opacity(isResolved ? 0.85 : 0.25))
+            )
+    }
+}
+
+// MARK: - CategoryPillsLayout
+//
+// A simple flow layout: children are laid out left-to-right, wrapping
+// to a new line when the available width runs out. Used for the
+// category pills since a typical program has 1–4 categories and a
+// horizontal ScrollView would look out of place inside a Form row
+// or a tvOS vertical stack.
+//
+// Uses the Swift 5.7+ `Layout` protocol. iOS 16+ / tvOS 16+ / macOS
+// 13+, well under Astral's deployment floor.
+struct CategoryPillsLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var cursorX: CGFloat = 0
+        var cursorY: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var contentWidth: CGFloat = 0
+
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if cursorX + size.width > maxWidth, cursorX > 0 {
+                cursorY += lineHeight + spacing
+                cursorX = 0
+                lineHeight = 0
+            }
+            cursorX += size.width + spacing
+            contentWidth = max(contentWidth, cursorX - spacing)
+            lineHeight = max(lineHeight, size.height)
+        }
+
+        return CGSize(width: contentWidth, height: cursorY + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var cursorX = bounds.minX
+        var cursorY = bounds.minY
+        var lineHeight: CGFloat = 0
+
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if cursorX + size.width > bounds.maxX, cursorX > bounds.minX {
+                cursorY += lineHeight + spacing
+                cursorX = bounds.minX
+                lineHeight = 0
+            }
+            sub.place(
+                at: CGPoint(x: cursorX, y: cursorY),
+                proposal: ProposedViewSize(size)
+            )
+            cursorX += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+    }
+}
+
+// MARK: - Glass sheet (phone)
+
+extension View {
+    /// Presents Program Info. On the phone it is the system sheet on
+    /// Liquid Glass with the tvOS card layout (Logan 2026-09-05); iPad
+    /// keeps the form sheet.
+    @ViewBuilder
+    /// `usesGuideCorners`: pass true from the GUIDE, so the art follows the
+    /// "Rounded corners in Guide view" toggle. The list and the DVR leave it
+    /// at false and keep the List toggle (Logan 2026-09-16).
+    func programInfoPresenter(item: Binding<ProgramInfoTarget?>,
+                              usesGuideCorners: Bool = false) -> some View {
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            self.sheet(item: item) { target in
+                ProgramInfoView(target: target, cardLayout: true,
+                                usesGuideCorners: usesGuideCorners)
+                    .presentationDetents([.medium, .large])
+            }
+        } else {
+            self.sheet(item: item) {
+                ProgramInfoView(target: $0, usesGuideCorners: usesGuideCorners)
+            }
+        }
+    }
+}

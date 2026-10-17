@@ -1,0 +1,73 @@
+# XcodeGen spec for AstralTV.
+#
+# v1.6.22 (Codex finding 2): rewritten to match the actual checked-in
+# Xcode project. The previous spec was a stale mirror of a much older
+# `Dispatcharr`-branded ancestor and would have produced an unsignable
+# project shape if anyone regenerated from it. Identifiers, bundle IDs,
+# entitlements, and resource paths now match `Astral.xcodeproj/project.pbxproj`.
+#
+# This file is informational, not authoritative. The canonical project
+# is `Astral.xcodeproj`. If you regenerate, diff against the checked-in
+# `.pbxproj` and reconcile any drift before committing.
+name: Astral
+options:
+  bundleIdPrefix: app.crzx
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    ENABLE_BITCODE: "NO"
+    SUPPORTS_MACCATALYST: "YES"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    # Leave blank so a fork can sign under its own team without
+    # editing this file. The checked-in `.pbxproj` carries Archie's
+    # personal team ID; that's expected for the maintained build.
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  Astral:
+    type: application
+    platform: iOS
+    deploymentTarget:
+      iOS: "18.0"
+    sources:
+      - path: .
+        excludes:
+          - "**/*.xcodeproj/**"
+          - "**/build/**"
+          - "**/DerivedData/**"
+          - "project.yml"
+          - "BUILD.md"
+          - "CHANGELOG.md"
+          - "README.md"
+    resources:
+      - path: App/AstralSplash.mp4
+      - path: SupportingFiles/Assets.xcassets
+    info:
+      path: SupportingFiles/Info.plist
+      properties:
+        CFBundleDisplayName: AstralTV
+        CFBundleIdentifier: app.crzx.astral
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: ""
+        UIBackgroundModes:
+          - audio
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UISupportsDocumentBrowser: false
+        LSSupportsOpeningDocumentsInPlace: false
+    entitlements:
+      path: SupportingFiles/Astral.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.crzx.astral
+        INFOPLIST_FILE: SupportingFiles/Info.plist

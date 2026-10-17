@@ -1,0 +1,42 @@
+# Dependencies
+Pods/
+Carthage/
+
+# Xcode
+build/
+build-*/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# CocoaPods artifacts (Podfile.lock is kept so builds are reproducible)
+
+# Archives & IPAs — these belong as GitHub Release assets only,
+# never committed to the repo. `git add -f` is explicitly disallowed.
+*.ipa
+IPAs/
+*.dSYM.zip
+*.dSYM
+
+# Secrets (never commit)
+.env
+*.p12
+*.mobileprovision
+
+# AI-assistant scratch / instructions — local-only
+CLAUDE.md
+
+# Windows cruft (stray Thumbs.db from cross-platform asset editing)
+Thumbs.db
+
+# Local-only UITest harness (see file header: heat/regression, not committed)
+AstralUITests/
+
+.freebuff/

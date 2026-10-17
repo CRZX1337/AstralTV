@@ -1,0 +1,822 @@
+import SwiftUI
+import SwiftData
+
+struct SettingsView: View {
+    /// The ONE hint under the playlist list, on iPhone, iPad and Apple
+    /// TV, and the same string Android uses (Settings redesign Phase 3
+    /// item 5). It replaces the two gesture hints that used to teach
+    /// tap-the-circle and long-press.
+    /// Phase 3 (Logan 2026-09-18): iOS/iPadOS rows carry a tappable
+    /// radio, so the hint names it. tvOS keeps its own wording because
+    /// the TV row is a single focus stop with no tappable circle.
+    static let playlistFooterHint = "Tap a playlist to open it, or its circle to make it active."
+
+    /// Observes ThemeManager so SettingsView's body re-evaluates on
+    /// every `selectedTheme` / `useCustomAccent` / `customAccentHex`
+    /// change. Without this, child rows that pass `iconColor: .accentPrimary`
+    /// (a computed property that reads `ThemeManager.shared.accent`)
+    /// keep the old Color value because SettingsView never invalidates
+    /// the rows are reconstructed only when SettingsView itself
+    /// re-renders. v1.6.8 user report: switching themes left
+    /// stale-coloured icons on App Settings + iCloud rows. Adding
+    /// the observer fixes the cascade by forcing re-render on every
+    /// theme mutation.
+    @ObservedObject private var theme = ThemeManager.shared
+    // Stored order, kept for the model and for iCloud sync. Every
+    // playlist list in Settings presents `sortedServers` (alphabetical)
+    // instead; nothing writes `sortOrder` from this screen any more.
+    @Query(sort: [
+        SortDescriptor(\ServerConnection.sortOrder, order: .forward),
+        SortDescriptor(\ServerConnection.createdAt, order: .forward)
+    ])
+    private var servers: [ServerConnection]
+
+    /// Presentation-only alphabetical order for every playlist list in
+    /// Settings (Logan 2026-09-18). `localizedStandardCompare` is
+    /// case-insensitive and numeric-aware, so "Playlist 2" sorts before
+    /// "Playlist 10". Ties fall back to `createdAt` then `id` so the
+    /// order is stable. Nothing here touches `sortOrder` or the sync
+    /// payload; the stored order is untouched.
+    private var sortedServers: [ServerConnection] {
+        servers.sorted { a, b in
+            switch a.name.localizedStandardCompare(b.name) {
+            case .orderedAscending:  return true
+            case .orderedDescending: return false
+            case .orderedSame:
+                if a.createdAt != b.createdAt { return a.createdAt < b.createdAt }
+                return a.id.uuidString < b.id.uuidString
+            }
+        }
+    }
+    @Environment(\.modelContext) private var modelContext
+    @State private var showAddServer = false
+    @State private var serverToDelete: ServerConnection? = nil
+    @State private var serverToEdit: ServerConnection? = nil
+    @State private var showDeleteAlert = false
+    /// Read-only here: the Sync row's value on the Settings root. The
+    /// toggle itself lives on SyncSettingsView.
+    @AppStorage("iCloudSyncEnabled") private var iCloudSyncEnabled = false
+
+    // Phase 4 (plan A2): iPad split-view state. Optional so a cleared
+    // selection falls back to Playlists.
+    @Environment(\.horizontalSizeClass) private var hSizeClass
+    @State private var padSelection: SettingsRoute? = .category(.playlists)
+    /// Bumped by the `playlists` deep link on the single-column layout:
+    /// Playlists is the first section of the root list there, so the
+    /// link pops to the root and scrolls to its top.
+    @State private var phoneScrollToPlaylistsToken = 0
+    /// Phase 2 (2026-09-17): whether the Settings tab is currently wide
+    /// enough for two panes. Written by the GeometryReader at the tab
+    /// root; read by the deep-link handler so `astral://settings/<page>`
+    /// picks the right target (sidebar selection vs. phone push) in every
+    /// width case, including Split View and Stage Manager.
+    @State private var padSplitActive = false
+    /// Tint strength for the selected sidebar row. Faint on purpose: the
+    /// row reads as selected without becoming a solid block.
+    private static let padSidebarSelectionOpacity: Double = 0.16
+    /// iPhone push stack. Only the `astral://settings/<page>` deep link
+    /// writes to it; the visible rows stay classic
+    /// `NavigationLink(destination:)` pushes.
+    @State private var phonePath = NavigationPath()
+
+    var body: some View {
+        // Menu-button routing on tvOS:
+        //
+        // MainTabView's `.onExitCommand { handleMenuPress() }` on the
+        // outer TabView intercepts every Menu press before the inner
+        // NavigationStack, or any per-destination `.onExitCommand`,
+        // can react. (Same constraint that drives the VOD
+        // `isVODDetailPushed` pattern.) So we don't attach a handler
+        // here; we let MainTabView detect the pushed state and drive
+        // pops explicitly.
+        //
+        // Coordination:
+        //   • `isSubviewPushed` (binding up to MainTabView) mirrors
+        //     `navPath.count > 0 || dismissStack.depth > 0`.
+        //   • MainTabView's `handleMenuPress()` sees `isSubviewPushed`
+        //     and flips `popRequested` instead of switching tabs.
+        //   • The `.onChange(of: popRequested)` in
+        //     `settingsNavigationStack` pops the innermost level,
+        //     classic dismiss stack first, then navPath, and resets
+        //     the flag. Repeated Menu presses peel levels off one at
+        //     a time until we're back at the Settings root, at which
+        //     point MainTabView's fallthrough switches to Live TV.
+        //
+        // See also `SettingsDismissStack` and
+        // `trackedAsClassicSettingsChild()` at the bottom of this file
+        // for how classic-`NavigationLink(destination:)` pushes
+        // (ServerDetailView, DVR → MyRecordingsView) opt into the
+        // same pop mechanism despite bypassing `navPath`.
+        settingsNavigationStack
+            // One Edit Playlist mechanism on iPhone and iPad: pushed pages
+            // (ServerDetailView) set the root's `serverToEdit`, the same
+            // binding the row context menu and the deep link use.
+            .environment(\.editPlaylist, EditPlaylistAction { serverToEdit = $0 })
+            // astral://settings/<page>. Warm app: the notification. Cold
+            // launch: the page parked on SettingsDeepLink before this view
+            // existed, consumed on the first mount.
+            .onAppear {
+                if let page = SettingsDeepLink.shared.consumePending() {
+                    applySettingsDeepLink(page)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .astralOpenSettingsPage)) { note in
+                guard let raw = note.userInfo?["page"] as? String,
+                      let page = SettingsDeepLinkPage(rawValue: raw) else { return }
+                _ = SettingsDeepLink.shared.consumePending()
+                applySettingsDeepLink(page)
+            }
+    }
+
+    // MARK: - Settings deep link
+
+    /// Drives the existing navigation for a `astral://settings/<page>` URL.
+    /// Unknown pages arrive here already folded into `.root`.
+    @MainActor
+    private func applySettingsDeepLink(_ page: SettingsDeepLinkPage) {
+        let activeServer = servers.first(where: { $0.isActive }) ?? servers.first
+        debugLog("🔗 SettingsView: deep link page=\(page.rawValue)")
+        // A short hop off the current turn so the navigation container has
+        // finished mounting (cold launch lands here inside the first
+        // onAppear, before the stack/rail can accept a programmatic move).
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            // Phase 2: the split is width-driven, so the deep link
+            // follows the CURRENT layout rather than the size class.
+            let isPad = padSplitActive
+            switch page {
+            case .root:
+                phonePath = NavigationPath()
+                padSelection = .category(.playlists)
+            case .playlistDetail:
+                guard let server = activeServer else { return }
+                if isPad {
+                    padSelection = .server(server.id)
+                } else {
+                    phonePath = NavigationPath()
+                    phonePath.append(SettingsRoute.server(server.id))
+                }
+            case .editPlaylist:
+                guard let server = activeServer else { return }
+                // Edit is a sheet on both iPhone and iPad.
+                if isPad { padSelection = .server(server.id) } else { phonePath = NavigationPath() }
+                serverToEdit = server
+            case .playlists:
+                // iPad split: the Playlists pane. Single column (iPhone,
+                // narrow iPad): there is no Playlists page, the playlists
+                // are the root's first section, so pop to the root and
+                // scroll there. Pushing .category(.playlists) here used to
+                // land on an EmptyView destination (black screen).
+                if isPad {
+                    padSelection = .category(.playlists)
+                } else {
+                    phonePath = NavigationPath()
+                    phoneScrollToPlaylistsToken += 1
+                }
+            case .remote:
+                // Remote Control is tvOS-only: fall back to the root.
+                phonePath = NavigationPath()
+                padSelection = .category(.playlists)
+            default:
+                guard let dest = page.category else { return }
+                if isPad {
+                    padSelection = .category(dest)
+                } else {
+                    phonePath = NavigationPath()
+                    phonePath.append(SettingsRoute.category(dest))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var settingsNavigationStack: some View {
+        // Phase 4 (plan A2): explicit idiom fork rather than trusting
+        // NavigationSplitView's collapse heuristics, so the iPhone view
+        // tree stays byte-identical.
+        //
+        // Phase 2 (2026-09-17): the fork is now decided by the Settings
+        // tab's AVAILABLE WIDTH, not by the horizontal size class alone.
+        // iPad Split View at 50% and Stage Manager windows report a
+        // compact size class but are still 600 pt or wider, so they now
+        // get two panes; a narrow Slide Over stays a single list. The
+        // iPhone is excluded by idiom, so its tree is untouched.
+        //
+        // Measured with a GeometryReader and nothing else: no preference
+        // keys, and nothing derived from the geometry feeds a sibling's
+        // padding (that shape loops the layout, per the iPhone Guide
+        // regression of 2026-09).
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            GeometryReader { geo in
+                let width = geo.size.width
+                let height = geo.size.height
+                let split = SettingsMetrics.padWantsSplit(width: width, height: height)
+                Group {
+                    if split {
+                        padSplitRoot(availableWidth: width)
+                    } else {
+                        NavigationStack(path: $phonePath) { settingsContent }
+                    }
+                }
+                .frame(width: width, height: height)
+                .onAppear { padSplitActive = split }
+                .onChange(of: split) { _, nowSplit in
+                    handleSplitChange(toSplit: nowSplit)
+                }
+            }
+        } else {
+            NavigationStack(path: $phonePath) { settingsContent }
+        }
+    }
+
+
+    @ViewBuilder
+    private var settingsContent: some View {
+            ZStack {
+                Color.appBackground.ignoresSafeArea()
+
+                ScrollViewReader { rootProxy in
+                List {
+                    // Re-tap-the-tab anchor: a zero-height, inset-free,
+                    // separator-free row, so the list looks exactly as before.
+                    Color.clear
+                        .frame(height: 0)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .id("settings.top")
+                    // MARK: - Playlists Section
+                    Section {
+                        if servers.isEmpty {
+                            HStack {
+                                Spacer()
+                                VStack(spacing: 8) {
+                                    Image(systemName: "list.and.film")
+                                        .scaledFont(.system(size: 28))
+                                        .foregroundColor(Color.contrastText(.textTertiary))
+                                    Text("No playlists added")
+                                        .scaledFont(.bodyMedium.subtext())
+                                        .foregroundColor(Color.contrastText(.textTertiary))
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 20)
+                            .listRowBackground(Color.cardBackground)
+                        } else {
+                            ForEach(sortedServers) { server in
+                                NavigationLink(destination: ServerDetailView(server: server)) {
+                                    ServerListRow(server: server,
+                                                  onActivate: { setActiveServer(server) })
+                                }
+                                .buttonStyle(PressableButtonStyle())
+                                .listRowBackground(Color.cardBackground)
+                                .contextMenu {
+                                    Button { serverToEdit = server } label: {
+                                        Label("Edit", systemImage: "pencil")
+                                    }
+                                    Button(role: .destructive) {
+                                        serverToDelete = server
+                                        showDeleteAlert = true
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                }
+                            }
+                            // Drag-to-reorder removed 2026-09-18: the list
+                            // is presented alphabetically, so a manual
+                            // order has nowhere to show. `sortOrder` is
+                            // left untouched in the model and in sync.
+                        }
+
+                        Button {
+                            showAddServer = true
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "plus.circle.fill")
+                                    .scaledFont(.system(size: 20))
+                                    .foregroundStyle(LinearGradient.accentGradient)
+                                Text("Add Playlist")
+                                    .scaledFont(.bodyMedium)
+                                    .foregroundColor(Color.contrastText(.accentPrimary))
+                            }
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        .listRowBackground(Color.cardBackground)
+
+                    } header: {
+                        Text("Playlists")
+                            .sectionHeaderStyle()
+                    } footer: {
+                        if !servers.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                // Phase 3 item 5: one sentence, identical
+                                // to the Android string. The old pair
+                                // ("Tap ○ to set the active playlist" /
+                                // "Long press to edit or delete") taught
+                                // two hidden gestures for something the
+                                // detail page now does in the open.
+                                Label(Self.playlistFooterHint, systemImage: "list.bullet")
+                                    .scaledFont(.labelSmall.subtext())
+                                    .foregroundColor(Color.contrastText(.textTertiary))
+                            }
+                            .padding(.top, 4)
+                        }
+                    }
+                    .listSectionSeparator(.hidden)
+
+                    // MARK: - App
+                    Section {
+                        NavigationLink(destination: LiveTVSettingsView()) {
+                            SettingsRow(icon: "tv.fill", iconColor: .accentPrimary,
+                                        title: "Live TV", subtitle: "Guide, groups, badges, colors")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        NavigationLink(destination: PlayerSettingsView()) {
+                            SettingsRow(icon: "play.rectangle.fill", iconColor: .accentPrimary,
+                                        title: "Player", subtitle: "Info card, rewind, gestures, multiview")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        NavigationLink(destination: MoviesTVSettingsView()) {
+                            SettingsRow(icon: "film.fill", iconColor: .accentPrimary,
+                                        title: "Movies & TV Shows", subtitle: "Library refresh, posters")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        NavigationLink(destination: DVRSettingsView()) {
+                            SettingsRow(icon: "record.circle", iconColor: .red,
+                                        title: "DVR", subtitle: "Recordings, buffers, storage")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                    } header: {
+                        Text("App")
+                            .sectionHeaderStyle()
+                    }
+                    .listRowBackground(Color.cardBackground)
+                    .listSectionSeparator(.hidden)
+
+                    // MARK: - Device
+                    Section {
+                        NavigationLink(destination: AppearanceSettingsView()) {
+                            SettingsRow(icon: "paintbrush.fill", iconColor: .accentPrimary,
+                                        title: "Appearance", subtitle: "Theme, text size, time format")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        NavigationLink(destination: GeneralSettingsView()) {
+                            SettingsRow(icon: "switch.2", iconColor: .accentPrimary,
+                                        title: "General", subtitle: "Startup, refresh, network")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        NavigationLink(destination: SyncSettingsView()) {
+                            SettingsRow(icon: "icloud.fill", iconColor: .accentPrimary,
+                                        title: "Sync", subtitle: syncValueLabel)
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                    } header: {
+                        Text("Device")
+                            .sectionHeaderStyle()
+                    }
+                    .listRowBackground(Color.cardBackground)
+                    .listSectionSeparator(.hidden)
+
+                    // MARK: - Developer & About
+                    Section {
+                        NavigationLink(destination: DeveloperSettingsView()) {
+                            SettingsRow(icon: "ladybug.fill", iconColor: .accentSecondary,
+                                        title: "Developer",
+                                        subtitle: "Debug logging & diagnostics")
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        NavigationLink(destination: AboutSettingsView()) {
+                            SettingsRow(icon: "info.circle.fill", iconColor: .accentPrimary,
+                                        title: "About", subtitle: AboutInfo.version)
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                    }
+                    .listRowBackground(Color.cardBackground)
+                    .listSectionSeparator(.hidden)
+                }
+                .listStyle(.insetGrouped)
+                .scrollContentBackground(.hidden)
+                // Phase 3 (Logan 2026-09-18): floating tab bar parity -
+                // content runs under the bar, the bar tucks away on scroll,
+                // and the last row clears it.
+                .settingsPhoneTabBarChrome()
+                // v1.6.8 fix: SwiftUI's List on Mac Catalyst (and to a
+                // lesser extent iPad) caches cell content rendering at
+                // the UIKit (UITableView) layer. When the theme
+                // changes, parent view body re-evaluation isn't enough
+                // to force every cell, particularly section headers,
+                // footers, and `SettingsRow` subtitle text, to pick
+                // up the new accent-derived `Color.textSecondary` /
+                // `.textTertiary`. Keying the List's identity on the
+                // active theme name forces a full teardown + rebuild
+                // on theme switches, guaranteeing every cell renders
+                // with the new palette. Trade-off is scroll position
+                // resets to top, which is acceptable for Settings.
+                .id("settings-list-\(theme.selectedTheme.rawValue)-\(theme.useCustomAccent ? theme.customAccentHex : "preset")")
+                // Tapping the Settings tab while already at its root scrolls
+                // the list back to the top. A pushed page pops instead - that
+                // is UIKit's own re-tap behaviour on the NavigationStack, and
+                // this arm stays out of its way by checking phonePath.
+                .onReceive(
+                    NotificationCenter.default.publisher(for: .astralTabReselected)
+                ) { note in
+                    guard (note.userInfo?["tab"] as? String) == AppTab.settings.rawValue,
+                          phonePath.isEmpty else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        rootProxy.scrollTo("settings.top", anchor: .top)
+                    }
+                }
+                .onChange(of: phoneScrollToPlaylistsToken) { _, _ in
+                    // Playlists is the first section, directly under the
+                    // top anchor.
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        rootProxy.scrollTo("settings.top", anchor: .top)
+                    }
+                }
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbarBackground(Color.appBackground, for: .navigationBar)
+            // Value-based routes exist on iPhone purely for the
+            // `astral://settings/<page>` deep link; the visible rows still
+            // push their destinations directly.
+            .navigationDestination(for: SettingsRoute.self) { route in
+                switch route {
+                case .category(.liveTV):         LiveTVSettingsView()
+                case .category(.player):         PlayerSettingsView()
+                case .category(.moviesTV):       MoviesTVSettingsView()
+                case .category(.dvr):            DVRSettingsView()
+                case .category(.appearance):     AppearanceSettingsView()
+                case .category(.general):        GeneralSettingsView()
+                case .category(.sync):           SyncSettingsView()
+                case .category(.syncCategories): SyncCategoriesSettingsView()
+                case .category(.developer):      DeveloperSettingsView()
+                case .category(.about):          AboutSettingsView()
+                case .server(let id):
+                    if let server = servers.first(where: { $0.id == id }) {
+                        ServerDetailView(server: server)
+                    }
+                // Playlists is the root itself; Remote Control is tvOS-only;
+                // Edit is a sheet here.
+                case .category(.playlists), .category(.remoteControl),
+                     .editServer:
+                    // Nothing should push these on iOS. If something does,
+                    // log it and pop straight back rather than sit on a
+                    // blank page.
+                    Color.clear.onAppear {
+                        debugLog("SettingsView: route \(route) has no iPhone screen; popping to root")
+                        phonePath = NavigationPath()
+                    }
+                }
+            }
+            .sheet(isPresented: $showAddServer) {
+                NavigationStack { AddServerView(onSave: { _ in }) }
+                    .settingsSheetLog("Add Playlist")
+                    .overlay(alignment: .top) {
+                        Capsule()
+                            .fill(.ultraThinMaterial)
+                            .frame(width: 36, height: 5)
+                            .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 0.5))
+                            .shadow(color: .black.opacity(0.25), radius: 4, y: 1)
+                            .padding(.top, 8)
+                            .allowsHitTesting(false)
+                    }
+            }
+            .alert("Delete Playlist?", isPresented: $showDeleteAlert) {
+                Button("Delete", role: .destructive) {
+                    if let server = serverToDelete {
+                        performServerCascadeDelete(server, servers: Array(servers), modelContext: modelContext)
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This will remove \"\(serverToDelete?.name ?? "this playlist")\" from the app. Your server data will not be affected.")
+            }
+            .sheet(item: $serverToEdit) { server in
+                EditServerSheet(server: server)
+            }
+    }
+
+    // MARK: - Root row values
+
+    /// The Sync row's value: the whole page is behind one row now, so the
+    /// root still says whether iCloud Sync is on.
+    private var syncValueLabel: String { iCloudSyncEnabled ? "On" : "Off" }
+
+    // MARK: - Active Server
+
+    // Callers: the tvOS row's long-press context menu, and (iOS,
+    // 2026-09-18) the radio button at the head of each playlist row.
+    // The detail page's Set Active row uses the same shared routine.
+    private func setActiveServer(_ server: ServerConnection) {
+        // Delegates to the shared routine (ServerDetailView.swift) so the
+        // root activation and the detail page's Set Active row stay in
+        // lockstep (GH #22 stop-old-source behavior included).
+        performSetActiveServer(server, servers: Array(servers), modelContext: modelContext)
+    }
+
+    // Reorder helpers removed 2026-09-18 with alphabetical
+    // presentation; `sortOrder` stays in the model and in sync.
+
+    // MARK: - iPad split root (Phase 4, plan A2)
+
+    /// Carries the current page across a single-list <-> split
+    /// transition (rotation, Split View drag, Stage Manager resize).
+    ///
+    /// `padSelection` is plain @State on SettingsView, which stays
+    /// mounted through the transition, so the sidebar selection survives
+    /// by itself. What needs help is the OTHER direction of the same
+    /// idea: when two panes collapse to one list, the page the user was
+    /// reading has to become a push, and when the list expands back it
+    /// has to become the sidebar selection again.
+    @MainActor
+    private func handleSplitChange(toSplit nowSplit: Bool) {
+        padSplitActive = nowSplit
+        let root = SettingsRoute.category(.playlists)
+        if nowSplit {
+            // List -> split. Nothing to do beyond clearing the push: the
+            // selection we are about to show is already in padSelection
+            // (seeded below on the way down, or left from the last time
+            // the window was wide).
+            phonePath = NavigationPath()
+        } else {
+            // Split -> list. Push the pane the user was on so the page
+            // does not vanish under them; Playlists IS the list root, so
+            // it pushes nothing.
+            phonePath = NavigationPath()
+            if let selection = padSelection, selection != root {
+                phonePath.append(selection)
+            }
+        }
+    }
+
+    private func padSplitRoot(availableWidth: CGFloat) -> some View {
+        // Hand-rolled split (plan A2 risk R4 fallback): NavigationSplitView
+        // on the iOS 27 SDK proposes the SCREEN width to its detail column
+        // inside a TabView, so List-backed panes overflowed the column and
+        // clipped at the right edge (verified on the iPad Pro; a frame cap
+        // and spacer centering both failed the same way). The HStack gives
+        // the detail column its true width, like the tvOS rail.
+        HStack(spacing: 0) {
+            padSidebar
+                // Phase 2: 280 pt from 600 to 839, 320 pt at 840 and up
+                // (was a flat 340). Matches the Android tablet rail.
+                .frame(width: SettingsMetrics.sidebarWidth(forAvailableWidth: availableWidth))
+            NavigationStack {
+                padDetail(for: padSelection ?? .category(.playlists))
+                    // Readable-width cap, centered, reusing the tvOS
+                    // reading column. Panes narrower than the cap simply
+                    // fill, so 600 to 839 pt is unaffected.
+                    .frame(maxWidth: SettingsMetrics.padDetailContentCap)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.appBackground.ignoresSafeArea())
+            }
+            // Rekey the stack on selection change so pages pushed from a
+            // pane (playlist detail, Sync Categories) pop when the user
+            // picks another sidebar item; otherwise the push stays on top
+            // of the swapped pane (observed on device).
+            .id(padSelection)
+        }
+        .background(Color.appBackground.ignoresSafeArea())
+        // Presentations duplicated from the iPhone chain (only one idiom
+        // branch is mounted, so they never double-present).
+        .sheet(isPresented: $showAddServer) {
+            NavigationStack { AddServerView(onSave: { _ in }) }
+        }
+        .sheet(item: $serverToEdit) { server in
+            EditServerSheet(server: server)
+        }
+        .alert("Delete Playlist?", isPresented: $showDeleteAlert) {
+            Button("Delete", role: .destructive) {
+                if let server = serverToDelete {
+                    performServerCascadeDelete(server, servers: Array(servers), modelContext: modelContext)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will remove \"\(serverToDelete?.name ?? "this playlist")\" from the app. Your server data will not be affected.")
+        }
+    }
+
+    /// Sidebar: Playlists as an ordinary item (matching the tvOS rail
+    /// ruling of 2026-08-04 and Android tablet, superseding the Rev 2
+    /// embed-playlist-rows design), then the categories in the frozen
+    /// order. Remote Control stays tvOS-only.
+    /// One sidebar row. Phase 2 (2026-09-17, Logan): the selected row is
+    /// a FAINT tonal tint, matching the Android tablet sidebar, not the
+    /// old solid accent block with white text. The fill is the live
+    /// ThemeManager accent at low opacity so it follows the chosen
+    /// theme, the title stays textPrimary and the subtitle keeps its
+    /// ordinary color, the icon is unchanged, and there is no border or
+    /// ring. Same corner radius as before.
+    private func padSidebarRow(_ dest: SettingsDestination, icon: String,
+                               iconColor: Color, title: String,
+                               subtitle: String?) -> some View {
+        let selected = padSelection == .category(dest)
+        return Button {
+            padSelection = .category(dest)
+        } label: {
+            SettingsRow(icon: icon, iconColor: iconColor,
+                        title: title, subtitle: subtitle,
+                        subtitleLineLimit: 1)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(selected ? theme.accent.opacity(Self.padSidebarSelectionOpacity)
+                                   : Color.clear))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var padSidebar: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Settings")
+                    .scaledFont(.title2.weight(.bold))
+                    .foregroundColor(.textPrimary)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 14)
+
+                padSidebarRow(.playlists, icon: "rectangle.stack.fill", iconColor: .accentPrimary,
+                              title: "Playlists",
+                              subtitle: servers.first(where: { $0.isActive })?.name)
+
+                Text("App")
+                    .scaledFont(.title3.weight(.semibold))
+                    .foregroundColor(Color.contrastText(.textSecondary))
+                    .padding(.horizontal, 14)
+                    .padding(.top, 18)
+                    .padding(.bottom, 6)
+
+                padSidebarRow(.liveTV, icon: "tv.fill", iconColor: .accentPrimary,
+                              title: "Live TV", subtitle: "Guide, groups, badges, colors")
+                padSidebarRow(.player, icon: "play.rectangle.fill", iconColor: .accentPrimary,
+                              title: "Player", subtitle: "Info card, rewind, gestures, multiview")
+                padSidebarRow(.moviesTV, icon: "film.fill", iconColor: .accentPrimary,
+                              title: "Movies & TV Shows", subtitle: "Library refresh, posters")
+                padSidebarRow(.dvr, icon: "record.circle", iconColor: .red,
+                              title: "DVR", subtitle: "Recordings, buffers, storage")
+
+                Text("Device")
+                    .scaledFont(.title3.weight(.semibold))
+                    .foregroundColor(Color.contrastText(.textSecondary))
+                    .padding(.horizontal, 14)
+                    .padding(.top, 18)
+                    .padding(.bottom, 6)
+
+                padSidebarRow(.appearance, icon: "paintbrush.fill", iconColor: .accentPrimary,
+                              title: "Appearance", subtitle: "Theme, text size, time format")
+                padSidebarRow(.general, icon: "switch.2", iconColor: .accentPrimary,
+                              title: "General", subtitle: "Startup, refresh, network")
+                padSidebarRow(.sync, icon: "icloud.fill", iconColor: .accentPrimary,
+                              title: "Sync", subtitle: syncValueLabel)
+
+                Divider()
+                    .background(Color.borderSubtle)
+                    .padding(.vertical, 12)
+
+                padSidebarRow(.developer, icon: "ladybug.fill", iconColor: .accentSecondary,
+                              title: "Developer", subtitle: "Debug logging & diagnostics")
+                padSidebarRow(.about, icon: "info.circle.fill", iconColor: .accentPrimary,
+                              title: "About", subtitle: AboutInfo.version)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 24)
+            .padding(.bottom, 24)
+        }
+        // Logan's ruling 2026-08-04: no gray panel behind the sidebar.
+        // Plain scrollable column on the app background, with a hairline
+        // break at the trailing edge marking where the sidebar ends.
+        .background(Color.appBackground)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.borderSubtle)
+                .frame(width: 1)
+                .ignoresSafeArea()
+        }
+    }
+
+    @ViewBuilder
+    private func padDetail(for route: SettingsRoute) -> some View {
+        switch route {
+        case .category(.playlists):      padPlaylistsPane
+        case .category(.liveTV):         LiveTVSettingsView()
+        case .category(.player):         PlayerSettingsView()
+        case .category(.moviesTV):       MoviesTVSettingsView()
+        case .category(.dvr):            DVRSettingsView()
+        case .category(.appearance):     AppearanceSettingsView()
+        case .category(.general):        GeneralSettingsView()
+        case .category(.sync):           SyncSettingsView()
+        case .category(.syncCategories): SyncCategoriesSettingsView()
+        case .category(.developer):      DeveloperSettingsView()
+        case .category(.about):          AboutSettingsView()
+        case .server(let id):
+            if let server = servers.first(where: { $0.id == id }) {
+                ServerDetailView(server: server)
+            } else {
+                Color.appBackground
+            }
+        case .category(.remoteControl), .editServer:
+            // RemoteControlSettingsView is tvOS-only; the pushes never
+            // target a pane.
+            Color.appBackground
+        }
+    }
+
+    /// Playlists pane: the iPhone root's playlist section as a detail
+    /// page. Rows push ServerDetailView on the detail stack.
+    private var padPlaylistsPane: some View {
+        List {
+            Section {
+                if servers.isEmpty {
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 8) {
+                            Image(systemName: "list.and.film")
+                                .scaledFont(.system(size: 28))
+                                .foregroundColor(Color.contrastText(.textTertiary))
+                            Text("No playlists added")
+                                .scaledFont(.bodyMedium.subtext())
+                                .foregroundColor(Color.contrastText(.textTertiary))
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 20)
+                    .listRowBackground(Color.cardBackground)
+                } else {
+                    ForEach(sortedServers) { server in
+                        NavigationLink(destination: ServerDetailView(server: server)) {
+                            ServerListRow(server: server,
+                                          onActivate: { setActiveServer(server) })
+                        }
+                        .buttonStyle(PressableButtonStyle())
+                        .listRowBackground(Color.cardBackground)
+                        .contextMenu {
+                            Button { serverToEdit = server } label: {
+                                Label("Edit", systemImage: "pencil")
+                            }
+                            Button(role: .destructive) {
+                                serverToDelete = server
+                                showDeleteAlert = true
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+
+                Button {
+                    showAddServer = true
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "plus.circle.fill")
+                            .scaledFont(.system(size: 20))
+                            .foregroundStyle(LinearGradient.accentGradient)
+                        Text("Add Playlist")
+                            .scaledFont(.bodyMedium)
+                            .foregroundColor(Color.contrastText(.accentPrimary))
+                    }
+                }
+                .buttonStyle(PressableButtonStyle())
+                .listRowBackground(Color.cardBackground)
+            } footer: {
+                if !servers.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        // Phase 3 item 5: same one-line hint as the phone
+                        // and the TV, and the same string as Android.
+                        Label(Self.playlistFooterHint, systemImage: "list.bullet")
+                            .scaledFont(.labelSmall.subtext())
+                            .foregroundColor(Color.contrastText(.textTertiary))
+                    }
+                    .padding(.top, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .navigationTitle("Playlists")
+        .navigationBarTitleDisplayMode(.inline)
+        // No EditButton: long-press covers edit/delete via the context
+        // menu, and the list is presented alphabetically.
+    }
+
+
+    // MARK: - tvOS Settings Layout
+
+}
+
+
+// MARK: - tvOS Settings Row Components
+
+
+/// Presents Edit Playlist through SettingsView's root `serverToEdit` sheet.
+struct EditPlaylistAction {
+    let present: (ServerConnection) -> Void
+    func callAsFunction(_ server: ServerConnection) { present(server) }
+}
+
+extension EnvironmentValues {
+    @Entry var editPlaylist: EditPlaylistAction? = nil
+}

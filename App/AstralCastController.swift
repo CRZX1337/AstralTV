@@ -1,0 +1,6369 @@
+//
+//  AstralCastController.swift
+//  Astral
+//
+//  Google Cast iOS SENDER (GH #33). iPhone/iPad only (the Cast SDK has no tvOS
+//  sender), so the whole file is #if os(iOS). Casts to the SAME receiver app id
+//  (46B79062) the Android sender uses. That id is a CUSTOM WEB RECEIVER
+//  (receiver.html on the repo's gh-pages; bare castMediaElement video, AstralTV
+//  idle screen + fading channel banner), so the load carries a directly
+//  playable contentURL. Casting rework P2: that URL is the PHONE-LOCAL cast
+//  HLS proxy's DEMUXED master playlist (http://<phone-lan-ip>:<port>/demuxed.m3u8,
+//  CastHLSProxySession), which ingests the channel's raw MPEG-TS and
+//  re-serves it as sliding-window live HLS with fMP4/CMAF segments. The
+//  previous Dispatcharr progressive-fMP4 URL stuttered every 10-15 s on the
+//  web receiver because a progressive live stream has no manifest clock; the
+//  proxy also works for NON-Dispatcharr sources. customData still carries the
+//  channel/movie IDENTITY ("astralMediaId"/"astralKind", matching the Android
+//  sender) for session resume + parity, but the WEB receiver plays contentURL.
+//
+//  Unlike Android we do NOT hand-roll discovery or a route chooser: GCKUICastButton
+//  does discovery + the device picker + session UI itself. iOS only needs the
+//  NSLocalNetworkUsageDescription + NSBonjourServices Info.plist keys.
+//
+
+import AVFoundation
+import Combine
+import Foundation
+import GoogleCast
+import Network
+import SwiftUI
+import UIKit
+import UserNotifications
+
+/// Receiver application id registered + published in the Google Cast SDK
+/// Developer Console (same id the Android sender targets).
+enum AstralCast {
+    // 46B79062 = the CURRENT console app (custom web receiver), re-registered
+    // 2026-08-05 after the 76DC0564 registration VANISHED from the console
+    // (cause unknown; Logan did not delete it - it broke cast for every user
+    // on the 1.8.4/0.4.3 builds, task #224). The original CFFD302F app was
+    // DELETED 2026-07-15 (console can't change receiver type). If this id
+    // ever changes again, also update Info.plist NSBonjourServices
+    // (_<id>._googlecast._tcp) and Android local.properties
+    // CAST_RECEIVER_APP_ID.
+    static let receiverAppID = "46B79062"
+
+    /// customData contract shared with the Android receiver.
+    static let keyMediaID = "astralMediaId"
+    static let keyKind = "astralKind"
+    static let kindLive = "live"
+    static let kindVOD = "vod"
+
+}
+
+/// Observable Cast state for the player chrome to react to.
+@MainActor
+final class AstralCastController: NSObject, ObservableObject {
+
+    static let shared = AstralCastController()
+
+    enum State: Equatable {
+        case unavailable          // no cast app id / no devices
+        case available            // devices found, not connected
+        case connecting(String?)  // device friendly name
+        case connected(String?)
+    }
+
+    enum Kind { case live, vod }
+
+    struct Content: Equatable {
+        var mediaID: String
+        var kind: Kind
+        var title: String
+        var subtitle: String?
+        var artURL: String?
+        /// The channel's raw MPEG-TS stream URL (the SAME URL the local
+        /// player would tune) plus its auth headers. P2: the web receiver
+        /// no longer gets this URL; it gets the local proxy playlist the
+        /// proxy builds FROM this ingest. nil = nothing playable (event
+        /// style channel); callers hide the cast affordance then.
+        var streamURL: URL?
+        var streamHeaders: [String: String] = [:]
+    }
+
+    @Published private(set) var state: State = .unavailable
+    /// Convenience for the player: true while a cast session is live and local
+    /// playback should be suspended.
+    var isCasting: Bool { if case .connected = state { return true } else { return false } }
+
+    /// What the TV is (or is about to be) playing. Survives the local player's
+    /// teardown so the cast-remote cover + channel flips have their anchor.
+    @Published private(set) var castingContent: Content?
+    /// What was casting when Change Cast Device was tapped; consumed by the
+    /// next beginSession so the new receiver opens on the same channel.
+    private var handoffContent: Content?
+    func rememberHandoff() { handoffContent = castingContent }
+    /// Device picked while another session was up; started when that
+    /// session reports its end.
+    private var switchTarget: GCKDevice?
+    /// Set by stopCasting() so a deliberate teardown is never reported as a
+    /// drop, even if the SDK attaches an error to it (Android parity, dce3074).
+    private var userRequestedStop = false
+    /// Captured at connect: by didEnd the session no longer exposes its
+    /// device, so reading it there yields nothing to name in the alert
+    /// (same lesson as Android's lastDeviceName, 2026-08-19).
+    private var lastDeviceName: String?
+    /// Mirrors the remote player's play/pause for the cover's transport button.
+    @Published private(set) var remoteIsPlaying = true
+
+    /// Channel name of an in-flight WEB RECEIVER channel flip: set the moment
+    /// the flip is requested and cleared when the receiver reports PLAYING
+    /// (or the flip fails / is superseded / the session ends). A web-receiver
+    /// flip is a full unload + fresh load, so the old channel disappears from
+    /// the screen while the new one warms up; the card and the controls sheet
+    /// say "Switching to <channel>" for exactly that window.
+    @Published private(set) var switchingToTitle: String?
+    /// Supersede token: every flip bumps it, and a load task whose token is
+    /// stale drops its result instead of racing the newer flip.
+    private var flipToken = 0
+    /// True once a web receiver has media loaded, so the NEXT load on this
+    /// session is a flip (tear the proxy down and load afresh) rather than the
+    /// session's first load.
+    private var webReceiverHasLoadedMedia = false
+
+    /// The cast proxy's video plan for what is casting now (the remuxer's
+    /// decision against the source SPS). Drives the transcode note on the
+    /// cast card and in Stream Info; nil until the source is read, and for
+    /// pipelines that bypass the proxy.
+    @Published private(set) var videoPlanOutcome: CastVideoPlanOutcome?
+    /// What the receiver is actually presenting, from its telemetry tick:
+    /// "1920x1080 at 60fps". nil until a PLAYING tick reports a size.
+    @Published private(set) var receiverVideoLine: String?
+    /// Last five playing-tick rates for the current size (median shown).
+    private var receiverFPSSamples: (resolution: String, values: [Double]) = ("", [])
+
+    /// Three-line note shown whenever the phone transcodes the video
+    /// (Logan 2026-09-27), in this order: the source, what this device
+    /// turns it into, and what the receiver ruled out (the list comes from
+    /// the plan's own decision). nil when no transcode runs.
+    var transcodeNote: (source: String, phone: String, receiver: String)? {
+        guard let outcome = videoPlanOutcome, let output = outcome.outputDescription,
+              let receiver = outcome.receiverLine(deviceName: connectedDeviceName) else { return nil }
+        let device = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+        return ("Source: \(outcome.sourceDescription)",
+                "Transcoding on this \(device) to \(output)",
+                receiver)
+    }
+
+    /// Equal writes still re-render every observer, and the proxy reports
+    /// once per ingest connection.
+    private func setVideoPlanOutcome(_ outcome: CastVideoPlanOutcome?) {
+        if videoPlanOutcome != outcome { videoPlanOutcome = outcome }
+    }
+
+    /// Accent status line for the cast card and the controls sheet: the flip
+    /// in progress wins over the steady "Casting to <device>".
+    func castStatusLine(deviceName: String) -> String {
+        if let switchingToTitle { return "Switching to \(switchingToTitle)" }
+        return "Casting to \(deviceName)"
+    }
+
+    /// A session connected with nothing to play: the receiver is up but the
+    /// user started the cast from the guide pill, where no channel is
+    /// playing. The cover renders a channel list instead of stranding the
+    /// receiver on its idle screen until the web receiver times out (Logan,
+    /// 2026-09-11: "launched then died instantly").
+    @Published private(set) var awaitingChannelPick = false
+    /// Last connect failure, surfaced inline on the picker row that was
+    /// tapped (no alert: the sheet is still on screen).
+    @Published var connectError: String?
+    /// Device id the picker is currently connecting to, so its row can show
+    /// a spinner and the other rows can dim.
+    @Published private(set) var connectingDeviceID: String?
+
+    private var started = false
+    private var pending: Content?
+    private var castStateObserver: NSObjectProtocol?
+
+    /// One-way diagnostic namespace: the receiver web app broadcasts a
+    /// JSON player-state snapshot on it, the sender only listens. Exists
+    /// because the receiver page's own console prints NOTHING that reaches
+    /// logcat on a Google TV Streamer, so on the 15:10:03 2026-09-12
+    /// session we could not see the buffered ranges or the seek range that
+    /// decide whether Shaka's chosen playhead is reachable. Logan's order:
+    /// "I need you to not guess. Add something in logging so you can see
+    /// it." Same namespace string on Android (core/cast/).
+    private static let receiverDebugNamespace = "urn:x-cast:com.astraltv.receiver.debug"
+    /// MEASURED receiver MSE codec support for this session, reported by the
+    /// receiver web app on `receiverDebugNamespace` (see receiver.html):
+    /// keys "ac-3", "ec-3", "mp4a.40.2", "avc1.64002A". nil until the first
+    /// caps message arrives; cleared when the session ends.
+    ///
+    /// This replaced a model allow-list that called a Google TV Streamer
+    /// AC-3 capable. The allow-list was right about the platform players and
+    /// wrong about the web receiver's MSE in the MUXED shape: the receiver's
+    /// own Chromium answered isTypeSupported("video/mp4;
+    /// codecs=\"avc1.64002A,ac-3\"") false (2026-09-12 15:52:40) and that
+    /// load died with Shaka 3015.
+    ///
+    /// As of 2026-09-13 the receiver probes the DEMUXED shape instead, which
+    /// is what this sender now loads: isTypeSupported("audio/mp4;
+    /// codecs=\"ac-3\"") is TRUE on that same Streamer, so AC-3 / E-AC-3
+    /// passes through in its own audio/mp4 SourceBuffer. The keys are
+    /// unchanged; only the MIME the receiver measures them with changed.
+    private var receiverCaps: [String: Bool]?
+    /// Last measurement logged, so the copy that rides every telemetry
+    /// snapshot does not repeat the line.
+    private var loggedCaps: [String: Bool]?
+    /// The receiver's `display` map (cast.framework canDisplayType):
+    /// h264_720p60, h264_1080p60, h264_1080p30, hevc_720p60, hevc_1080p60, hevc_4k60, h264_4k60.
+    /// nil when the page sent none (an older receiver page). Measured
+    /// 2026-09-26 on a Chromecast Ultra: h264_1080p60 false, h264_1080p30
+    /// true, every HEVC key false; that is what drives the video plan.
+    private var receiverDisplayCaps: [String: Bool]?
+    private var loggedDisplayCaps: [String: Bool]?
+
+    /// The video plan for a proxy load: receiver caps plus the Developer
+    /// switches. The remuxer applies it once it has read the source SPS
+    /// (the level, size and frame rate are not known before the ingest).
+    private func videoPlan(caps: [String: Bool]?) -> CastVideoPlan {
+        let defaults = UserDefaults.standard
+        let profile = CastTranscodeDownProfile(
+            rawValue: defaults.string(forKey: "castTranscodeDownProfile") ?? "") ?? .p720p60
+        return CastVideoPlan(
+            caps: caps.map { CastReceiverVideoCaps(mse: $0, display: receiverDisplayCaps) },
+            force: defaults.bool(forKey: "castForceHEVCTranscode"),
+            downProfile: profile)
+    }
+
+    /// True only when the receiver MEASURED AC-3 or E-AC-3 support, which it
+    /// now probes as `audio/mp4; codecs="ac-3"` (the DEMUXED shape the sender
+    /// loads) rather than the muxed `video/mp4` form that understated it. No
+    /// caps yet (a first load can race READY) reads as false, which refuses an
+    /// AC-3 channel by name rather than sending audio the receiver cannot
+    /// decode: the phone never transcodes cast audio.
+    private var receiverDecodesAC3: Bool {
+        guard let caps = receiverCaps else { return false }
+        return caps["ac-3"] == true || caps["ec-3"] == true
+    }
+
+    /// How long the audio plan waits for caps a web receiver has not
+    /// volunteered yet (an explicit request is sent first). Short: this runs in
+    /// front of the load, and the fallback is only a refusal of AC-3.
+    private static let capsRequestWaitSeconds: Double = 3
+    /// Poll interval while waiting for that answer.
+    private static let capsPollSeconds: Double = 0.1
+
+    /// Ask the receiver for a FRESH capability measurement. Sent on both
+    /// namespaces because a page old enough to answer hello without `mse` may
+    /// only listen for this on the debug channel.
+    private func requestReceiverCaps() {
+        sendControl(["cmd": "caps"])
+        guard let channel = receiverDebugChannel,
+              let data = try? JSONSerialization.data(withJSONObject: ["cmd": "caps"]),
+              let text = String(data: data, encoding: .utf8) else { return }
+        channel.sendTextMessage(text, error: nil)
+    }
+
+    /// Caps for the audio plan: what the receiver already told us, and
+    /// otherwise ASK and wait up to `capsRequestWaitSeconds` before giving up.
+    /// On a Chromecast Ultra the only caps message was the one at READY, which
+    /// this sender's channel was attached too late to see.
+    private func awaitReceiverCaps() async -> [String: Bool]? {
+        if let caps = receiverCaps { return caps }
+        requestReceiverCaps()
+        var waited: Double = 0
+        while waited < Self.capsRequestWaitSeconds {
+            try? await Task.sleep(nanoseconds: UInt64(Self.capsPollSeconds * 1_000_000_000))
+            if Task.isCancelled { return receiverCaps }
+            waited += Self.capsPollSeconds
+            if let caps = receiverCaps { return caps }
+        }
+        return nil
+    }
+
+    /// Stores the `mse` object from a receiver debug message (the dedicated
+    /// `type: "caps"` message sent on READY, and the copy that rides every
+    /// telemetry snapshot).
+    fileprivate func noteReceiverCaps(_ json: [String: Any]) {
+        func bools(_ any: Any?) -> [String: Bool]? {
+            guard let dict = any as? [String: Any], !dict.isEmpty else { return nil }
+            var parsed: [String: Bool] = [:]
+            for (key, value) in dict {
+                if let b = value as? Bool { parsed[key] = b } else if let n = value as? NSNumber { parsed[key] = n.boolValue }
+            }
+            return parsed.isEmpty ? nil : parsed
+        }
+        // The display map arrives in the same message as `mse`; parsed
+        // first so a caps wait that wakes on `receiverCaps` already sees it.
+        if let display = bools(json["display"]) {
+            receiverDisplayCaps = display
+            if loggedDisplayCaps != display {
+                loggedDisplayCaps = display
+                func cap(_ key: String) -> String { display[key].map { $0 ? "yes" : "no" } ?? "n/a" }
+                debugLog("[Cast] receiver display: h264_720p60=\(cap("h264_720p60")) "
+                    + "h264_1080p60=\(cap("h264_1080p60")) "
+                    + "h264_1080p30=\(cap("h264_1080p30")) hevc_720p60=\(cap("hevc_720p60")) "
+                    + "hevc_1080p60=\(cap("hevc_1080p60")) "
+                    + "hevc_4k60=\(cap("hevc_4k60")) h264_4k60=\(cap("h264_4k60")) "
+                    + "hevc_1080p60_hlg=\(cap("hevc_1080p60_hlg")) hevc_1080p60_pq=\(cap("hevc_1080p60_pq")) "
+                    + "hevc_4k60_hlg=\(cap("hevc_4k60_hlg")) hevc_4k60_pq=\(cap("hevc_4k60_pq"))")
+            }
+        }
+        guard let parsed = bools(json["mse"]) else { return }
+        receiverCaps = parsed
+        guard loggedCaps != parsed else { return }
+        loggedCaps = parsed
+        func cap(_ key: String) -> String { parsed[key] == true ? "yes" : "no" }
+        debugLog("[Cast] receiver caps: ac-3=\(cap("ac-3")) ec-3=\(cap("ec-3")) "
+            + "aac=\(cap("mp4a.40.2")) h264=\(cap("avc1.64002A")) "
+            + "hvc1=\(cap("hvc1")) hvc1.4k=\(cap("hvc1.4k")) hev1=\(cap("hev1")) "
+            + "hvc1.hlg=\(cap("hvc1.hlg")) hvc1.pq=\(cap("hvc1.pq"))")
+    }
+
+    /// Attached on session start, dropped on session end.
+    private var receiverDebugChannel: GCKGenericChannel?
+
+    // MARK: - Receiver type (native Android TV app vs web receiver)
+
+    /// Custom control namespace shared with the Android app (core/cast/CastControl).
+    /// Used here for two things only: the receiver-type handshake and the
+    /// in-place channel flip a running Cast Connect receiver needs.
+    private static let controlNamespace = "urn:x-cast:com.astraltv.control"
+
+    /// Which receiver this session is talking to.
+    ///
+    /// The Cast SDK decides whether Cast Connect launched the native Android TV
+    /// app or the web receiver, but it exposes that decision nowhere public
+    /// (neither GCKCastSession nor its application metadata carries it). So the
+    /// sender asks the RECEIVER: it sends `hello` on connect and only the AstralTV
+    /// Android TV receiver answers `receiverInfo` / platform=android-tv-app. No
+    /// answer inside `targetProbeSeconds` means the web receiver, which needs the
+    /// phone-local HLS proxy and a directly playable contentURL.
+    enum ReceiverTarget { case unknown, androidTVApp, webReceiver }
+
+    /// Published so the Options sheet can grey out the receiver-control rows
+    /// the web receiver page does not implement.
+    @Published private(set) var receiverTarget: ReceiverTarget = .unknown
+    /// The Android TV receiver's option snapshot (tracks, speed, scale, audio
+    /// only), the same CMD_STATE frame the Android sender and the companion
+    /// remote decode, so all three pickers read one wire shape.
+    @Published private(set) var remoteState = CompanionClient.RemoteState()
+    private var controlChannel: GCKGenericChannel?
+    private var targetProbeTask: Task<Void, Never>?
+    /// The AstralTV Android TV receiver said `"multiview": true` in its
+    /// receiverInfo answer: it handles `multiview.open` (Logan 2026-10-06).
+    /// The web receiver cannot run Multiview, and an older TV app does not
+    /// say it, so both leave this false and the sheet offers Play Here only.
+    @Published private(set) var receiverMultiviewCapable = false
+    /// The Multiview the AstralTV Android TV app is running over Cast Connect,
+    /// as its `multiview.state` pushes report it; nil when none (Logan
+    /// 2026-10-08). The remote-session card and sheet show it instead of the
+    /// last single channel.
+    @Published private(set) var nativeMultiview: NativeMultiviewState?
+    /// A live load held until the receiver type is known. Guessing is not an
+    /// option in either direction: guessing web starts a proxy plus a server
+    /// transcode for a TV that can play the raw TS natively, and guessing native
+    /// black-screens a dongle.
+    private var deferredLoad: Content?
+    /// Last resort only: BOTH receivers answer the probe now (the web
+    /// receiver.html answers platform=web-receiver as of 2026-09-13), so the
+    /// timeout exists for a receiver too old to answer at all. It is long because
+    /// the only thing it has to outlast is a Cast Connect cold start of the
+    /// Android TV app on a slow device, and while it runs the UI stays in the
+    /// state a load-in-flight already shows rather than guessing a path.
+    private static let targetProbeSeconds: Double = 12
+    /// Re-send interval for the probe inside that window: the Cast Connect
+    /// receiver's message listener does not exist until its process has started,
+    /// so a single probe sent at connect can simply be dropped.
+    private static let probeRetrySeconds: Double = 1
+
+    /// Send `hello` (repeatedly) until a receiver names itself, or the window ends.
+    private func probeReceiverTarget() {
+        receiverTarget = .unknown
+        receiverMultiviewCapable = false
+        targetProbeTask?.cancel()
+        targetProbeTask = Task { @MainActor [weak self] in
+            var waited: Double = 0
+            while let self, self.receiverTarget == .unknown, waited < Self.targetProbeSeconds {
+                self.sendControl(["cmd": "hello"])
+                try? await Task.sleep(nanoseconds: UInt64(Self.probeRetrySeconds * 1_000_000_000))
+                if Task.isCancelled { return }
+                waited += Self.probeRetrySeconds
+            }
+            guard let self, !Task.isCancelled, self.receiverTarget == .unknown else { return }
+            debugLog("[Cast] receiver type handshake timed out after "
+                + "\(Int(Self.targetProbeSeconds))s with no answer")
+            self.resolveReceiverTarget(.webReceiver, answered: false)
+        }
+    }
+
+    /// Apply a receiver's own answer. An unrecognised platform is left unknown so
+    /// the timeout decides rather than a bad guess.
+    private func noteReceiverInfo(_ json: [String: Any]) {
+        // 2026-09-13 (Chromecast Ultra, log 02:38:56-02:39:02): the web receiver
+        // sent its caps ONCE at READY on the debug namespace, and this sender
+        // attached that channel after READY, so the audio plan ran with "caps
+        // not received, assuming no AC-3" and refused the stream. The hello
+        // reply is the one message always read before the plan, so the
+        // measurement now rides along with it.
+        noteReceiverCaps(json)
+        let mv = (json["platform"] as? String) == "android-tv-app"
+            && (json["multiview"] as? Bool ?? false)
+        if mv != receiverMultiviewCapable {
+            receiverMultiviewCapable = mv
+            debugLog("[MV-CAST] receiver multiview capable=\(mv)")
+        }
+        // A sender that joins while the TV already runs a Multiview asks for
+        // it, so the card shows it at once.
+        if mv { sendControl(MultiviewRemoteCommand.frame(MultiviewRemoteCommand.getState)) }
+        switch json["platform"] as? String {
+        case "android-tv-app": resolveReceiverTarget(.androidTVApp)
+        case "web-receiver": resolveReceiverTarget(.webReceiver)
+        default: break
+        }
+    }
+
+    /// Latch the receiver type, log WHICH of the three outcomes happened, and
+    /// release any held load.
+    private func resolveReceiverTarget(_ target: ReceiverTarget, answered: Bool = true) {
+        // The web receiver answering hello means the AstralTV TV app is no
+        // longer what Cast Connect launches here (uninstalled, measured
+        // 2026-09-27), so the picker must stop listing it as AstralTV on TV.
+        // Ahead of the latch: the answer can land after a handshake timeout
+        // already chose the web receiver.
+        if target == .webReceiver, answered,
+           let id = GCKCastContext.sharedInstance().sessionManager.currentCastSession?.device.deviceID {
+            CastNativeDeviceRegistry.shared.forget(id)
+        }
+        guard receiverTarget != target else { return }
+        receiverTarget = target
+        if target == .androidTVApp {
+            // Remember this device as one that runs the AstralTV Android TV app,
+            // so the picker can list it under "AstralTV on TV" next time.
+            if let id = GCKCastContext.sharedInstance()
+                .sessionManager.currentCastSession?.device.deviceID {
+                CastNativeDeviceRegistry.shared.markNative(id)
+            }
+            debugLog("[Cast] target=android-tv-app, native playback (receiver answered)")
+        } else if answered {
+            debugLog("[Cast] target=web-receiver (receiver answered)")
+        } else {
+            debugLog("[Cast] target=web-receiver (no answer, handshake timed out)")
+        }
+        if let held = deferredLoad {
+            deferredLoad = nil
+            if let session = GCKCastContext.sharedInstance().sessionManager.currentCastSession {
+                load(held, on: session)
+            }
+        }
+    }
+
+    // Receiver controls, same frames as the Android sender's setRemote* calls
+    // (CastControl.kt): only the AstralTV Android TV receiver acts on them;
+    // the web receiver page drops any cmd it does not know.
+    func requestRemoteState() { sendControl(["cmd": "getState"]) }
+    func setRemoteAudioTrack(_ id: String) { sendControl(["cmd": "setAudio", "id": id]) }
+    /// nil selects Off; the receiver reads an empty id as "no subtitles".
+    func setRemoteTextTrack(_ id: String?) { sendControl(["cmd": "setText", "id": id ?? ""]) }
+    func setRemoteSpeed(_ speed: Double) { sendControl(["cmd": "setSpeed", "speed": speed]) }
+    func setRemoteAspect(_ key: String) { sendControl(["cmd": "setAspect", "aspect": key]) }
+    func setRemoteAudioOnly(_ on: Bool) { sendControl(["cmd": "setAudioOnly", "audioOnly": on]) }
+
+    /// True when "Play on <device>" can open Multiview on the Cast receiver:
+    /// Cast Connect launched the AstralTV Android TV app and it advertised
+    /// Multiview. The web receiver gets the phone-side composite instead
+    /// (MultiviewCompositeSession).
+    var canOpenMultiviewOnReceiver: Bool {
+        isCasting && receiverTarget == .androidTVApp && receiverMultiviewCapable
+    }
+
+    /// Open Multiview on the AstralTV Android TV app with these channels, in
+    /// order (Logan 2026-10-06). Same frame as the AstralTV Remote one:
+    /// {"cmd":"multiview.open","type":"multiview.open","channels":[{"channelId":
+    /// "disp:<uuid>","playlistId":"<id>"}],"focus":0}. Channels with no
+    /// Dispatcharr id are skipped (the TV cannot resolve them). Capped at 9.
+    @discardableResult
+    func openMultiviewOnReceiver(_ channels: [ChannelDisplayItem], focus: Int) -> Bool {
+        let frame = MultiviewRemoteCommand.openFrame(channels, focus: focus)
+        let n = (frame["channels"] as? [Any])?.count ?? 0
+        guard n > 0 else {
+            surfaceCastFailure("The AstralTV app on this TV cannot look up these channels. "
+                + "Only Dispatcharr channels can open in Multiview there.")
+            debugLog("[MV-CAST] multiview.open not sent: no Dispatcharr ids")
+            return false
+        }
+        sendControl(frame)
+        debugLog("[MV-CAST] sent multiview.open to \(connectedDeviceName ?? "TV") channels=\(n)")
+        return true
+    }
+
+    /// Give the audio to tile `index` of the TV's Multiview (Cast Connect).
+    func setNativeMultiviewFocus(_ index: Int) {
+        guard var mv = nativeMultiview, mv.channels.indices.contains(index), index != mv.focus else { return }
+        debugLog("[MV-CAST] sent multiview.focus focus=\(index)")
+        mv.focus = index
+        nativeMultiview = mv  // optimistic; the TV's state push confirms
+        sendControl(MultiviewRemoteCommand.frame(MultiviewRemoteCommand.focus, ["focus": index]))
+    }
+
+    /// Set the TV's Multiview layout.
+    func setNativeMultiviewLayout(_ mode: MultiviewLayoutMode) {
+        guard var mv = nativeMultiview, mode != mv.layout else { return }
+        debugLog("[MV-CAST] sent multiview.layout layout=\(mode.rawValue)")
+        mv.layout = mode
+        nativeMultiview = mv
+        sendControl(MultiviewRemoteCommand.frame(MultiviewRemoteCommand.layout, ["layout": mode.rawValue]))
+    }
+
+    /// Stop Casting on a Cast Connect Multiview: the TV leaves Multiview for
+    /// its own UI before the session ends.
+    func stopNativeMultiview() {
+        debugLog("[MV-CAST] sent multiview.stop")
+        nativeMultiview = nil
+        sendControl(MultiviewRemoteCommand.frame(MultiviewRemoteCommand.stop))
+        stopCasting()
+    }
+
+    /// Fire-and-forget JSON on the control namespace. No-op with no channel.
+    private func sendControl(_ dict: [String: Any]) {
+        guard let channel = controlChannel,
+              let data = try? JSONSerialization.data(withJSONObject: dict),
+              let text = String(data: data, encoding: .utf8) else { return }
+        // Logged so a Speed / Video Scale / Audio Only change can be matched
+        // against the receiver's next state reply when verifying on device.
+        debugLog("[Cast] control -> \(text)")
+        channel.sendTextMessage(text, error: nil)
+    }
+
+    /// Initialise GCKCastContext once. Call from app launch on the main thread.
+    func start() {
+        guard !started else { return }
+        let criteria = GCKDiscoveryCriteria(applicationID: AstralCast.receiverAppID)
+        let options = GCKCastOptions(discoveryCriteria: criteria)
+        // P2: the phone IS the receiver's media server (local HLS proxy),
+        // so the session must survive backgrounding; suspending it would
+        // freeze the TV the moment the user pockets the phone. The
+        // proxy's own keepalive rides the audio background mode via
+        // AudioSessionRefCount (see CastHLSProxySession).
+        options.suspendSessionsWhenBackgrounded = false
+        // The SDK defaults to deferring ALL discovery until the user taps a
+        // GCKUICastButton for the first time. Task #225 replaced that button
+        // with the app's own sectioned picker, so the tap never happens,
+        // discovery never starts, castState stays noDevicesAvailable, and the
+        // picker's Google Cast section (gated on that state) can never appear
+        // to start discovery manually. Device-verified on Logan's iPhone:
+        // zero Cast devices listed even for the default media receiver ID
+        // until this flag went false.
+        options.startDiscoveryAfterFirstTapOnCastButton = false
+        // Cast Connect ON (Logan 2026-09-13), measured basis: the Cast web
+        // receiver's Chromium renderer presents only about 46 fps with
+        // double-vsync intervals on a Google TV Streamer at 720p60 and 1080p60,
+        // a ceiling every web-receiver app shares, while the native AstralTV
+        // Android TV app renders a full 60 fps. With this flag the framework
+        // launches that native app on any Android TV target that has AstralTV
+        // installed, and the TV tunes the channel ITSELF (no phone proxy,
+        // AC-3 passthrough as in normal playback).
+        // Targets without the app (legacy dongles, Nest displays) fall back to
+        // the web receiver on their own and keep the local HLS proxy path.
+        // No credentials: the Android TV receiver authenticates nothing; it
+        // validates the load against its own playlist and effective base.
+        let launchOptions = GCKLaunchOptions()
+        launchOptions.androidReceiverCompatible = true
+        options.launchOptions = launchOptions
+        GCKCastContext.setSharedInstanceWith(options)
+        GCKCastContext.sharedInstance().sessionManager.add(self)
+        // The flag above only makes discovery ELIGIBLE to run without a
+        // GCKUICastButton; it does not by itself put a scanner on the wire.
+        // Nothing else asked for discovery at launch (the only startDiscovery()
+        // call lived in the in-player picker's CastDeviceList), so start it here
+        // for app lifetime, exactly like the companion mDNS browser. This is
+        // also what triggers the SDK's local-network permission use.
+        let discovery = GCKCastContext.sharedInstance().discoveryManager
+        discovery.add(self)
+        discovery.startDiscovery()
+        debugLog("[Cast] context configured appId=\(AstralCast.receiverAppID), discovery state=\(discovery.discoveryState.rawValue), devices=\(discovery.deviceCount)")
+        // SDK 4.x has no GCKCastStateListener; cast availability changes arrive
+        // via kGCKCastStateDidChangeNotification. The session listener below is
+        // still the authority on the connected/connecting transitions.
+        castStateObserver = NotificationCenter.default.addObserver(
+            forName: .gckCastStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.syncCastState(GCKCastContext.sharedInstance().castState)
+            }
+        }
+        // Task #267: while casting, a confirmed Dispatcharr Switch Stream
+        // (SwitchStreamView, opened from the cast Options sheet) posts the
+        // same reprime the local player uses; here it re-tunes the proxy.
+        // The local player is torn down while casting, so this observer is
+        // the only live consumer.
+        NotificationCenter.default.addObserver(
+            forName: .switchStreamReprime,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let uuid = note.userInfo?["uuid"] as? String
+            Task { @MainActor in self?.handleSwitchStreamReprime(uuid: uuid) }
+        }
+        started = true
+        syncCastState(GCKCastContext.sharedInstance().castState)
+    }
+
+    /// Set (or clear) the content mirrored to the cast device. Loads immediately
+    /// if a session is connected; otherwise held until one connects.
+    func setContent(_ content: Content?) {
+        pending = content
+        castingContent = content
+        if let content, let session = GCKCastContext.sharedInstance().sessionManager.currentCastSession {
+            load(content, on: session)
+        }
+        syncNowPlayingCard()
+    }
+
+    /// Lock-screen / Control Center card while casting. The local player is
+    /// torn down during a cast, so NowPlayingBridge is free; publishing here
+    /// gives the backgrounded phone honest visible UI for why it is awake
+    /// (the silent-render keepalive) plus play/pause without unlocking.
+    /// Channel up/down stay on the in-app cover: the bridge's transport is
+    /// play/pause/seek only, matching the web receiver's control surface.
+    func syncNowPlayingCard() {
+        if case .connected = state, let content = castingContent,
+           content.mediaID == MultiviewCompositeSession.castMediaID {
+            syncCompositeNowPlayingCard()
+            return
+        }
+        compositeNowPlayingTimer?.invalidate()
+        compositeNowPlayingTimer = nil
+        compositeNowPlayingSignature = nil
+        guard case .connected = state, let content = castingContent,
+              let item = ChannelStore.shared.channels.first(where: { $0.id == content.mediaID })
+        else {
+            if isCasting == false { NowPlayingBridge.shared.teardown() }
+            return
+        }
+        NowPlayingBridge.shared.configure(
+            for: item,
+            isLive: true,
+            onPlay: {
+                GCKCastContext.sharedInstance().sessionManager
+                    .currentCastSession?.remoteMediaClient?.play()
+            },
+            onPause: {
+                GCKCastContext.sharedInstance().sessionManager
+                    .currentCastSession?.remoteMediaClient?.pause()
+            },
+            onSeek: nil
+        )
+    }
+
+    private var compositeNowPlayingTimer: Timer?
+    private var compositeNowPlayingSignature: String?
+
+    /// Composited Multiview cast (Logan 2026-10-08, Android parity): title
+    /// "Multiview", subtitle the audio-focused tile's channel, the third line
+    /// that channel's current program, artwork that channel's logo, and the
+    /// program's timeline. A composite down to one tile reads as that
+    /// channel, like the remote card. Re-run on a focus change, a tile set
+    /// change and each minute (program rollover); republished only when what
+    /// it shows changed.
+    private func syncCompositeNowPlayingCard() {
+        if compositeNowPlayingTimer == nil {
+            compositeNowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+                Task { @MainActor in AstralCastController.shared.syncNowPlayingCard() }
+            }
+        }
+        let store = MultiviewStore.shared
+        let tiles = store.tiles
+        guard let tile = tiles.first(where: { $0.id == store.audioTileID }) ?? tiles.first else { return }
+        let item = ChannelStore.shared.channels.first(where: { $0.id == tile.item.id }) ?? tile.item
+        let trimmed = item.currentProgram?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let program: String? = trimmed.isEmpty ? nil : trimmed
+        let single = MultiviewCompositeSession.shared.singleChannelName != nil
+        let title = single ? item.name : "Multiview"
+        let subtitle = single ? program : item.name
+        let programLine = single ? nil : program
+        let signature = [title, subtitle ?? "", programLine ?? "", item.logoURL?.absoluteString ?? "",
+                         item.currentProgramStart.map { "\($0.timeIntervalSince1970)" } ?? ""].joined(separator: "|")
+        guard signature != compositeNowPlayingSignature else { return }
+        compositeNowPlayingSignature = signature
+        debugLog("[MV-CAST] now playing title=\(title) subtitle=\(subtitle ?? "-") program=\(programLine ?? "-")")
+        NowPlayingBridge.shared.configure(
+            title: title,
+            subtitle: subtitle,
+            artworkURL: item.logoURL,
+            duration: nil,
+            isLive: true,
+            programStart: item.currentProgramStart,
+            programEnd: item.currentProgramEnd,
+            onPlay: {
+                GCKCastContext.sharedInstance().sessionManager
+                    .currentCastSession?.remoteMediaClient?.play()
+            },
+            onPause: {
+                GCKCastContext.sharedInstance().sessionManager
+                    .currentCastSession?.remoteMediaClient?.pause()
+            },
+            onSeek: nil,
+            programLine: programLine
+        )
+    }
+
+    /// End the current cast session (returns playback to the phone).
+    ///
+    /// The media session is stopped FIRST, and only then is the Cast session
+    /// ended. Ending the session alone tears the receiver app down out from
+    /// under a playing HTMLMediaElement: the Google TV Streamer log for the
+    /// card's X (2026-09-12 02:29:26) shows CastV2.Receiver.Stop.In and
+    /// "Stopping app" with no media request of type STOP anywhere in the
+    /// session, and the audio outlived the video surface long enough for
+    /// Logan to hear it ("audio kept playing in the background"). A MEDIA
+    /// STOP makes the receiver unload the element and release its decoders
+    /// in the normal order before the app goes away.
+    func stopCasting() {
+        // Parity with Android's graceful latch (commit dce3074): GCK documents
+        // a nil error for intentional ends, but our own stops are latched too
+        // so a deliberate teardown can never masquerade as a drop.
+        userRequestedStop = true
+        MultiviewCompositeSession.shared.stop(detail: "cast stopped")
+        // Best effort and deliberately not awaited: the session teardown below
+        // must happen even if the receiver never answers, and a wedged
+        // receiver is exactly when the user reaches for the X.
+        GCKCastContext.sharedInstance().sessionManager
+            .currentCastSession?.remoteMediaClient?.stop()
+        GCKCastContext.sharedInstance().sessionManager.endSessionAndStopCasting(true)
+    }
+
+    /// Stop Casting from the sheet: stop the receiver's media and the phone
+    /// side (composite, proxy) but KEEP the Cast session, so the card drops
+    /// to its idle "Select a Channel" state and the next pick plays on the
+    /// TV without reconnecting. Android parity (Logan 2026-10-11): the
+    /// card's X still disconnects (stopCasting).
+    func stopPlaybackKeepingSession() {
+        debugLog("[Cast] stop: playback ended, session kept (idle card)")
+        staleCheckTask?.cancel()
+        staleWatchTask?.cancel()
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepEndsAt = nil
+        switchingToTitle = nil
+        webReceiverHasLoadedMedia = false
+        // The proxy's own terminal hook would read the stop as an ingest
+        // failure and end the session; detach it first.
+        CastHLSProxySession.shared.onTerminalAfterReady = nil
+        MultiviewCompositeSession.shared.stop(detail: "cast stopped")
+        GCKCastContext.sharedInstance().sessionManager
+            .currentCastSession?.remoteMediaClient?.stop()
+        Task.detached { CastHLSProxySession.shared.stop() }
+        castingContent = nil
+        remoteIsPlaying = false
+    }
+
+    /// Remote transport for the cast-remote cover. The web receiver has no
+    /// custom control channel; plain RemoteMediaClient play/pause is the whole
+    /// basic-cast transport surface (device-verified on Android 2026-07-15).
+    func remoteTogglePlayPause() {
+        guard let client = GCKCastContext.sharedInstance()
+            .sessionManager.currentCastSession?.remoteMediaClient else { return }
+        if client.mediaStatus?.playerState == .paused {
+            client.play()
+        } else {
+            client.pause()
+        }
+    }
+
+    /// Back / Forward from the remote session sheet: a RELATIVE seek on the
+    /// receiver's media session (GCKMediaSeekOptions.relative). The web
+    /// receiver's player clamps it to its live seek range; with no seekable
+    /// window the receiver ignores it.
+    func remoteSeek(by seconds: Double) {
+        guard let client = GCKCastContext.sharedInstance()
+            .sessionManager.currentCastSession?.remoteMediaClient else { return }
+        let options = GCKMediaSeekOptions()
+        options.interval = seconds
+        options.relative = true
+        debugLog("[Cast] remote seek \(seconds)s")
+        client.seek(with: options)
+    }
+
+    /// Timeline scrub release on the remote session sheet: the same
+    /// RemoteMediaClient seek the Back / Forward buttons send, to an
+    /// ABSOLUTE stream position (seconds).
+    func remoteSeek(to seconds: Double) {
+        guard let client = GCKCastContext.sharedInstance()
+            .sessionManager.currentCastSession?.remoteMediaClient else { return }
+        let options = GCKMediaSeekOptions()
+        options.interval = max(0, seconds)
+        options.relative = false
+        debugLog("[Cast] scrub seek to \(Int(max(0, seconds)))s")
+        client.seek(with: options)
+    }
+
+    /// Seekable window for the remote sheet's timeline scrub, in receiver
+    /// stream-position seconds. Live: the reported live seekable range.
+    /// Buffered (VOD, catch-up, DVR): 0 to the stream duration. nil when
+    /// the receiver reports neither (plain live): the bar stays read-only.
+    func remoteSeekWindow() -> RemoteSeekWindow? {
+        guard let client = GCKCastContext.sharedInstance()
+            .sessionManager.currentCastSession?.remoteMediaClient,
+              let status = client.mediaStatus else { return nil }
+        let pos = client.approximateStreamPosition()
+        if let range = status.liveSeekableRange {
+            let lo = min(range.startTime, range.endTime)
+            let hi = max(range.startTime, range.endTime)
+            guard lo.isFinite, hi.isFinite, hi - lo >= 1 else { return nil }
+            return RemoteSeekWindow(start: lo, end: hi, position: min(max(pos, lo), hi), isLive: true)
+        }
+        let dur = status.mediaInformation?.streamDuration ?? 0
+        guard dur.isFinite, dur > 0, status.mediaInformation?.streamType != .live else { return nil }
+        return RemoteSeekWindow(start: 0, end: dur, position: min(max(pos, 0), dur), isLive: false)
+    }
+
+    // MARK: - Composite catch-up: receiver lag and live-edge nudge (rounds 6 and 7)
+
+    /// A Multiview focus or layout change is on the composite within a
+    /// frame, but the TV shows it only when the receiver's playhead reaches
+    /// the frames drawn after it.
+    ///
+    /// Device log 2026-10-07 round 7 (15:43 to 15:47, Travel Chromecast):
+    /// the web receiver took the composite profile (profile=composite,
+    /// seekWhy "profile composite behind3", TARGETDURATION 1, HOLD-BACK 3)
+    /// and joined at t=7.549, but then buffered for 9.2 s (bufTime=9.21)
+    /// before it played at 15:43:37.9. It never moved forward again, so it
+    /// played 12.3 to 12.4 s behind the composite live point for the whole
+    /// session (every `composite focus` line), which is the 11 to 12 s
+    /// Logan timed. The round 6 nudge never fired on the first two focus
+    /// changes because it judged the lag by the SDK's cached
+    /// liveSeekableRange, which was stale (seekable end 7.363 at t=30.4
+    /// and t=58.0, from the load-time status): "behind" came out negative.
+    ///
+    /// Now the receiver's live seek end is computed from the proxy itself:
+    /// the newest published composite segment's end minus the composite
+    /// HOLD-BACK, the same point the receiver's player clamps to (receiver
+    /// seek=[..-22.384] against a newest segment ending at 25.36, 15:43:43).
+    /// The nudge runs once when the receiver first plays after a composite
+    /// load (the startup buffering is where the 9 s were lost), and on
+    /// every focus and layout change.
+    ///
+    /// Round 8 (device log 2026-10-07 16:36 to 16:41, receiver gh-pages
+    /// 0ba57941 with rebufferingGoal 1, bufferingGoal 3): the receiver
+    /// joined and stayed 3.7 to 4.0 s behind the live seek end (startup
+    /// 16:36:47.157 behind=3.7 s, focus 16:38:29.851 behind=4.0 s, layout
+    /// 16:39:04.444 behind=3.9 s, 16:39:51.436 behind=3.8 s), so the TV ran
+    /// 6.9 to 7.2 s behind the composite live point ("receiver lag"), the
+    /// 7 s Logan timed, and the old 6 s threshold never nudged. The
+    /// receiver's own status says why: its playhead sits about 3 s below
+    /// its seekable end (t=110.609, seek end 113.566 at 16:38:30.181), the
+    /// receiver page's composite "behind 3" start target taken from a seek
+    /// end that already sits the presentation delay behind the newest
+    /// segment. With a 1 s re-buffering goal a seek now settles about 1 s
+    /// after it lands (it was 3.5 s on Shaka's defaults, round 7), so the
+    /// nudge fires above 2 s and aims 0.5 s inside the seek end: the
+    /// startup catch-up brings the TV to about 4 s behind the composite
+    /// and later focus changes find it under the threshold (no re-seek).
+    static let compositeNudgeThresholdSeconds: Double = 2.0
+    /// Where the nudge aims: just inside the live seek end.
+    static let compositeNudgeMarginSeconds: Double = 0.5
+    /// The composite playlists' HOLD-BACK: three targets of the composite
+    /// profile's nearest-second TARGETDURATION of 1 (CastSegmentProfile).
+    static let compositeHoldBackSeconds: Double = 3.0
+    private var compositeNudgeCheck: Task<Void, Never>?
+    /// Set at each composite load; the first playing tick clears it and
+    /// runs the startup catch-up.
+    private var compositeStartupCatchUpPending = false
+
+    /// Called by MultiviewCompositeSession on every composite focus change
+    /// while the composite is cast.
+    func compositeFocusChanged(tileID: String) {
+        syncNowPlayingCard()
+        compositeCatchUp(reason: "focus \(tileID)")
+    }
+
+    /// Called by MultiviewCompositeSession on a Layout row change while the
+    /// composite is cast: the new layout reaches the TV after the same lag.
+    func compositeLayoutChanged(_ mode: String) {
+        compositeCatchUp(reason: "layout \(mode)")
+    }
+
+    /// Receiver status tick (custom channel): the first playing tick after
+    /// a composite load runs the startup catch-up.
+    private func noteCompositeReceiverTick(_ json: [String: Any]) {
+        guard compositeStartupCatchUpPending,
+              castingContent?.mediaID == MultiviewCompositeSession.castMediaID,
+              json["state"] as? String == "PLAYING",
+              (json["rate"] as? NSNumber)?.doubleValue == 1,
+              (json["elPaused"] as? NSNumber)?.intValue ?? 0 == 0 else { return }
+        compositeStartupCatchUpPending = false
+        Task { @MainActor [weak self] in
+            // Let the SDK's media status catch up with the play.
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            self?.compositeCatchUp(reason: "startup")
+        }
+    }
+
+    /// Logs the receiver's lag behind the composite live point and seeks a
+    /// web receiver that is more than the threshold behind its live seek end.
+    private func compositeCatchUp(reason: String) {
+        guard isCasting, castingContent?.mediaID == MultiviewCompositeSession.castMediaID,
+              let client = GCKCastContext.sharedInstance().sessionManager.currentCastSession?.remoteMediaClient
+        else { return }
+        // Receiver state as of the tap, before the proxy hop.
+        let pos = client.approximateStreamPosition()
+        let cachedEnd = client.mediaStatus?.liveSeekableRange.map { max($0.startTime, $0.endTime) }
+        let target = receiverTarget
+        Task { @MainActor [weak self] in
+            let proxy = await Self.proxyLiveEdge()
+            guard let self, self.isCasting,
+                  self.castingContent?.mediaID == MultiviewCompositeSession.castMediaID,
+                  let client = GCKCastContext.sharedInstance().sessionManager.currentCastSession?.remoteMediaClient
+            else { return }
+            let lag = Self.compositeLagLine(position: pos, edge: proxy.edge, loadedGeneration: proxy.loadedGeneration)
+            // The receiver's live seek end on its own timeline: only stated
+            // when the receiver plays the proxy's current generation.
+            let seekEnd: Double? = proxy.edge.flatMap { e in
+                e.generation == proxy.loadedGeneration
+                    ? e.seconds - e.sinceLastSegment - Self.compositeHoldBackSeconds : nil
+            }
+            let behind = seekEnd.map { $0 - pos }
+            debugLog("[Cast] composite \(reason): receiver t=\(String(format: "%.3f", pos)) "
+                + "live seek end=\(seekEnd.map { String(format: "%.3f", $0) } ?? "n/a") (newest segment end - HOLD-BACK \(Self.compositeHoldBackSeconds) s; "
+                + "SDK cached \(cachedEnd.map { String(format: "%.3f", $0) } ?? "none")) "
+                + "behind=\(behind.map { String(format: "%.1f s", $0) } ?? "n/a"); \(lag)")
+            guard target == .webReceiver, let seekEnd, let behind, seekEnd.isFinite,
+                  behind > Self.compositeNudgeThresholdSeconds else { return }
+            let aim = max(pos, seekEnd - Self.compositeNudgeMarginSeconds)
+            let options = GCKMediaSeekOptions()
+            options.interval = aim
+            options.relative = false
+            debugLog(String(format: "[Cast] composite nudge (%@): seek t=%.3f -> %.3f (live seek end %.3f, %.1f s behind > %.1f s)",
+                            reason, pos, aim, seekEnd, behind, Self.compositeNudgeThresholdSeconds))
+            client.seek(with: options)
+            self.compositeNudgeCheck?.cancel()
+            self.compositeNudgeCheck = Task { @MainActor [weak self] in
+                // The result as hard data: where the receiver is 6 s later
+                // (the round 7 nudge re-buffered for 3.5 s).
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                guard !Task.isCancelled, let self, self.isCasting,
+                      let c = GCKCastContext.sharedInstance().sessionManager.currentCastSession?.remoteMediaClient
+                else { return }
+                let p = c.approximateStreamPosition()
+                let state = c.mediaStatus?.playerState.rawValue ?? -1
+                let after = await Self.proxyLiveEdge()
+                let lagAfter = Self.compositeLagLine(position: p, edge: after.edge,
+                                                     loadedGeneration: after.loadedGeneration)
+                debugLog("[Cast] composite nudge result (\(reason)): receiver t=\(String(format: "%.3f", p)) "
+                    + "playerState=\(state) (moved \(String(format: "%+.1f", p - pos)) s in 6 s wall); \(lagAfter)")
+            }
+        }
+    }
+
+    /// The proxy's composite live point and the generation the receiver was
+    /// loaded on, read off the main actor (both are bounded queue hops).
+    nonisolated private static func proxyLiveEdge() async
+        -> (edge: (generation: Int, seconds: Double, sinceLastSegment: Double)?, loadedGeneration: Int?) {
+        let task = Task<((generation: Int, seconds: Double, sinceLastSegment: Double)?, Int?), Never>
+            .detached(priority: .userInitiated) {
+                (CastHLSProxySession.shared.liveEdgeEstimate(),
+                 CastHLSProxySession.shared.receiverRequestCounts()?.generation)
+            }
+        let (edge, gen) = await task.value
+        return (edge, gen)
+    }
+
+    /// "lag behind the composite live point" for a receiver position, or
+    /// why it cannot be stated (the receiver's t is on the media timeline
+    /// of the generation it was loaded on).
+    nonisolated private static func compositeLagLine(position: Double,
+                                                     edge: (generation: Int, seconds: Double, sinceLastSegment: Double)?,
+                                                     loadedGeneration: Int?) -> String {
+        guard let edge else { return "composite live point unknown" }
+        guard edge.generation == loadedGeneration else {
+            return "composite live point t=\(String(format: "%.3f", edge.seconds)) on gen \(edge.generation), "
+                + "receiver loaded gen \(loadedGeneration.map(String.init) ?? "?"): lag n/a"
+        }
+        return String(format: "composite live point t=%.3f (last cut %.1f s ago): receiver lag %.1f s",
+                      edge.seconds, edge.sinceLastSegment, edge.seconds - position)
+    }
+
+    /// Friendly name of the connected cast device, for the cover header.
+    var connectedDeviceName: String? {
+        if case .connected(let name) = state { return name }
+        return nil
+    }
+
+    /// Channel up/down from the cast cover. On the web receiver every flip
+    /// is a FULL restart: the proxy session is stopped and a new one starts
+    /// on the new channel, and the receiver gets a brand new load. Walks
+    /// ChannelStore's full list,
+    /// skipping channels with no stream URL at all.
+    func castChannel(_ delta: Int) {
+        guard let current = castingContent else { return }
+        let channels = ChannelStore.shared.channels
+        guard !channels.isEmpty,
+              var idx = channels.firstIndex(where: { $0.id == current.mediaID }) else { return }
+        for _ in 0..<channels.count {
+            idx += delta
+            guard channels.indices.contains(idx) else { return } // clamp at ends
+            if let content = Self.castContent(for: channels[idx]) {
+                setContent(content)
+                return
+            }
+        }
+    }
+
+    /// Build the web-receiver payload for a live channel, or nil when the
+    /// channel has no stream URL at all. P2: EVERY source type is now
+    /// castable in principle (Dispatcharr, XC, M3U); the proxy's codec
+    /// gate is the real arbiter and refuses by name at load time.
+    static func castContent(for item: ChannelDisplayItem) -> Content? {
+        guard let url = item.streamURL ?? item.streamURLs.first else { return nil }
+        return Content(
+            mediaID: item.id,
+            kind: .live,
+            title: item.name,
+            subtitle: item.currentProgram,
+            artURL: item.logoURL?.absoluteString,
+            streamURL: url,
+            streamHeaders: ChannelStore.shared.activeServer?.authHeaders ?? ["Accept": "*/*"]
+        )
+    }
+
+    /// Picker entry point (guide pill AND in-player chrome): start a session
+    /// on `device` and decide up front WHAT it will play, so the receiver is
+    /// never left idle with nothing loaded. Priority: the channel playing
+    /// locally (full or mini player), else the multiview audio tile, else
+    /// nothing -- and "nothing" means the cover shows a channel list once the
+    /// session connects, never a bare receiver.
+    func beginSession(with device: GCKDevice) {
+        let name = device.friendlyName ?? device.deviceID
+        // The SDK refuses startSession while another Cast session is up
+        // (measured 2026-09-27 10:24: "startSession refused" when the idle
+        // sheet's Change Cast Device picked a second receiver). End the
+        // current one, keep the channel, and start on the new device once
+        // the end is reported.
+        if let current = GCKCastContext.sharedInstance().sessionManager.currentCastSession,
+           current.device.deviceID != device.deviceID {
+            debugLog("[Cast] picker selected \(name) while \(current.device.friendlyName ?? "?") is connected: ending it first")
+            switchTarget = device
+            if handoffContent == nil { handoffContent = castingContent }
+            stopCasting()
+            return
+        }
+        connectError = nil
+        connectingDeviceID = device.deviceID
+        awaitingChannelPick = false
+        // One remote target at a time (Android parity): a companion session
+        // would otherwise leave two remote covers live.
+        if CompanionClient.shared.isControlling { CompanionClient.shared.disconnect() }
+        let seed = Self.currentCastableItem()
+        // A Change Cast Device handoff wins over nothing; a channel playing
+        // locally still wins over the handoff.
+        pending = seed.flatMap { Self.castContent(for: $0) } ?? handoffContent
+        castingContent = pending
+        debugLog("[Cast] picker selected \(name) -> startSession seed=\(seed?.name ?? handoffContent?.title ?? "none")")
+        handoffContent = nil
+        let started = GCKCastContext.sharedInstance().sessionManager.startSession(with: device)
+        if !started {
+            pending = nil
+            castingContent = nil
+            connectingDeviceID = nil
+            connectError = "Could not connect to \(name)"
+            debugLog("[Cast] startSession refused by the SDK for \(name)")
+        }
+    }
+
+    /// What a fresh session should open with, if anything is playing on the
+    /// phone right now. Mirrors the in-player chrome's notion of "the current
+    /// channel" (NowPlayingManager for single streams, the audio tile for
+    /// multiview).
+    static func currentCastableItem() -> ChannelDisplayItem? {
+        if let item = NowPlayingManager.shared.playingItem { return item }
+        if let id = MultiviewStore.shared.audioTileID,
+           let tile = MultiviewStore.shared.tiles.first(where: { $0.id == id }) {
+            return tile.item
+        }
+        return MultiviewStore.shared.tiles.first?.item
+    }
+
+    /// A channel tap while a session is already connected (guide row, VOD
+    /// play, or the awaiting-pick state): load it on the receiver. No local
+    /// playback starts (rule 5, Logan 2026-09-12).
+    func castPickedChannel(_ item: ChannelDisplayItem) {
+        guard let content = Self.castContent(for: item) else {
+            surfaceCastFailure("This channel has no castable stream")
+            return
+        }
+        awaitingChannelPick = false
+        debugLog("[Cast] cover picked channel=\(item.name)")
+        setContent(content)
+    }
+
+    // MARK: - Loading
+
+    /// In-flight "warm the proxy, then load" task; superseded by every
+    /// channel flip and cancelled when the session ends.
+    private var proxyLoadTask: Task<Void, Never>?
+    /// The in-flight load request; retained so its delegate callbacks
+    /// (which report receiver-side load failure) stay alive.
+    private var loadRequest: GCKRequest?
+    /// The last proxy load (URL and content), for the composite load retry.
+    private var lastProxyLoad: (url: URL, content: Content)?
+    /// Composite receiver-load retries used since the last fresh load.
+    private var compositeLoadRetries = 0
+    private static let compositeLoadMaxRetries = 2
+
+    /// Live path (casting rework P2): start (or re-point) the local cast
+    /// HLS proxy at the channel's raw TS URL, wait until the playlist has
+    /// two segments (25 s bound, first terminal error wins), then load
+    /// the proxy's MASTER playlist. The wait matters: the receiver
+    /// fetches the playlist the moment load() lands, and an empty live
+    /// playlist is a hard receiver error, not a retry.
+    private func load(_ content: Content, on session: GCKCastSession) {
+        proxyLoadTask?.cancel()
+        staleCheckTask?.cancel()
+        staleWatchTask?.cancel()
+        // Route by receiver type (2026-09-13). The native Android TV app gets the
+        // channel IDENTITY and tunes itself; a web receiver gets the phone-local
+        // proxy playlist. While the handshake is still in flight the load is HELD.
+        switch receiverTarget {
+        case .unknown:
+            deferredLoad = content
+            debugLog("[Cast] load held: receiver type not yet known")
+            return
+        case .androidTVApp:
+            loadNative(content, on: session)
+            return
+        case .webReceiver:
+            break
+        }
+        guard content.kind == .live, let castURL = content.streamURL else {
+            // No proxyable stream: nothing the web receiver could play.
+            surfaceCastFailure("This channel has no castable stream")
+            return
+        }
+        let rawTS = Self.forceHLSCastIngestURL(castURL)
+        // Channel flip on the web receiver (Logan 2026-09-13): a flip is a
+        // FRESH LOAD, never a splice into the running HLS stream. A Chromecast
+        // Ultra chokes on the splice for about 5 s (BUFFERING/PLAYING
+        // toggling, the playhead creeping in 0.1 s stall-skip steps, then a
+        // gap jump) while the old channel is still on screen. So the old proxy
+        // session is torn down first (ports freed, ingest cancelled), a new
+        // one starts on the new channel, and the receiver is handed a brand
+        // new load request: it unloads the old media and shows its own loading
+        // state for the new channel. Cast Connect (the native Android TV app)
+        // keeps its in-place setChannel tune; only this path changed.
+        // iPad log 2026-10-11 22:44:39 to 22:44:42: Add Channel turned the
+        // ESPN2 HD cast into a composite 28 ms after its load went out; the
+        // flip stopped that channel's proxy, the receiver failed the ESPN2
+        // load (code 310), and because that request was still the tracked
+        // one, its failure stopped the NEW composite proxy and surfaced
+        // "The TV could not start this channel". A superseded load's
+        // failure is not this load's failure: forget it here.
+        loadRequest = nil
+        lastProxyLoad = nil
+        compositeLoadRetries = 0
+        let isFlip = webReceiverHasLoadedMedia
+        flipToken &+= 1
+        let token = flipToken
+        if isFlip {
+            switchingToTitle = content.title
+            webReceiverHasLoadedMedia = false
+            debugLog("[Cast] channel flip: fresh load for \(content.title) (proxy restart)")
+        }
+        let headers = content.streamHeaders
+        // Cast audio (Logan 2026-09-13): AC-3 / E-AC-3 PASSES THROUGH to the
+        // web receiver and the Dispatcharr output-profile path is gone.
+        // Nothing server-side is asked for and local playback was never
+        // involved. The one on-phone transcode left is MPEG audio (TS
+        // stream_type 0x03 / 0x04) to AAC, restored 2026-09-13 for the
+        // European and OTA channels that carry MP2; the AC-3 family is
+        // never re-encoded.
+        //
+        // What changed: the proxy now serves a DEMUXED master (separate video
+        // and audio renditions, one SourceBuffer each), and a Google TV
+        // Streamer answers isTypeSupported('audio/mp4; codecs="ac-3"') true
+        // for exactly that shape while the old muxed video/mp4 form answered
+        // false (the measurement that used to force the AAC profile). Emby
+        // plays AC-3 through the same audio/mp4 path.
+        //
+        // So the ingest is ALWAYS the plain stream URL, and the only decision
+        // left is whether this receiver may have the AC-3 bitstream:
+        // `receiverCaps` ac-3 / ec-3, measured by the receiver itself. False
+        // plus an AC-3 source is transcoded on the phone to AAC-LC stereo
+        // (2026-09-21, `audio=transcode-aac`), and refused by name only when
+        // this device has no AC-3 decoder (`audio=aac-only`). AAC
+        // sources pass through as before (a channel_configuration 0 layout is
+        // still refused), and MPEG audio transcodes instead of refusing.
+        let receiverName = session.device.friendlyName ?? lastDeviceName
+        let receiverModel = session.device.modelName ?? receiverName ?? "unknown"
+        proxyLoadTask = Task { [weak self] in
+            // The plan now WAITS for the measurement (asking for it if needed)
+            // instead of reading a nil that only meant "the message has not
+            // arrived on this channel yet".
+            let caps = await self?.awaitReceiverCaps()
+            if Task.isCancelled { return }
+            if isFlip {
+                // Tear the old session down BEFORE the new ingest: this frees
+                // the port and cancels the old ingest, so the new session gets
+                // its own server, ring and playlist URL rather than splicing a
+                // new generation behind the old channel's segments.
+                await Task.detached { CastHLSProxySession.shared.stop() }.value
+                if Task.isCancelled { return }
+            }
+            if caps == nil { debugLog("[Cast] caps not received, assuming no AC-3") }
+            let allowAC3 = caps?["ac-3"] == true || caps?["ec-3"] == true
+            // No AC-3 on the receiver: decode it here instead of refusing the
+            // channel, as long as this device can build the decoder.
+            let transcodeAC3 = !allowAC3 && CastAudioTranscoder.canDecode(.ac3)
+            let audioMode = allowAC3 ? "passthrough" : (transcodeAC3 ? "transcode-aac" : "aac-only")
+            func cap(_ key: String) -> String { caps?[key] == true ? "yes" : "no" }
+            debugLog("[Cast] audio plan: receiver=\(receiverModel) "
+                + "caps=\(caps == nil ? "none" : "measured") "
+                + "ac-3=\(cap("ac-3")) ec-3=\(cap("ec-3")) aac=\(cap("mp4a.40.2")) "
+                + "-> ingest=plain audio=\(audioMode)")
+            // Video plan: decided per source once the proxy reads the SPS
+            // (the full `[Cast] video plan: source=...` line comes from
+            // there); this line records what the decision will work from.
+            let videoPlan = await MainActor.run { self?.videoPlan(caps: caps) } ?? .passthrough
+            debugLog("[Cast] video plan inputs: receiver=\(receiverModel) hvc1=\(cap("hvc1")) "
+                + "display=\(videoPlan.caps?.display == nil ? "none" : "measured") "
+                + "force=\(videoPlan.force ? "yes" : "no") down=\(videoPlan.downProfile.rawValue)")
+            let playlistURL: URL
+            // The previous channel's note must not describe this one while
+            // the new source is still being read.
+            await MainActor.run { self?.setVideoPlanOutcome(nil) }
+            CastHLSProxySession.shared.onVideoDecision = { outcome in
+                Task { @MainActor in
+                    AstralCastController.shared.setVideoPlanOutcome(outcome)
+                }
+            }
+            // A connection-limit refusal or reconnect bounce after the
+            // receiver loaded ends the cast with the notice text.
+            CastHLSProxySession.shared.onTerminalAfterReady = { text in
+                Task { @MainActor in
+                    let controller = AstralCastController.shared
+                    guard controller.isCasting else { return }
+                    debugLog("[LIMIT] cast ingest stopped after load; ending cast")
+                    controller.surfaceCastFailure(text)
+                    controller.stopCasting()
+                }
+            }
+            do {
+                // The DEMUXED master is what the receiver loads: the audio
+                // rendition declares ac-3 / ec-3 honestly in its own
+                // audio/mp4 SourceBuffer. It is the only shape the proxy
+                // serves (the muxed endpoints were removed 2026-09-13).
+                playlistURL = try await CastHLSProxySession.shared.startChannel(
+                    rawTSURL: rawTS, headers: headers, allowAC3Passthrough: allowAC3,
+                    transcodeAC3: transcodeAC3,
+                    receiverDecodesAVCLevel42: caps?["avc1.64002A"],
+                    videoPlan: videoPlan,
+                    // The phone-composited Multiview cuts every second and
+                    // advertises a nearest-second target (round 6).
+                    segmentProfile: content.mediaID == MultiviewCompositeSession.castMediaID
+                        ? .composite : .standard)
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run { [weak self] in
+                    guard let self, self.flipToken == token else { return }
+                    self.switchingToTitle = nil
+                }
+                self?.surfaceCastFailure(Self.castFailureMessage(
+                    error, receiverName: receiverName, isDispatcharr: rawTS.path.contains("/proxy/ts/")))
+                debugLog("[Cast] load channel=\(content.title) audio=unknown mode=refused")
+                // The proxy is already torn down; a session left up would
+                // show a live cast cover over a dead playlist (zombie
+                // "Casting" UI, seen live 2026-08-14). End it; the session
+                // teardown path resumes local playback.
+                self?.stopCasting()
+                return
+            }
+            let summary = CastHLSProxySession.shared.audioSummary()
+            debugLog("[Cast] load channel=\(content.title) "
+                + "audio=\(summary?.codec ?? "none") mode=\(summary?.mode ?? "unknown")")
+            guard !Task.isCancelled else { return }
+            // Counters start at the load the receiver is about to get.
+            CastHLSProxySession.shared.markReceiverLoad()
+            await MainActor.run { [weak self] in
+                // Re-fetch the session: the connect may have churned while
+                // the proxy warmed up.
+                guard let self,
+                      let live = GCKCastContext.sharedInstance().sessionManager.currentCastSession,
+                      self.flipToken == token,
+                      self.castingContent?.mediaID == content.mediaID else { return }
+                self.loadProxyPlaylist(playlistURL, content: content, on: live)
+                self.armStaleReceiverCheck(playlistURL: playlistURL, content: content, afterReload: false)
+            }
+        }
+    }
+
+    // Cast audio, 2026-09-13: the "retry once without the output_profile
+    // parameter" wrapper that used to sit between `load` and
+    // `CastHLSProxySession.startChannel` is GONE with the profile itself.
+    // There is one ingest URL now, the plain one, so a failure is a real
+    // failure and is surfaced as such.
+
+    /// Specific refusal wording for every way a cast start can fail
+    /// (Logan 2026-09-12: "cannot cast this channel" is not detailed
+    /// enough). Shown in the cast alert and logged.
+    private static func castFailureMessage(_ error: Error, receiverName: String?,
+                                           isDispatcharr: Bool) -> String {
+        if let codec = error as? CastUnsupportedCodecError {
+            let name = codec.codecName
+                .replacingOccurrences(of: " video", with: "")
+                .replacingOccurrences(of: " audio", with: "")
+            switch codec.stream {
+            case .video:
+                return "This channel's video is \(name), which cannot be cast to this receiver."
+            case .audio:
+                if name.hasPrefix("AC-3") || name.hasPrefix("E-AC-3") {
+                    return "This receiver cannot decode this channel's surround audio (AC-3)."
+                }
+                return "This channel's audio is \(name), which the receiver cannot decode."
+            }
+        }
+        let seconds = CastHLSProxySession.readyTimeoutSeconds
+        switch error {
+        case CastHLSProxyError.timedOut:
+            return isDispatcharr
+                ? "Dispatcharr did not send any data for this channel within \(seconds) seconds."
+                : "The server did not send any data for this channel within \(seconds) seconds."
+        case CastHLSProxyError.upstreamUnavailable(let code):
+            return isDispatcharr
+                ? "Dispatcharr could not start this channel (HTTP \(code))."
+                : "The server could not start this channel (HTTP \(code))."
+        case CastHLSProxyError.stopped(let notice):
+            return "\(notice.title). \(notice.message)"
+        case CastHLSProxyError.ingestUnreachable:
+            return "This channel's stream could not be reached from this iPhone."
+        case CastHLSProxyError.noLANAddress:
+            return "Casting needs Wi-Fi: a Google Cast device cannot reach this iPhone over cellular."
+        case CastHLSProxyError.serverFailed:
+            return "AstralTV could not start the local cast server on this iPhone."
+        default:
+            return "This channel could not be cast: \(error)"
+        }
+    }
+
+    /// Cast Connect path: hand the native AstralTV Android TV receiver the channel
+    /// identity only and let it tune like a local tap (its own ExoPlayer, its own
+    /// effective base, AC-3 passthrough). Nothing on the phone touches the stream:
+    /// no HLS proxy, no contentURL.
+    ///
+    /// The identity MUST be the Android app's own channel id, because the receiver
+    /// resolves the load against ITS playlist: Dispatcharr channels share the
+    /// server uuid, which is "disp:<uuid>" on Android (the same translation the LAN
+    /// companion remote uses). A channel with no Dispatcharr uuid (XC / M3U) has no
+    /// id the TV could resolve, so it is refused by name instead of black-screening.
+    private func loadNative(_ content: Content, on session: GCKCastSession) {
+        guard let client = session.remoteMediaClient else { return }
+        let item = ChannelStore.shared.channels.first { $0.id == content.mediaID }
+        guard let item, let androidID = CompanionClient.androidChannelID(for: item) else {
+            surfaceCastFailure("The AstralTV app on this TV cannot look up this channel. "
+                + "Only Dispatcharr channels can be cast to it.")
+            debugLog("[Cast] native load refused: no Dispatcharr id for \(content.title)")
+            return
+        }
+        // Any proxy left over from an earlier web-receiver session has no client.
+        Task.detached { CastHLSProxySession.shared.stop() }
+
+        let metadata = GCKMediaMetadata(metadataType: .generic)
+        metadata.setString(content.title, forKey: kGCKMetadataKeyTitle)
+        if let sub = content.subtitle, !sub.isEmpty {
+            metadata.setString(sub, forKey: kGCKMetadataKeySubtitle)
+        }
+        if let art = content.artURL, let url = URL(string: art) {
+            metadata.addImage(GCKImage(url: url, width: 480, height: 270))
+        }
+        // entity is what the receiver's Cast Connect load handler deep-links on,
+        // and it must match the scheme MainActivity parses; customData carries the
+        // identity, contentID repeats it as the fallback the receiver reads when
+        // customData is stripped. No contentURL: the receiver builds its own.
+        let builder = GCKMediaInformationBuilder(entity: "astraltv://channel/\(androidID)")
+        builder.contentID = androidID
+        builder.streamType = .live
+        builder.contentType = "video/mp2t"
+        builder.metadata = metadata
+        builder.customData = [
+            AstralCast.keyMediaID: androidID,
+            AstralCast.keyKind: AstralCast.kindLive,
+        ]
+        let requestBuilder = GCKMediaLoadRequestDataBuilder()
+        requestBuilder.mediaInformation = builder.build()
+        requestBuilder.autoplay = true
+        let request = client.loadMedia(with: requestBuilder.build())
+        request.delegate = self
+        loadRequest = request
+        // Cast Connect does not re-deliver a second load() to an already-running
+        // receiver, so every tune also rides the reliable control channel, which
+        // re-tunes the TV in place with no relaunch (Android parity).
+        sendControl(["cmd": "setChannel", "channelId": androidID])
+        debugLog("[Cast] target=android-tv-app, native playback: channel=\(content.title) "
+            + "id=\(androidID) proxy=none profile=none")
+    }
+
+    private func loadProxyPlaylist(_ playlistURL: URL, content: Content, on session: GCKCastSession) {
+        guard let client = session.remoteMediaClient else { return }
+
+        let metadata = GCKMediaMetadata(metadataType: .generic)
+        metadata.setString(content.title, forKey: kGCKMetadataKeyTitle)
+        if let sub = content.subtitle, !sub.isEmpty {
+            metadata.setString(sub, forKey: kGCKMetadataKeySubtitle)
+        }
+        if let art = content.artURL, let url = URL(string: art) {
+            metadata.addImage(GCKImage(url: url, width: 480, height: 270))
+        }
+
+        // Use the non-deprecated entity initializer. The channel identity
+        // rides in customData; entity is an opaque app-specific identifier.
+        let builder = GCKMediaInformationBuilder(entity: content.mediaID)
+        builder.streamType = .live
+        // The custom WEB receiver (46B79062) plays contentURL directly:
+        // the local proxy's MASTER playlist (the master's
+        // CLOSED-CAPTIONS=NONE is load-bearing; see CastHLSSegmentStore).
+        // Declaring the segment container skips the receiver's sniffing.
+        builder.contentURL = playlistURL
+        builder.contentType = "application/x-mpegURL"
+        builder.hlsSegmentFormat = .FMP4
+        builder.hlsVideoSegmentFormat = .FMP4
+        builder.metadata = metadata
+        var custom: [String: Any] = [
+            AstralCast.keyMediaID: content.mediaID,
+            AstralCast.keyKind: AstralCast.kindLive,
+        ]
+        // The web receiver applies its composite live profile (about 3 s
+        // behind the edge, SEEK kept for the focus-change nudge) on this flag.
+        if content.mediaID == MultiviewCompositeSession.castMediaID {
+            custom["astral"] = ["composite": true]
+            // Round 7: the first playing tick after this load runs the
+            // startup catch-up (the receiver's startup buffering is where
+            // it fell 9 s behind).
+            compositeStartupCatchUpPending = true
+        } else {
+            compositeStartupCatchUpPending = false
+        }
+        builder.customData = custom
+        let mediaInfo = builder.build()
+
+        let requestBuilder = GCKMediaLoadRequestDataBuilder()
+        requestBuilder.mediaInformation = mediaInfo
+        requestBuilder.autoplay = true
+        let request = client.loadMedia(with: requestBuilder.build())
+        request.delegate = self
+        loadRequest = request
+        lastProxyLoad = (playlistURL, content)
+        // The next load on this session is a flip: tear down and load afresh.
+        webReceiverHasLoadedMedia = true
+    }
+
+    // MARK: - Switch Stream reprime (cast Options sheet, task #267)
+
+    /// Dispatcharr Switch Stream while casting: `change_stream` swaps the
+    /// upstream behind the SAME `/proxy/ts/stream/<uuid>` URL, so the
+    /// ingest URL and the receiver's playlist URL never change -- but the
+    /// proxy's remuxer should not be left riding the mid-stream TS splice
+    /// (fresh buffer, new clock). Re-run `startChannel` with the unchanged
+    /// raw TS URL: same server + port, new generation, gap-free playlist
+    /// splice, and the receiver just keeps polling (the same seamless path
+    /// channel flips use, device-verified). No loadMedia; the loaded media
+    /// stays untouched.
+    /// Developer Force HLS: the Cast proxy ingests raw MPEG-TS only, so
+    /// Cast stays on the TS stream. Strips an `output_format=hls` request
+    /// if one reached here and logs the fallback either way.
+    nonisolated static func forceHLSCastIngestURL(_ url: URL) -> URL {
+        guard PlaybackFeatureFlags.forceHLS else { return url }
+        if (url.query ?? "").contains("output_format=hls") {
+            let ts = removingHLSOutputFormat(url)
+            debugLog("[FORCE-HLS] Cast fell back to TS: the cast proxy ingests MPEG-TS only (\(ts.absoluteString))")
+            return ts
+        }
+        debugLog("[FORCE-HLS] Cast fell back to TS: the cast proxy ingests MPEG-TS only")
+        return url
+    }
+
+    private func handleSwitchStreamReprime(uuid: String?) {
+        guard isCasting, let uuid, let content = castingContent,
+              let castURL = content.streamURL,
+              case let rawTS = Self.forceHLSCastIngestURL(castURL),
+              let item = ChannelStore.shared.channels.first(where: { $0.id == content.mediaID }),
+              item.uuid == uuid else { return }
+        debugLog("[CAST-HLS] switch-stream reprime for \(item.name)")
+        let headers = content.streamHeaders
+        proxyLoadTask?.cancel()
+        staleCheckTask?.cancel()
+        staleWatchTask?.cancel()
+        // Same audio plan as the initial load: the plain stream URL, with
+        // AC-3 / E-AC-3 passthrough gated on the receiver's own measurement,
+        // otherwise the on-phone AAC transcode when a decoder exists.
+        let allowAC3 = receiverDecodesAC3
+        let transcodeAC3 = !allowAC3 && CastAudioTranscoder.canDecode(.ac3)
+        let decodesLevel42 = receiverCaps?["avc1.64002A"]
+        let plan = videoPlan(caps: receiverCaps)
+        proxyLoadTask = Task { [weak self] in
+            do {
+                let playlistURL = try await CastHLSProxySession.shared.startChannel(
+                    rawTSURL: rawTS, headers: headers, allowAC3Passthrough: allowAC3,
+                    transcodeAC3: transcodeAC3, receiverDecodesAVCLevel42: decodesLevel42,
+                    videoPlan: plan)
+                CastHLSProxySession.shared.markReceiverLoad()
+                await MainActor.run { [weak self] in
+                    self?.armStaleReceiverCheck(playlistURL: playlistURL, content: content, afterReload: false)
+                }
+            } catch is CancellationError {
+            } catch {
+                self?.surfaceCastFailure("The stream switch interrupted casting: \(error)")
+                self?.stopCasting()
+            }
+        }
+    }
+
+    // MARK: - Stale receiver check (incident 2026-09-25 15:26)
+
+    /// 10 s after each accepted proxy load (initial load and Switch Stream
+    /// reprime) the proxy's request counters say whether the receiver page
+    /// is actually playing. On 2026-09-25 15:26 a session attached to a
+    /// receiver page that fetched the master and both rendition playlists
+    /// once, two segments, then nothing for 2.5 minutes while the proxy kept
+    /// producing; only ending the session and casting again recovered it.
+    /// A playlist with no segment re-issues the same load ONCE per channel;
+    /// still nothing 10 s after that surfaces the cast-failure notice.
+    /// Android parity: AstralCastSender (963e5ed6).
+    private static let staleReceiverSeconds: UInt64 = 10
+    private static let compositeStaleReceiverSeconds: UInt64 = 8
+    private var staleCheckTask: Task<Void, Never>?
+    /// Channel whose load was already re-issued once.
+    private var staleReloadedMediaID: String?
+
+    private func armStaleReceiverCheck(playlistURL: URL, content: Content, afterReload: Bool) {
+        staleCheckTask?.cancel()
+        staleWatchTask?.cancel()
+        staleCheckTask = Task { @MainActor [weak self] in
+            // Composite: 8 s (1 s cuts; the receiver has segments at once).
+            let wait = content.mediaID == MultiviewCompositeSession.castMediaID
+                ? Self.compositeStaleReceiverSeconds : Self.staleReceiverSeconds
+            try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            let counts = await Task.detached { CastHLSProxySession.shared.receiverRequestCounts() }.value
+            guard !Task.isCancelled, let self, self.isCasting,
+                  self.castingContent?.mediaID == content.mediaID,
+                  let counts else { return }
+            let secs = content.mediaID == MultiviewCompositeSession.castMediaID
+                ? Self.compositeStaleReceiverSeconds : Self.staleReceiverSeconds
+            if counts.segments > 0 {
+                let first = counts.firstSegmentAt.map { $0.timeIntervalSince(counts.markedAt) } ?? 0
+                debugLog("[Cast] receiver healthy: first segment \(String(format: "%.1f", first)) s after load "
+                    + "(playlists=\(counts.playlists) vseg=\(counts.videoSegments) "
+                    + "aseg=\(counts.audioSegments) gen=\(counts.generation))")
+                return
+            }
+            if counts.playlists == 0 {
+                debugLog("[Cast] receiver fetched NOTHING \(secs)s after load "
+                    + "(no playlist, no segment); leaving it to the idle reload")
+                return
+            }
+            if afterReload || self.staleReloadedMediaID == content.mediaID {
+                debugLog("[Cast] stale receiver: still no segment after the reload; surfacing "
+                    + "(playlists=\(counts.playlists) segments=0 gen=\(counts.generation))")
+                self.surfaceCastFailure("The Cast device stopped requesting video. "
+                    + "Disconnect from it and cast again.")
+                return
+            }
+            debugLog("[Cast] stale receiver: playlist fetched, no segment in \(secs) s; "
+                + "re-issuing the load once (playlists=\(counts.playlists) gen=\(counts.generation))")
+            await self.reissueStaleLoad(playlistURL: playlistURL, content: content)
+        }
+        startStaleWatch(playlistURL: playlistURL, content: content)
+    }
+
+    /// Re-issue the same proxy load (the once-per-channel latch is set here)
+    /// and arm the post-reload check, which surfaces on a second failure.
+    private func reissueStaleLoad(playlistURL: URL, content: Content) async {
+        staleReloadedMediaID = content.mediaID
+        staleHealthySince = nil
+        guard let live = GCKCastContext.sharedInstance().sessionManager.currentCastSession else { return }
+        await Task.detached { CastHLSProxySession.shared.markReceiverLoad() }.value
+        guard castingContent?.mediaID == content.mediaID else { return }
+        loadProxyPlaylist(playlistURL, content: content, on: live)
+        armStaleReceiverCheck(playlistURL: playlistURL, content: content, afterReload: true)
+    }
+
+    // Mid-stream stall watch (the actual 15:26 shape: a couple of segments,
+    // then nothing while the playhead sat). Every 10 s while the channel is
+    // loaded: a last segment request older than 30 s while the receiver is
+    // NOT PLAYING at rate 1 re-issues the load (same latch, same alert on a
+    // second failure). A PLAYING receiver on a 5 s target can go 10-15 s
+    // between fetches, so it is never touched. 10 min of healthy playback
+    // clears the latch so a later genuine stall still gets its one reload.
+    private static let staleWatchInterval: UInt64 = 10
+    private static let staleSegmentAge: TimeInterval = 30
+    private static let staleLatchResetSeconds: TimeInterval = 600
+    private var staleWatchTask: Task<Void, Never>?
+    private var staleHealthySince: Date?
+    /// Latest receiver player state / rate from the debug telemetry.
+    private var receiverPlayerState: String?
+    private var receiverPlaybackRate: Double?
+
+    private func startStaleWatch(playlistURL: URL, content: Content) {
+        staleWatchTask?.cancel()
+        staleHealthySince = nil
+        staleWatchTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.staleWatchInterval * 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                let counts = await Task.detached { CastHLSProxySession.shared.receiverRequestCounts() }.value
+                guard !Task.isCancelled, let self, self.isCasting,
+                      self.castingContent?.mediaID == content.mediaID else { return }
+                guard let counts, let last = counts.lastSegmentAt else { continue }
+                let now = Date()
+                let age = now.timeIntervalSince(last)
+                let state = self.receiverPlayerState ?? "?"
+                let playing = state == "PLAYING" && self.receiverPlaybackRate == 1
+                if playing && age < Self.staleSegmentAge {
+                    let since = self.staleHealthySince ?? now
+                    self.staleHealthySince = since
+                    if self.staleReloadedMediaID == content.mediaID,
+                       now.timeIntervalSince(since) >= Self.staleLatchResetSeconds {
+                        self.staleReloadedMediaID = nil
+                        debugLog("[Cast] stale receiver latch cleared after 10 min of healthy playback")
+                    }
+                    continue
+                }
+                self.staleHealthySince = nil
+                guard !playing, age > Self.staleSegmentAge else { continue }
+                let rate = self.receiverPlaybackRate.map { String(format: "%g", $0) } ?? "?"
+                if self.staleReloadedMediaID == content.mediaID {
+                    debugLog("[Cast] stale receiver: still no segment after the reload; surfacing "
+                        + "(last segment \(Int(age)) s ago, receiver \(state) rate=\(rate) gen=\(counts.generation))")
+                    self.surfaceCastFailure("The Cast device stopped requesting video. "
+                        + "Disconnect from it and cast again.")
+                    return
+                }
+                debugLog("[Cast] stale receiver: last segment \(Int(age)) s ago with receiver \(state); "
+                    + "re-issuing the load once (rate=\(rate) vseg=\(counts.videoSegments) "
+                    + "aseg=\(counts.audioSegments) gen=\(counts.generation))")
+                await self.reissueStaleLoad(playlistURL: playlistURL, content: content)
+                return // the reload's arm restarts the watch
+            }
+        }
+    }
+
+    // MARK: - Sleep timer (Android cast-options parity, task #267)
+
+    /// When the armed timer fires (nil = off). Phone-side countdown like
+    /// the companion remote's; expiry STOPS the cast (frees the TV, the
+    /// proxy, and the provider connection) WITHOUT the usual local resume
+    /// -- a sleeping user's phone must not start playing to a dark room.
+    @Published private(set) var sleepEndsAt: Date?
+    private var sleepTimerTask: Task<Void, Never>?
+    /// One-shot: the next onSessionEnded skips the resume-locally step.
+    private var suppressLocalResume = false
+
+    /// Arm (minutes > 0) or cancel (0) the sleep timer.
+    func armSleepTimer(minutes: Int) {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        guard minutes > 0 else { sleepEndsAt = nil; return }
+        sleepEndsAt = Date().addingTimeInterval(TimeInterval(minutes) * 60)
+        debugLog("[CAST-HLS] sleep timer armed: \(minutes)m")
+        sleepTimerTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(minutes) * 60 * 1_000_000_000)
+            guard !Task.isCancelled, let self, self.isCasting else { return }
+            debugLog("[CAST-HLS] sleep timer fired -> stopping cast")
+            self.sleepEndsAt = nil
+            self.suppressLocalResume = true
+            self.stopCasting()
+        }
+    }
+
+    /// Same surface the cast tap paths already imply: a plain alert on
+    /// the frontmost scene (mirrors the Android Toast).
+    fileprivate func surfaceCastFailure(_ message: String) {
+        debugLog("[CAST-HLS] cast failure surfaced: \(message)")
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        guard let root = scene?.windows.first(where: { $0.isKeyWindow })?.rootViewController else { return }
+        var top = root
+        while let presented = top.presentedViewController { top = presented }
+        let alert = UIAlertController(title: "Cast", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        top.present(alert, animated: true)
+    }
+
+    // MARK: - State plumbing
+
+    fileprivate func syncCastState(_ castState: GCKCastState) {
+        let session = GCKCastContext.sharedInstance().sessionManager.currentCastSession
+        let device = session?.device.friendlyName
+        switch castState {
+        // Guard on an actual session: at teardown castState can still read
+        // .connected for a runloop tick while currentCastSession is already nil,
+        // which would leave a transient .connected(nil) and keep isCasting true.
+        case .connected where session != nil: state = .connected(device)
+        case .connected: state = .available
+        case .connecting: state = .connecting(device)
+        case .notConnected: state = .available
+        default: state = .unavailable   // .noDevicesAvailable
+        }
+    }
+}
+
+// MARK: - GCKDiscoveryManagerListener (app-lifetime discovery + logging)
+
+extension AstralCastController: GCKDiscoveryManagerListener {
+    // GCK delivers discovery callbacks on the main thread (SDK contract).
+    nonisolated func didStartDiscovery(forDeviceCategory deviceCategory: String) {
+        MainActor.assumeIsolated { logDiscovery("didStartDiscovery category=\(deviceCategory)") }
+    }
+
+    nonisolated func didUpdateDeviceList() {
+        MainActor.assumeIsolated { logDiscovery("didUpdateDeviceList") }
+    }
+
+    nonisolated func didInsert(_ device: GCKDevice, at index: UInt) {
+        let name = device.friendlyName ?? device.deviceID
+        MainActor.assumeIsolated { logDiscovery("didInsert \(name)") }
+    }
+
+    nonisolated func didRemove(_ device: GCKDevice, at index: UInt) {
+        let name = device.friendlyName ?? device.deviceID
+        MainActor.assumeIsolated { logDiscovery("didRemove \(name)") }
+    }
+
+    fileprivate func logDiscovery(_ what: String) {
+        let discovery = GCKCastContext.sharedInstance().discoveryManager
+        let names = (0..<discovery.deviceCount)
+            .map { discovery.device(at: $0).friendlyName ?? discovery.device(at: $0).deviceID }
+        debugLog("[Cast] \(what): discovery state=\(discovery.discoveryState.rawValue), devices=\(discovery.deviceCount) \(names)")
+    }
+}
+
+// MARK: - GCKSessionManagerListener
+
+extension AstralCastController: GCKSessionManagerListener {
+    // GCK delivers session-manager callbacks on the main thread, so
+    // MainActor.assumeIsolated runs synchronously in place. This (vs a
+    // Task { @MainActor }) avoids "sending non-Sendable session across isolation"
+    // under Swift 6 strict concurrency, since nothing is dispatched cross-domain.
+    nonisolated func sessionManager(_ sessionManager: GCKSessionManager, didStart session: GCKCastSession) {
+        MainActor.assumeIsolated { self.onConnected() }
+    }
+    nonisolated func sessionManager(_ sessionManager: GCKSessionManager, didResumeCastSession session: GCKCastSession) {
+        MainActor.assumeIsolated { self.onConnected() }
+    }
+    nonisolated func sessionManager(_ sessionManager: GCKSessionManager,
+                                    didFailToStart session: GCKSession,
+                                    withError error: Error) {
+        let name = session.device.friendlyName ?? session.device.deviceID
+        let text = error.localizedDescription
+        MainActor.assumeIsolated { self.onSessionFailedToStart(device: name, message: text) }
+    }
+    nonisolated func sessionManager(_ sessionManager: GCKSessionManager, didEnd session: GCKSession, withError error: Error?) {
+        MainActor.assumeIsolated { self.onSessionEnded(error: error) }
+    }
+
+    /// Connect attempt refused by the device: clear the captured intent and
+    /// leave the message on the picker row the user tapped.
+    private func onSessionFailedToStart(device: String, message: String) {
+        debugLog("[Cast] session failed to start \(device): \(message)")
+        pending = nil
+        castingContent = nil
+        awaitingChannelPick = false
+        connectingDeviceID = nil
+        connectError = "Could not connect to \(device): \(message)"
+        syncCastState(GCKCastContext.sharedInstance().castState)
+    }
+
+    /// Re-fetches the current session on the MainActor (rather than receiving the
+    /// non-Sendable GCKCastSession across isolation), then loads pending content.
+    private func onConnected() {
+        guard let session = GCKCastContext.sharedInstance().sessionManager.currentCastSession else { return }
+        state = .connected(session.device.friendlyName)
+        session.device.friendlyName.map { lastDeviceName = $0 }
+        connectingDeviceID = nil
+        connectError = nil
+        debugLog("[Cast] session started \(session.device.friendlyName ?? session.device.deviceID) state=\(GCKCastContext.sharedInstance().castState.rawValue) pending=\(pending?.title ?? "none")")
+        // Ask for notification permission the first time a cast connects (a
+        // moment when the user just acted, so the system dialog has obvious
+        // context). Without this the app never appears in Settings >
+        // Notifications unless the user happens to set a reminder first, and
+        // the involuntary-drop alert below has nowhere to land - found on
+        // Logan's iPhone during the drop test 2026-08-19. No-op once the
+        // user has answered either way.
+        Task {
+            let center = UNUserNotificationCenter.current()
+            guard await center.notificationSettings().authorizationStatus == .notDetermined else { return }
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+        }
+        session.remoteMediaClient?.add(self)
+        // Listen for the receiver's diagnostic snapshots (see
+        // `receiverDebugNamespace`). Purely read-only; nothing is ever
+        // sent on this channel.
+        let debugChannel = GCKGenericChannel(namespace: Self.receiverDebugNamespace)
+        debugChannel.delegate = self
+        session.add(debugChannel)
+        receiverDebugChannel = debugChannel
+        // Custom control channel: the receiver-type handshake and the in-place
+        // channel flip a running Cast Connect receiver needs. Attached BEFORE any
+        // load decision below, because that decision waits on the handshake.
+        let control = GCKGenericChannel(namespace: Self.controlNamespace)
+        control.delegate = self
+        session.add(control)
+        controlChannel = control
+        probeReceiverTarget()
+        // Cast takes precedence over an active companion session: tear that
+        // down first so the two remote covers can never both be live (review
+        // 2026-07-16). Companion Disconnect leaves the Android TV playing.
+        if CompanionClient.shared.isControlling { CompanionClient.shared.disconnect() }
+        // What this session plays: the intent captured at picker tap
+        // (beginSession), else whatever is playing now (a session started by
+        // any other path, e.g. a resumed session).
+        let content = pending
+            ?? Self.currentCastableItem().flatMap { Self.castContent(for: $0) }
+        if let content {
+            // Hand the channel to the TV, then tear the local player down
+            // (frees the decoder AND the Dispatcharr connection slot -- the
+            // receiver is about to open its own; on max-connections=1
+            // channels the local stream would starve the TV's, Android
+            // review 2026-07-15). The cast-remote cover (HomeView renders it
+            // off isCasting) takes over.
+            setContent(content)
+            AppOrientationLock.release()
+            if PlayerSession.shared.mode != .idle || NowPlayingManager.shared.playingItem != nil {
+                // PlayerSession.stop() tears down the local player's Now
+                // Playing card; republish the cast card after it.
+                PlayerSession.shared.stop()
+            }
+            syncNowPlayingCard()
+        } else {
+            // Started from the guide pill with nothing playing: the receiver
+            // is up but has no media, and an unloaded web receiver dies on
+            // its idle timeout (Logan 2026-09-11). Keep the session and let
+            // the cover ask which channel to cast.
+            awaitingChannelPick = true
+            debugLog("[Cast] session started with no channel to load; awaiting channel pick")
+        }
+    }
+
+    /// Session ended (user tapped Stop on the cover, or the TV went away):
+    /// resume the last cast channel locally -- "stop casting" means "bring
+    /// playback back to my phone" (Android parity).
+    private func onSessionEnded(error: Error? = nil) {
+        // Involuntary drop = the SDK reports an error AND we did not ask to
+        // stop. GCK passes nil for intentional ends (unlike the Android SDK,
+        // whose end codes are non-zero for every path - measured 2026-08-19:
+        // deliberate stop 2161 vs receiver death 2155/2055).
+        let wasUserStop = userRequestedStop
+        userRequestedStop = false
+        let involuntary = (error != nil) && !wasUserStop
+        awaitingChannelPick = false
+        connectingDeviceID = nil
+        debugLog("[Cast] session ended reason=\(wasUserStop ? "user stop" : (error != nil ? "error: \(error!.localizedDescription)" : "remote end"))")
+        if let next = switchTarget {
+            switchTarget = nil
+            DispatchQueue.main.async { [weak self] in self?.beginSession(with: next) }
+        }
+        if involuntary {
+            debugLog("[CAST] session ended involuntarily: \(error.map(String.init(describing:)) ?? "?")")
+        }
+        pending = nil
+        // The receiver is gone, so its debug channel goes with it; remove
+        // it from the session while one is still reachable, then drop the
+        // reference either way.
+        if let debugChannel = receiverDebugChannel {
+            GCKCastContext.sharedInstance().sessionManager.currentCastSession?.remove(debugChannel)
+            debugChannel.delegate = nil
+            receiverDebugChannel = nil
+        }
+        if let control = controlChannel {
+            GCKCastContext.sharedInstance().sessionManager.currentCastSession?.remove(control)
+            control.delegate = nil
+            controlChannel = nil
+        }
+        targetProbeTask?.cancel()
+        targetProbeTask = nil
+        receiverTarget = .unknown
+        remoteState = CompanionClient.RemoteState()
+        nativeMultiview = nil
+        deferredLoad = nil
+        receiverCaps = nil
+        loggedCaps = nil
+        receiverDisplayCaps = nil
+        loggedDisplayCaps = nil
+        setVideoPlanOutcome(nil)
+        if receiverVideoLine != nil { receiverVideoLine = nil }
+        receiverFPSSamples = ("", [])
+        // The cast card must not outlive the session; a local resume below
+        // publishes its own via PlayerSession.
+        NowPlayingBridge.shared.teardown()
+        // The receiver is gone; the proxy has no client left to serve.
+        proxyLoadTask?.cancel()
+        staleCheckTask?.cancel()
+        staleWatchTask?.cancel()
+        proxyLoadTask = nil
+        loadRequest = nil
+        switchingToTitle = nil
+        webReceiverHasLoadedMedia = false
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepEndsAt = nil
+        Task.detached { CastHLSProxySession.shared.stop() }
+        syncCastState(GCKCastContext.sharedInstance().castState)
+        let skipResume = suppressLocalResume
+        suppressLocalResume = false
+        defer { castingContent = nil }
+        // Kenton-class drop (Android a5e2b73/dce3074 parity): the cast dying
+        // while the app is BACKGROUNDED used to be completely silent here -
+        // the TV falls to the idle splash and the phone says nothing. Post a
+        // notification naming what stopped, and skip the local auto-resume
+        // for that case only (audio starting in a pocket is a worse signal
+        // than a notification). Foreground drops keep the existing behavior:
+        // playback returns to the phone, which announces itself. If
+        // notifications are not authorized, behavior is unchanged - the
+        // resume below stays as the fallback signal.
+        if involuntary, UIApplication.shared.applicationState != .active {
+            let deviceName = lastDeviceName
+            let contentTitle = castingContent?.title
+            Task {
+                let center = UNUserNotificationCenter.current()
+                let settings = await center.notificationSettings()
+                guard settings.authorizationStatus == .authorized
+                    || settings.authorizationStatus == .provisional else { return }
+                let content = UNMutableNotificationContent()
+                content.title = deviceName.map { "Casting to \($0) interrupted" }
+                    ?? "Casting interrupted"
+                var body = ""
+                if let contentTitle, !contentTitle.isEmpty { body += "\(contentTitle) stopped. " }
+                body += "The connection to the TV was lost. Open AstralTV to cast again."
+                content.body = body
+                content.sound = .default
+                try? await center.add(UNNotificationRequest(
+                    identifier: "astral-cast-drop", content: content, trigger: nil))
+            }
+            return
+        }
+        // Rule 4 (Logan 2026-09-12): "when I cancel casting, do not
+        // automatically start playing it on the phone. If I close it, it
+        // should just close." The old behavior resumed the cast channel
+        // locally here (Android-parity "bring it back to my phone"); that is
+        // deliberately gone, for EVERY end reason. `skipResume` (the sleep
+        // timer's one-shot) is now redundant but stays read so the timer's
+        // intent is still expressed.
+        _ = skipResume
+        debugLog("[Cast] stop: session ended, no local resume")
+    }
+}
+
+// MARK: - GCKRequestDelegate (receiver-side load failure)
+
+extension AstralCastController: GCKRequestDelegate {
+    /// A load the receiver rejected must not leave the proxy ingesting a
+    /// stream nobody is watching (it pins a provider connection slot).
+    nonisolated func request(_ request: GCKRequest, didFailWithError error: GCKError) {
+        // Identity captured OUTSIDE the isolation hop: GCKRequest is not
+        // Sendable, and the callback arrives on the main thread anyway
+        // (assumeIsolated runs synchronously in place).
+        let failedID = ObjectIdentifier(request)
+        let errorText = String(describing: error)
+        MainActor.assumeIsolated {
+            guard let inFlight = self.loadRequest, ObjectIdentifier(inFlight) == failedID else { return }
+            self.loadRequest = nil
+            debugLog("[CAST-HLS] receiver load failed: \(errorText)")
+            // Composite: the proxy is still up and publishing; re-issue the
+            // load (2 s apart) and surface only once the retries are spent.
+            if let last = self.lastProxyLoad,
+               last.content.mediaID == MultiviewCompositeSession.castMediaID,
+               self.castingContent?.mediaID == last.content.mediaID,
+               self.compositeLoadRetries < Self.compositeLoadMaxRetries {
+                self.compositeLoadRetries += 1
+                let attempt = self.compositeLoadRetries
+                debugLog("[CAST-HLS] composite load failed; re-issuing the load (attempt \(attempt) of \(Self.compositeLoadMaxRetries))")
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard let self, self.isCasting, self.loadRequest == nil,
+                          self.castingContent?.mediaID == last.content.mediaID,
+                          let live = GCKCastContext.sharedInstance().sessionManager.currentCastSession
+                    else { return }
+                    await Task.detached { CastHLSProxySession.shared.markReceiverLoad() }.value
+                    self.loadProxyPlaylist(last.url, content: last.content, on: live)
+                    self.armStaleReceiverCheck(playlistURL: last.url, content: last.content, afterReload: false)
+                }
+                return
+            }
+            Task.detached { CastHLSProxySession.shared.stop() }
+            self.surfaceCastFailure("The TV could not start this channel")
+        }
+    }
+}
+
+// MARK: - GCKRemoteMediaClientListener (play/pause mirror for the cover)
+
+extension AstralCastController: GCKRemoteMediaClientListener {
+    nonisolated func remoteMediaClient(_ client: GCKRemoteMediaClient,
+                                       didUpdate mediaStatus: GCKMediaStatus?) {
+        let playing: Bool
+        switch mediaStatus?.playerState {
+        case .paused: playing = false
+        default: playing = true // playing / buffering / loading all read as "on"
+        }
+        // A flip's "Switching to <channel>" ends when the receiver actually
+        // reports PLAYING, not when the load request returns: the receiver
+        // still has to fetch the playlist and fill its buffer.
+        let nowPlaying = mediaStatus?.playerState == .playing
+        MainActor.assumeIsolated {
+            self.remoteIsPlaying = playing
+            if nowPlaying { self.switchingToTitle = nil }
+        }
+    }
+}
+
+// MARK: - GCKGenericChannelDelegate (receiver debug telemetry)
+//
+// The receiver web app broadcasts one JSON snapshot of its player state
+// per event on `receiverDebugNamespace`; this logs it as ONE line so the
+// sender log alone shows what Shaka believed about its own buffer. Added
+// 2026-09-12 after the Google TV Streamer session where the receiver sat
+// at position -58 ms in BUFFERING for 45 s and nothing on the device
+// could tell us where the buffered range or the seek range actually was.
+// Keys the receiver sends: ev, t, buffered (array of [start, end]
+// pairs), ready, state, rate, seek ([start, end] or null), bufTime, bw,
+// hist, err. Any field the receiver omits logs as `?`.
+
+extension AstralCastController: GCKGenericChannelDelegate {
+
+    nonisolated func cast(_ channel: GCKGenericChannel,
+                          didReceiveTextMessage message: String,
+                          withNamespace protocolNamespace: String) {
+        // GCK delivers channel callbacks on the main thread, but this is a
+        // diagnostic path and `MainActor.assumeIsolated` would TRAP if that
+        // ever stopped being true. Hopping costs a log line's latency and
+        // cannot take the app down.
+        let ns = protocolNamespace
+        Task { @MainActor [message] in
+            if ns == Self.controlNamespace {
+                handleControlMessage(message)
+            } else {
+                logReceiverDebug(message)
+            }
+        }
+    }
+
+    /// Receiver -> sender on the control namespace: the handshake answer and
+    /// the Android TV receiver's option snapshot (the Options sheet's track,
+    /// speed, scale and audio-only rows). Transport and now-playing ride the
+    /// Cast media status.
+    private func handleControlMessage(_ message: String) {
+        guard let data = message.data(using: .utf8),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return
+        }
+        // The web receiver page spells the discriminator "type", the Android TV
+        // receiver spells it "cmd" like every other frame on this namespace.
+        let kind = (json["cmd"] as? String) ?? (json["type"] as? String)
+        // The receiver answers an explicit caps request on whichever namespace
+        // it was asked on, so the control channel can carry one too.
+        if kind == "caps" { noteReceiverCaps(json); return }
+        if kind == "state" {
+            let decoded = CompanionClient.decodeState(json)
+            // One line per reply: without it there was no way to confirm the
+            // receiver applied an aspect / speed / audio-only command.
+            debugLog("[Cast] state <- aspect=\(decoded.aspect) speed=\(decoded.speed) audioOnly=\(decoded.audioOnly) audio=\(decoded.audio.count) tracks text=\(decoded.text.count) tracks textOff=\(decoded.textOff)")
+            if decoded != remoteState { remoteState = decoded }
+            return
+        }
+        if kind == MultiviewRemoteCommand.state {
+            let st = NativeMultiviewState(json: json)
+            debugLog("[MV-CAST] state <- active=\(st != nil) count=\(st?.channels.count ?? 0) focus=\(st?.focus ?? 0) layout=\(st?.layout.rawValue ?? "auto")")
+            if st != nativeMultiview { nativeMultiview = st }
+            return
+        }
+        if kind == "multiview.opened" || kind == "multiview.error" {
+            let detail = (json["error"] as? String).map { " error=\($0)" }
+                ?? " count=\((json["count"] as? NSNumber)?.intValue ?? -1)"
+            debugLog("[MV-CAST] reply from \(connectedDeviceName ?? "TV"): \(kind ?? "")\(detail)")
+            if kind == "multiview.error" {
+                surfaceCastFailure("The TV could not open Multiview: \(json["error"] as? String ?? "unknown error")")
+            }
+            return
+        }
+        guard kind == "receiverInfo" else { return }
+        noteReceiverInfo(json)
+    }
+
+    /// The tick's `res` ("1920x1080", from videoWidth / videoHeight) and
+    /// `fps` (decoded frames per second over the last tick, one decimal).
+    /// The rate is shown whole: the measurement wanders a tenth either side
+    /// of the true rate every tick, and a card that flickers between 59.9
+    /// and 60.1 says nothing more than "60".
+    private func noteReceiverVideo(_ json: [String: Any]) {
+        // A paused or buffering tick reports no frames; the last playing
+        // reading stays up rather than the line blinking out.
+        guard let res = json["res"] as? String, !res.isEmpty, !res.hasPrefix("0x"),
+              !res.hasSuffix("x0"),
+              let fps = (json["fps"] as? NSNumber)?.doubleValue, fps > 0 else { return }
+        // The tick's rate is a one-second sample: the first few after a load
+        // straddle the start and read 8 or 15 fps on a stream the receiver
+        // then presents at 60 (Logan's card, 2026-09-27 01:11). Show the
+        // median of the last five playing ticks, and nothing before five.
+        if receiverFPSSamples.resolution != res { receiverFPSSamples = (res, []) }
+        receiverFPSSamples.values.append(fps)
+        if receiverFPSSamples.values.count > 5 { receiverFPSSamples.values.removeFirst() }
+        guard receiverFPSSamples.values.count == 5 else { return }
+        let median = receiverFPSSamples.values.sorted()[2]
+        let line = "\(res) at \(Int(median.rounded()))fps"
+        if receiverVideoLine != line { receiverVideoLine = line }
+    }
+
+
+    /// Never throws and never logs anything but the single line: a
+    /// malformed snapshot must not cost us the rest of the session.
+    private func logReceiverDebug(_ message: String) {
+        guard let data = message.data(using: .utf8),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return
+        }
+        noteReceiverCaps(json)
+        // The dedicated caps message carries no player state; it is fully
+        // handled above and must not print a row of "?" fields.
+        if json["type"] as? String == "caps" { return }
+        func string(_ key: String) -> String {
+            if let s = json[key] as? String { return s }
+            if let n = json[key] as? NSNumber { return n.stringValue }
+            return "?"
+        }
+        func decimals(_ key: String, _ places: Int) -> String {
+            guard let n = json[key] as? NSNumber else { return "?" }
+            return String(format: "%.\(places)f", n.doubleValue)
+        }
+        // Chromium reports a two-track SourceBuffer's buffered ranges as
+        // the INTERSECTION of the tracks, so these pairs are what the
+        // proxy log's buffStart must fall inside.
+        var buffered = "?"
+        if let ranges = json["buffered"] as? [[Any]] {
+            let pairs = ranges.compactMap { pair -> String? in
+                guard pair.count >= 2,
+                      let a = pair[0] as? NSNumber, let b = pair[1] as? NSNumber else { return nil }
+                return String(format: "[%.3f-%.3f]", a.doubleValue, b.doubleValue)
+            }
+            buffered = pairs.isEmpty ? "none" : pairs.joined()
+        }
+        var seek = "?"
+        if json["seek"] is NSNull {
+            seek = "none"
+        } else if let pair = json["seek"] as? [Any], pair.count >= 2,
+                  let a = pair[0] as? NSNumber, let b = pair[1] as? NSNumber {
+            seek = String(format: "[%.3f-%.3f]", a.doubleValue, b.doubleValue)
+        } else if json["seek"] == nil {
+            seek = "?"
+        }
+        var bandwidth = "?"
+        if let bw = json["bw"] as? NSNumber { bandwidth = String(Int(bw.doubleValue)) }
+        var error = "?"
+        if json["err"] is NSNull { error = "none" } else if json["err"] != nil { error = string("err") }
+        var history = "?"
+        if let entries = json["hist"] as? [Any], let last = entries.last {
+            history = String(describing: last)
+        } else if json["hist"] != nil {
+            history = string("hist")
+        }
+        // Anything the receiver adds later still reaches the log: the known
+        // keys keep their order and formatting, then every remaining top-level
+        // key prints generically. "type"/"mse" belong to the caps path above
+        // and would only repeat it here.
+        let known: Set<String> = [
+            "ev", "t", "buffered", "ready", "state", "rate",
+            "seek", "bufTime", "bw", "hist", "err", "type", "mse",
+        ]
+        var extras = ""
+        for key in json.keys.sorted() where !known.contains(key) {
+            let value = json[key]
+            let text: String
+            switch value {
+            case is NSNull, nil:
+                text = "null"
+            case let s as String:
+                text = s
+            case let n as NSNumber:
+                text = n.stringValue
+            default:
+                if let data = try? JSONSerialization.data(withJSONObject: value as Any),
+                   let compact = String(data: data, encoding: .utf8) {
+                    text = compact
+                } else {
+                    text = String(describing: value as Any)
+                }
+            }
+            extras += " \(key)=\(text)"
+        }
+        if let st = json["state"] as? String { receiverPlayerState = st }
+        noteCompositeReceiverTick(json)
+        if let r = json["rate"] as? NSNumber { receiverPlaybackRate = r.doubleValue }
+        noteReceiverVideo(json)
+        var line = "[Cast] receiver: ev=\(string("ev")) t=\(decimals("t", 3)) "
+            + "buffered=\(buffered) ready=\(string("ready")) state=\(string("state")) "
+            + "rate=\(string("rate")) seek=\(seek) bufTime=\(decimals("bufTime", 2)) "
+            + "bw=\(bandwidth) hist=\(history) err=\(error)" + extras
+        if line.count > 1000 { line = String(line.prefix(997)) + "..." }
+        debugLog(line)
+    }
+}
+
+// MARK: - Companion remote client (GH #33 second-screen)
+
+/// LAN remote for the AstralTV ANDROID TV app: the TV advertises `_astraltv._tcp`
+/// and runs a WebSocket server; this client discovers it (NWBrowser), pairs
+/// with the TV's 6-digit code (token remembered per TV afterwards), and drives
+/// the TV's native player. The wire format is EXACTLY the Android
+/// CompanionProtocol + CastControl JSON: session frames carry "t"
+/// (hello/auth/authOk/authFail), control frames carry "cmd". Channel identity
+/// is the ANDROID id format -- "disp:<uuid>" for Dispatcharr channels -- so
+/// companion channel control is Dispatcharr-only (both platforms share the
+/// server uuid; XC/M3U ids don't translate across apps).
+///
+/// Unlike casting, Disconnect leaves the TV playing (it's the user's own
+/// device; Android device-verified UX 2026-07-15) and the phone just returns
+/// to the guide -- no local resume.
+@MainActor
+final class CompanionClient: NSObject, ObservableObject {
+
+    static let shared = CompanionClient()
+
+    struct TV: Identifiable, Equatable {
+        let id: String          // TXT "id" when present, else the service name
+        let name: String
+        let endpoint: NWEndpoint
+    }
+
+    enum Conn: Equatable {
+        case idle
+        case connecting(String?)
+        /// Connected but unauthenticated: the TV is showing a pairing code.
+        case needsPairing(String?)
+        case connected(String?)
+    }
+
+    /// One audio/subtitle track the phone's picker renders.
+    struct Track: Identifiable, Equatable {
+        let id: String
+        let label: String
+        let selected: Bool
+    }
+
+    /// Full option state pushed by the TV (CMD_STATE) -- powers the phone's
+    /// audio/subtitle/speed/aspect pickers + the rewind scrubber. Same shape as
+    /// the Android CastControl.RemoteState.
+    struct RemoteState: Equatable {
+        var audio: [Track] = []
+        var text: [Track] = []
+        var textOff = true
+        var speed: Double = 1
+        var aspect = "fit"
+        var streamInfo = ""
+        var canSeek = false
+        var isLive = true
+        var positionWallMs: Int64 = 0
+        var windowStartMs: Int64 = 0
+        var windowEndMs: Int64 = 0
+        var audioOnly = false
+    }
+
+    @Published private(set) var devices: [TV] = []
+    @Published private(set) var conn: Conn = .idle
+    @Published private(set) var remoteIsPlaying = true
+    /// Full options snapshot from the TV (tracks / speed / aspect / rewind).
+    @Published private(set) var remoteState = RemoteState()
+    /// Best-effort title of what the TV plays (hello frame / what we sent).
+    @Published private(set) var nowPlaying = ""
+    /// Android-format channel id ("disp:<uuid>") this phone last sent.
+    @Published private(set) var controllingChannelID: String?
+
+    var isControlling: Bool { if case .connected = conn { return true } else { return false } }
+    var connectedTVName: String? { if case .connected(let n) = conn { return n } else { return nil } }
+
+    private var browser: NWBrowser?
+    private var socket: URLSessionWebSocketTask?
+    private var resolver: NWConnection?
+    private var currentTV: TV?
+    /// Monotonic attempt counter: a cancelled attempt's async tail must never
+    /// clobber its successor's state (Android adversarial-review lesson).
+    private var generation = 0
+
+    // MARK: Discovery
+
+    /// True between startDiscovery() and stopDiscovery(): the auto-restart
+    /// paths only revive a browse the app still wants.
+    private var discoveryWanted = false
+
+    func startDiscovery() {
+        discoveryWanted = true
+        guard browser == nil else { return }
+        let b = NWBrowser(
+            for: .bonjourWithTXTRecord(type: "_astraltv._tcp", domain: nil),
+            using: NWParameters()
+        )
+        b.browseResultsChangedHandler = { [weak self] results, _ in
+            // Raw dump (GH #33 field debugging): every result with its full
+            // endpoint + TXT so ghost-vs-real mysteries are diagnosable from
+            // the device log.
+            let dump = results.map { r -> String in
+                var txt = "-"
+                if case .bonjour(let t) = r.metadata { txt = t.dictionary.description }
+                return "\(r.endpoint) txt=\(txt) if=\(r.interfaces.map { "\($0.type)" }.joined(separator: "+"))"
+            }.joined(separator: " | ")
+            DebugLogger.shared.log("companion browse results (\(results.count)): \(dump)")
+            let adverts: [Advert] = results.compactMap { result in
+                guard case .service(let name, _, _, _) = result.endpoint else { return nil }
+                var txtID: String?
+                if case .bonjour(let txt) = result.metadata,
+                   let id = txt.dictionary["id"], !id.isEmpty {
+                    txtID = id
+                }
+                return Advert(txtID: txtID, name: name, endpoint: result.endpoint)
+            }.sorted { $0.name.lowercased() < $1.name.lowercased() }
+            Task { @MainActor [weak self] in self?.publishDevices(adverts) }
+        }
+        // An NWBrowser that dies while the app is suspended reports .failed on
+        // resume; without this handler the wedged instance also blocked
+        // startDiscovery()'s nil guard forever, freezing `devices` with ghost
+        // entries (2026-07-16: picker kept a stale "Apple TV" and never saw
+        // its "Living Room" re-registration, so connecting just timed out).
+        b.stateUpdateHandler = { [weak self] state in
+            DebugLogger.shared.log("companion browser state: \(state)")
+            if case .failed = state {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.browser?.cancel()
+                    self.browser = nil
+                    if self.discoveryWanted { self.startDiscovery() }
+                }
+            }
+        }
+        b.start(queue: .main)
+        browser = b
+    }
+
+    func stopDiscovery() {
+        discoveryWanted = false
+        browser?.cancel()
+        browser = nil
+        devices = []
+    }
+
+    /// Scene-foreground re-assert: restart the browse if it is missing or not
+    /// healthy. `devices` is intentionally NOT cleared here -- the fresh
+    /// browser's first results callback replaces the list wholesale, so ghost
+    /// entries drop without the Control-TV button blinking on every foreground.
+    func ensureDiscovery() {
+        guard discoveryWanted else { return }
+        if let b = browser, case .ready = b.state { return }
+        browser?.cancel()
+        browser = nil
+        startDiscovery()
+    }
+
+    // MARK: Ghost filtering
+
+    /// Connect-failed quarantine. The phone's system mDNS cache keeps a dead
+    /// service's PTR record for up to 75 min when the goodbye packets were
+    /// missed (phone suspended), so a fresh browse can list TVs that no longer
+    /// exist (2026-07-16: two ghost "Apple TV" rows after the ATV renamed).
+    /// A failed connect is the one reliable ghost detector: hide that entry
+    /// for a while (a real TV that was just briefly unreachable comes back on
+    /// the next results change or after the window).
+    private var deadTVs: [String: Date] = [:]
+    private static let deadTVWindow: TimeInterval = 60
+
+    private static func tvKey(_ tv: TV) -> String { "\(tv.id)|\(tv.name)" }
+
+    /// One raw Bonjour advertisement, before duplicates are collapsed. Kept
+    /// separate from `TV` so the dedupe can see the TXT id and the endpoint
+    /// that the picker row itself never shows.
+    private struct Advert {
+        let txtID: String?
+        let name: String
+        let endpoint: NWEndpoint
+    }
+
+    /// Per-advertisement identity (NOT the device identity): two adverts for
+    /// the same device differ here, which is what lets the dedupe keep the one
+    /// that resolved most recently.
+    private static func advertKey(_ a: Advert) -> String {
+        "\(a.txtID ?? "-")|\(a.name)|\(a.endpoint)"
+    }
+
+    /// First time each advertisement was seen, so a group of duplicates can
+    /// keep the newest registration. Pruned to what the browse still reports.
+    private var advertSeen: [String: Date] = [:]
+
+    /// Collapse duplicate rows and hide quarantined ghosts.
+    ///
+    /// 2026-09-13: the "AstralTV Remote" section listed "Living Room Apple TV"
+    /// twice for one device. The old key was id + display name, and the id
+    /// falls back to the display name when an advert carries no TXT "id", so
+    /// a stale advert (no TXT id) and the fresh one (with TXT id) produced two
+    /// keys and two identical-looking rows. Identity is now the STABLE
+    /// identifier only: the TXT "id" record, which survives a rename, plus the
+    /// Bonjour instance name (the host name, which mDNS keeps unique per
+    /// network) so a TXT-less advert still lands in the same group. Several
+    /// interfaces for one device collapse the same way. The surviving row is
+    /// the advertisement that resolved most recently.
+    private func publishDevices(_ adverts: [Advert]) {
+        let now = Date()
+        var liveKeys = Set<String>()
+        for a in adverts {
+            let key = Self.advertKey(a)
+            liveKeys.insert(key)
+            if advertSeen[key] == nil { advertSeen[key] = now }
+        }
+        advertSeen = advertSeen.filter { liveKeys.contains($0.key) }
+
+        var groupForTXTID: [String: Int] = [:]
+        var groupForHost: [String: Int] = [:]
+        var groups: [[Advert]] = []
+        for a in adverts {
+            var group: Int?
+            if let id = a.txtID { group = groupForTXTID[id] }
+            if group == nil { group = groupForHost[a.name] }
+            let index: Int
+            if let group {
+                index = group
+            } else {
+                groups.append([])
+                index = groups.count - 1
+            }
+            groups[index].append(a)
+            if let id = a.txtID { groupForTXTID[id] = index }
+            groupForHost[a.name] = index
+        }
+
+        var kept: [Advert] = []
+        for group in groups {
+            guard var winner = group.first else { continue }
+            for a in group.dropFirst() {
+                let aSeen = advertSeen[Self.advertKey(a)] ?? now
+                let wSeen = advertSeen[Self.advertKey(winner)] ?? now
+                // Most recently resolved wins; on a tie the advert carrying a
+                // TXT id is the better-identified one.
+                if aSeen > wSeen || (aSeen == wSeen && winner.txtID == nil && a.txtID != nil) {
+                    winner = a
+                }
+            }
+            for a in group where Self.advertKey(a) != Self.advertKey(winner) {
+                DebugLogger.shared.log(
+                    "[Remote] dropped duplicate advertisement \(a.name) \(a.endpoint)")
+            }
+            kept.append(winner)
+        }
+
+        devices = kept.map { TV(id: $0.txtID ?? $0.name, name: $0.name, endpoint: $0.endpoint) }
+            .filter { tv in
+                let key = Self.tvKey(tv)
+                if let died = deadTVs[key],
+                   Date().timeIntervalSince(died) < Self.deadTVWindow { return false }
+                return true
+            }
+    }
+
+    private func quarantine(_ tv: TV) {
+        let key = Self.tvKey(tv)
+        deadTVs[key] = Date()
+        devices.removeAll { Self.tvKey($0) == key }
+    }
+
+    // MARK: Connection
+
+    func connect(to tv: TV) {
+        // Mutual exclusion with casting: cast is the heavier transport and
+        // wins (review 2026-07-16). The companion picker button is already
+        // hidden while casting; this guards the programmatic path too.
+        guard !AstralCastController.shared.isCasting else { return }
+        disconnect(userInitiated: false)
+        currentTV = tv
+        generation += 1
+        let gen = generation
+        conn = .connecting(tv.name)
+        // The TV's WS server lives at ws://host:port/remote; a Bonjour endpoint
+        // carries neither, so resolve first: open a throwaway TCP connection to
+        // the service endpoint and read the remote host:port off its path.
+        let probe = NWConnection(to: tv.endpoint, using: .tcp)
+        resolver = probe
+        probe.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self, gen == self.generation else { return }
+                switch state {
+                case .ready:
+                    let remote = probe.currentPath?.remoteEndpoint
+                    probe.cancel()
+                    self.resolver = nil
+                    if case .hostPort(let host, let port)? = remote {
+                        self.openSocket(host: host, port: port, gen: gen)
+                    } else {
+                        self.conn = .idle
+                    }
+                case .failed, .cancelled:
+                    if case .connecting = self.conn, self.resolver != nil {
+                        self.resolver = nil
+                        self.conn = .idle
+                        self.quarantine(tv)
+                    }
+                default:
+                    // .waiting (unreachable host / connection refused) retries
+                    // forever with default NWParameters, so never resolves on
+                    // its own -- the timeout below is the only escape.
+                    break
+                }
+            }
+        }
+        probe.start(queue: .main)
+        // Fail an unresolvable pick (ghost mDNS record, dead WS server) instead
+        // of spinning "Connecting…" forever (review 2026-07-16).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self, gen == self.generation, self.resolver != nil else { return }
+            self.resolver?.cancel()
+            self.resolver = nil
+            if case .connecting = self.conn { self.conn = .idle }
+            self.quarantine(tv)
+        }
+    }
+
+    private func openSocket(host: NWEndpoint.Host, port: NWEndpoint.Port, gen: Int) {
+        // Bracket IPv6, and PRESERVE the %interface zone (link-local fe80::/10
+        // is common on flat home LANs and unroutable without its scope) by
+        // percent-encoding it as %25<zone> per RFC 6874 -- NOT stripping it,
+        // which black-holed link-local companion connections (review 2026-07-16).
+        var h = "\(host)"
+        if h.contains(":") {
+            h = h.replacingOccurrences(of: "%", with: "%25")
+            h = "[\(h)]"
+        }
+        guard let url = URL(string: "ws://\(h):\(port)/remote") else {
+            conn = .idle
+            return
+        }
+        let task = URLSession.shared.webSocketTask(with: url)
+        socket = task
+        task.resume()
+        // Authenticate immediately: remembered token, or blank to make the TV
+        // show a pairing code (it answers authFail + needsPairing).
+        sendJSON(["t": "auth", "token": storedToken(), "code": ""])
+        receiveLoop(task: task, gen: gen)
+    }
+
+    private func receiveLoop(task: URLSessionWebSocketTask, gen: Int) {
+        task.receive { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self, gen == self.generation else { return }
+                switch result {
+                case .success(let message):
+                    if case .string(let text) = message,
+                       let data = text.data(using: .utf8),
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        self.handle(json)
+                    }
+                    self.receiveLoop(task: task, gen: gen)
+                case .failure:
+                    self.socket = nil
+                    self.conn = .idle
+                    self.controllingChannelID = nil
+                    self.nowPlaying = ""
+                }
+            }
+        }
+    }
+
+    /// Liveness: both hosts tick ~1Hz while a session is authed, so silence
+    /// means the TV app died/restarted (2026-07-16 test: the phone sat frozen
+    /// on "Controlling Living Room" after a tvOS redeploy). Tear the session
+    /// down instead of leaving a dead remote on screen.
+    private var lastMessageAt = Date()
+    private var livenessTask: Task<Void, Never>?
+
+    private func startLiveness(gen: Int) {
+        livenessTask?.cancel()
+        lastMessageAt = Date()
+        livenessTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard let self, gen == self.generation, self.isControlling else { return }
+                if Date().timeIntervalSince(self.lastMessageAt) > 12 {
+                    debugLog("companion liveness: no traffic for 12s -> dropping session")
+                    self.disconnect(userInitiated: false)
+                    self.conn = .idle
+                    return
+                }
+            }
+        }
+    }
+
+    private func handle(_ json: [String: Any]) {
+        lastMessageAt = Date()
+        if let t = json["t"] as? String, !t.isEmpty {
+            switch t {
+            case "hello":
+                if let np = json["nowPlaying"] as? String, !np.isEmpty { nowPlaying = np }
+                // Hosts that handle multiview.open say so (Logan 2026-10-06).
+                hostMultiviewCapable = json["multiview"] as? Bool ?? false
+                Self.clog("host multiview capable=\(hostMultiviewCapable)")
+            case "authOk":
+                let remembered = (json["token"] as? String)?.isEmpty == false
+                if let token = json["token"] as? String, !token.isEmpty { storeToken(token) }
+                conn = .connected(currentTV?.name)
+                Self.clog("authOk -> connected to \(currentTV?.name ?? "TV") (token=\(remembered ? "issued" : "none"))")
+                onControllingStarted()
+                requestState()
+                startLiveness(gen: generation)
+            case "authFail":
+                conn = .needsPairing(currentTV?.name)
+                Self.clog("authFail reason=\(json["reason"] as? String ?? "?") -> needs pairing", level: .warning)
+            default:
+                break
+            }
+            return
+        }
+        switch json["cmd"] as? String {
+        case "multiview.opened":
+            debugLog("[MV-CAST] reply from \(connectedTVName ?? "TV"): multiview.opened count=\((json["count"] as? NSNumber)?.intValue ?? -1)")
+        case "multiview.error":
+            debugLog("[MV-CAST] reply from \(connectedTVName ?? "TV"): multiview.error error=\(json["error"] as? String ?? "?")")
+        case "state":
+            remoteState = Self.decodeState(json)
+            if let playing = json["isPlaying"] as? Bool { remoteIsPlaying = playing }
+            // Adopt the TV's reported channel as the flip anchor -- covers
+            // connecting to a TV that is already playing something this phone
+            // didn't start (and TVs that switch channels on their own remote).
+            if let cid = json["channelId"] as? String, !cid.isEmpty {
+                if cid != controllingChannelID { Self.clog("state anchor adopt \(cid) audioOnly=\(remoteState.audioOnly)") }
+                controllingChannelID = cid
+            }
+            if let np = json["nowPlaying"] as? String, !np.isEmpty { nowPlaying = np }
+        case "position":
+            if let playing = json["isPlaying"] as? Bool { remoteIsPlaying = playing }
+            // Live scrubber fields crawl via the ~1Hz tick.
+            var s = remoteState
+            if let v = json["canSeek"] as? Bool { s.canSeek = v }
+            if let v = json["isLive"] as? Bool { s.isLive = v }
+            if let v = Self.int64(json["positionWallMs"]) { s.positionWallMs = v }
+            if let v = Self.int64(json["windowStartMs"]) { s.windowStartMs = v }
+            if let v = Self.int64(json["windowEndMs"]) { s.windowEndMs = v }
+            remoteState = s
+            // The anchor also rides the tick: the Android host's post-setChannel
+            // full-state push races its async re-prime (it still carries the OLD
+            // channel), and nothing else re-sent channelId -- Switch Stream then
+            // targeted the previous channel (2026-07-17 Streamer test).
+            if let cid = json["channelId"] as? String, !cid.isEmpty {
+                controllingChannelID = cid
+            }
+        default:
+            break
+        }
+    }
+
+    static func decodeState(_ json: [String: Any]) -> RemoteState {
+        func tracks(_ key: String) -> [Track] {
+            (json[key] as? [[String: Any]] ?? []).map {
+                Track(id: $0["id"] as? String ?? "",
+                      label: $0["label"] as? String ?? "",
+                      selected: $0["selected"] as? Bool ?? false)
+            }
+        }
+        var s = RemoteState()
+        s.audio = tracks("audio")
+        s.text = tracks("text")
+        s.textOff = json["textOff"] as? Bool ?? true
+        s.speed = json["speed"] as? Double ?? 1
+        s.aspect = json["aspect"] as? String ?? "fit"
+        s.streamInfo = json["streamInfo"] as? String ?? ""
+        s.canSeek = json["canSeek"] as? Bool ?? false
+        s.isLive = json["isLive"] as? Bool ?? true
+        s.positionWallMs = int64(json["positionWallMs"]) ?? 0
+        s.windowStartMs = int64(json["windowStartMs"]) ?? 0
+        s.windowEndMs = int64(json["windowEndMs"]) ?? 0
+        s.audioOnly = json["audioOnly"] as? Bool ?? false
+        return s
+    }
+
+    private static func int64(_ v: Any?) -> Int64? {
+        if let i = v as? Int64 { return i }
+        if let i = v as? Int { return Int64(i) }
+        if let d = v as? Double { return Int64(d) }
+        return nil
+    }
+
+    /// User typed the 6-digit code shown on the TV.
+    func submitPairingCode(_ code: String) {
+        conn = .connecting(currentTV?.name)
+        sendJSON(["t": "auth", "token": "", "code": code.trimmingCharacters(in: .whitespaces)])
+    }
+
+    /// Stop controlling. The TV keeps playing; the phone does NOT resume local
+    /// playback (companion Disconnect semantics, device-verified on Android).
+    func disconnect(userInitiated: Bool = true) {
+        if isControlling { Self.clog("disconnect(userInitiated=\(userInitiated)) from \(connectedTVName ?? "TV")") }
+        generation += 1
+        socket?.cancel(with: .normalClosure, reason: nil)
+        socket = nil
+        resolver?.cancel()
+        resolver = nil
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepEndsAt = nil
+        if userInitiated || conn != .idle {
+            conn = .idle
+            controllingChannelID = nil
+            nowPlaying = ""
+            remoteState = RemoteState()
+        }
+    }
+
+    // MARK: Sleep timer (Android companion-overlay parity)
+
+    /// When the armed timer fires (nil = off). Phone-side countdown, like the
+    /// Android overlay: the session is the user's own TV, so expiry PAUSES it
+    /// (a cast would be stopped) and drops the remote cover.
+    @Published private(set) var sleepEndsAt: Date?
+    private var sleepTimerTask: Task<Void, Never>?
+
+    /// Arm (minutes > 0) or cancel (0) the sleep timer.
+    func armSleepTimer(minutes: Int) {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        guard minutes > 0 else { sleepEndsAt = nil; Self.clog("sleep timer cancelled"); return }
+        sleepEndsAt = Date().addingTimeInterval(TimeInterval(minutes) * 60)
+        Self.clog("sleep timer armed: \(minutes)m")
+        sleepTimerTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(minutes) * 60 * 1_000_000_000)
+            guard !Task.isCancelled, let self, self.isControlling else { return }
+            Self.clog("sleep timer fired -> pausing TV")
+            self.pause()
+            self.sleepEndsAt = nil
+        }
+    }
+
+    // MARK: Control surface
+
+    /// Fresh companion session: mirror the currently playing channel to the TV,
+    /// then tear down local playback (same swap as casting).
+    private func onControllingStarted() {
+        guard let item = NowPlayingManager.shared.playingItem,
+              let androidID = Self.androidChannelID(for: item) else { return }
+        setChannel(androidID, title: item.name)
+        AppOrientationLock.release()
+        PlayerSession.shared.stop()
+    }
+
+    /// Shared diagnostic breadcrumb for the companion remote. Gated behind the
+    /// user's debug-logging pref (DebugLogger); safe to leave in Release so a
+    /// user hitting a bug can flip logging on, reproduce, and send the file.
+    static func clog(_ message: String, level: LogLevel = .info) {
+        DebugLogger.shared.log("[Companion] \(message)", category: "Companion", level: level)
+    }
+
+    func setChannel(_ androidChannelID: String, title: String?) {
+        controllingChannelID = androidChannelID
+        if let title, !title.isEmpty { nowPlaying = title }
+        sendJSON(["cmd": "setChannel", "channelId": androidChannelID])
+        Self.clog("-> TV setChannel \(androidChannelID) title=\(title ?? "-")")
+    }
+
+    func togglePlayPause() { sendJSON(["cmd": "toggle"]); Self.clog("-> TV toggle") }
+
+    /// The connected host's hello carried `"multiview": true`.
+    @Published private(set) var hostMultiviewCapable = false
+
+    /// Open Multiview on the controlled TV with these channels, in order
+    /// (Logan 2026-10-06). Frame shared with the Cast path:
+    /// MultiviewRemoteCommand.openFrame.
+    @discardableResult
+    func openMultiview(_ channels: [ChannelDisplayItem], focus: Int) -> Bool {
+        let frame = MultiviewRemoteCommand.openFrame(channels, focus: focus)
+        let n = (frame["channels"] as? [Any])?.count ?? 0
+        guard n > 0 else {
+            debugLog("[MV-CAST] multiview.open not sent: no Dispatcharr ids")
+            return false
+        }
+        sendJSON(frame)
+        debugLog("[MV-CAST] sent multiview.open to \(connectedTVName ?? "TV") channels=\(n)")
+        return true
+    }
+
+    // Full options surface (parity with the Android companion overlay).
+    func requestState() { sendJSON(["cmd": "getState"]) }
+    func setAudioTrack(_ id: String) { sendJSON(["cmd": "setAudio", "id": id]); Self.clog("-> TV setAudio \(id)") }
+    func setTextTrack(_ id: String?) { sendJSON(["cmd": "setText", "id": id ?? ""]); Self.clog("-> TV setText \(id ?? "off")") }
+    func setSpeed(_ speed: Double) { sendJSON(["cmd": "setSpeed", "speed": speed]); Self.clog("-> TV setSpeed \(speed)") }
+    func setAspect(_ key: String) { sendJSON(["cmd": "setAspect", "aspect": key]); Self.clog("-> TV setAspect \(key)") }
+    func pause() { sendJSON(["cmd": "pause"]); Self.clog("-> TV pause") }
+    func play() { sendJSON(["cmd": "play"]); Self.clog("-> TV play") }
+    func setAudioOnly(_ on: Bool) { sendJSON(["cmd": "setAudioOnly", "audioOnly": on]); Self.clog("-> TV setAudioOnly \(on)") }
+    func seekBy(_ deltaMs: Int64) { sendJSON(["cmd": "seekBy", "deltaMs": deltaMs]) }
+    func seekToWall(_ ms: Int64) { sendJSON(["cmd": "seekWall", "targetWallMs": ms]) }
+    func goLive() { sendJSON(["cmd": "goLive"]) }
+
+    /// The card's X for the companion transport (Logan 2026-09-12): stop what
+    /// the TV is playing AND close the card, the same as Cast and AirPlay. The
+    /// stop frame has to reach the TV before the socket goes away, so the
+    /// disconnect rides the send completion (with a short fallback in case the
+    /// completion never fires on a half-dead socket).
+    func stopPlaybackAndDisconnect() {
+        debugLog("[Remote] X: stop + close")
+        guard let socket,
+              let data = try? JSONSerialization.data(withJSONObject: ["cmd": "stop"]),
+              let text = String(data: data, encoding: .utf8) else {
+            disconnect()
+            return
+        }
+        var closed = false
+        let close: @MainActor () -> Void = { [weak self] in
+            guard !closed else { return }
+            closed = true
+            self?.disconnect()
+        }
+        socket.send(.string(text)) { _ in
+            Task { @MainActor in close() }
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            close()
+        }
+    }
+
+    /// Companion-only "Disconnect" (controls sheet): drop the link and hide the
+    /// card, but leave the TV playing what it is playing.
+    func disconnectLeavingTVPlaying() {
+        debugLog("[Remote] disconnect, TV keeps playing")
+        disconnect()
+    }
+
+    /// Channel up/down: walk ChannelStore for the next Dispatcharr channel
+    /// (companion ids only translate for Dispatcharr sources).
+    func flipChannel(_ delta: Int) {
+        let channels = ChannelStore.shared.channels
+        var idx: Int
+        if let currentID = controllingChannelID,
+           let cur = channels.firstIndex(where: { Self.androidChannelID(for: $0) == currentID }) {
+            idx = cur
+        } else {
+            // No anchor (TV idle on its guide, or playing something we can't
+            // map): behave like a real remote and start from the ends -- up
+            // tunes the first controllable channel, down the last.
+            idx = delta > 0 ? -1 : channels.count
+        }
+        for _ in 0..<channels.count {
+            idx += delta
+            guard channels.indices.contains(idx) else { return } // clamp at ends
+            let item = channels[idx]
+            if let androidID = Self.androidChannelID(for: item) {
+                setChannel(androidID, title: item.name)
+                return
+            }
+        }
+    }
+
+    /// The ANDROID app's channel id for a channel this iOS app knows:
+    /// Dispatcharr channels share the server uuid ("disp:<uuid>" on Android).
+    /// nil for XC/M3U (ids don't translate; companion control unavailable).
+    static func androidChannelID(for item: ChannelDisplayItem) -> String? {
+        guard let uuid = item.uuid, !uuid.isEmpty else { return nil }
+        return "disp:\(uuid)"
+    }
+
+    private func sendJSON(_ dict: [String: Any]) {
+        guard let socket,
+              let data = try? JSONSerialization.data(withJSONObject: dict),
+              let text = String(data: data, encoding: .utf8) else { return }
+        socket.send(.string(text)) { _ in }
+    }
+
+    // MARK: Token store (per TV)
+
+    private func tokenKey() -> String { "companion.token.\(currentTV?.id ?? "unknown")" }
+    private func storedToken() -> String {
+        UserDefaults.standard.string(forKey: tokenKey()) ?? ""
+    }
+    private func storeToken(_ token: String) {
+        UserDefaults.standard.set(token, forKey: tokenKey())
+    }
+}
+
+// MARK: - Native (AstralTV on TV) Cast device registry
+
+/// Cast devices that answered the `hello` handshake with
+/// platform=android-tv-app at least once, i.e. Cast Connect launched the
+/// AstralTV Android TV app there. The Cast SDK cannot tell us this before a
+/// session exists, so the picker remembers the answer and groups those
+/// devices separately from here on. Persisted in UserDefaults: it is a hint
+/// for sectioning, never a gate on playback.
+@MainActor
+final class CastNativeDeviceRegistry: ObservableObject {
+
+    static let shared = CastNativeDeviceRegistry()
+
+    private static let key = "cast.nativeDeviceIDs"
+
+    @Published private(set) var ids: Set<String>
+
+    private init() {
+        ids = Set(UserDefaults.standard.stringArray(forKey: Self.key) ?? [])
+    }
+
+    func isNative(_ deviceID: String) -> Bool { ids.contains(deviceID) }
+
+    func markNative(_ deviceID: String) {
+        guard !deviceID.isEmpty, !ids.contains(deviceID) else { return }
+        ids.insert(deviceID)
+        UserDefaults.standard.set(Array(ids), forKey: Self.key)
+        debugLog("[Cast] device \(deviceID) recorded as AstralTV on TV")
+    }
+
+    /// Only a web receiver's own answer calls this; a handshake timeout is
+    /// not evidence the TV app is gone.
+    func forget(_ deviceID: String) {
+        guard ids.contains(deviceID) else { return }
+        ids.remove(deviceID)
+        UserDefaults.standard.set(Array(ids), forKey: Self.key)
+        debugLog("[Cast] device \(deviceID) no longer AstralTV on TV")
+    }
+}
+
+// MARK: - SwiftUI Cast button
+
+/// Wraps the SDK's GCKUICastButton (which owns discovery + the device chooser).
+struct CastButton: UIViewRepresentable {
+    var tint: UIColor = .white
+
+    func makeUIView(context: Context) -> GCKUICastButton {
+        let button = GCKUICastButton(frame: CGRect(x: 0, y: 0, width: 24, height: 24))
+        button.tintColor = tint
+        return button
+    }
+
+    func updateUIView(_ uiView: GCKUICastButton, context: Context) {
+        uiView.tintColor = tint
+    }
+}
+
+// MARK: - Cast remote cover (GH #33 basic cast)
+
+/// Remote sheet for the companion transport (AstralTV on TV). Google Cast and
+/// AirPlay moved to RemoteSessionSheet (2026-09-21 production layout). Local playback is torn down underneath;
+/// this drives the TV. One layout, two transports -- the callbacks decide.
+/// Inlined here (not its own file) so no pbxproj target surgery is needed.
+struct RemoteControlScreen: View {
+    var title: String
+    var subtitle: String?
+    var artURL: String?
+    var statusText: String       // "Casting to X" / "Controlling X"
+    var isPlaying: Bool
+    var stopLabel: String        // "Stop casting" / "Disconnect"
+    var onTogglePlayPause: () -> Void
+    var onChannelUp: () -> Void
+    var onChannelDown: () -> Void
+    var onStop: () -> Void
+    /// Companion transport only (Logan 2026-09-12): drop the connection and
+    /// hide the card while the TV KEEPS PLAYING. The X above is the other
+    /// semantic (stop the TV as well), so both need to exist here.
+    var onDisconnect: (() -> Void)? = nil
+    /// Non-nil for the companion transport (full options: scrubber + Options
+    /// sheet). nil for basic cast (web receiver has no control namespace).
+    var companion: CompanionClient? = nil
+
+    @State private var showOptions = false
+    // Skip Intervals (Settings > App Behaviors) for the skip row.
+    @AppStorage(SkipIntervals.backKey) private var skipBackSeconds = SkipIntervals.defaultBack
+    @AppStorage(SkipIntervals.forwardKey) private var skipForwardSeconds = SkipIntervals.defaultForward
+    @Environment(\.dismiss) private var dismiss
+
+    /// Compact bottom-sheet layout (Logan 2026-09-13): Android's cast sheet,
+    /// not a full-screen page. Grabber, centered transport glyph, channel /
+    /// program / accent status, the live bar, a skip row, then the bottom
+    /// row (collapse, big play/pause, channel list, X). Every action the old
+    /// full-screen remote had is still wired.
+    /// Measured height of the compact content, so the small detent ends just
+    /// below the bottom row instead of leaving the blank band a fixed
+    /// fraction left behind (Logan's screenshot 2026-09-13).
+    @State private var contentHeight: CGFloat = 320
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack(spacing: 10) {
+                header
+                if let companion, companion.remoteState.canSeek {
+                    rewindBar(companion)
+                } else {
+                    liveLabel
+                }
+                skipRow
+                bottomRow
+                if let onDisconnect {
+                    Button("Disconnect (leave TV playing)", action: onDisconnect)
+                        .scaledFont(.footnote.weight(.semibold))
+                        .foregroundStyle(ThemeManager.shared.accent)
+                }
+            }
+            .padding(.horizontal, 24)
+            // Top padding clears the drag indicator.
+            .padding(.top, 18)
+            .padding(.bottom, 8)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { height in
+                let rounded = (height * 2).rounded() / 2
+                if abs(contentHeight - rounded) > 0.5 { contentHeight = rounded }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        // Small sheet over the page the user was on (the channel list stays
+        // visible above it), draggable up to full height for the options.
+        .presentationDetents([.height(contentHeight + Self.bottomInset), .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(Color.black)
+        .sheet(isPresented: $showOptions) {
+            if let companion {
+                RemoteOptionsSheet(companion: companion)
+            }
+        }
+    }
+
+    /// Centered glyph (or the channel art when we have it), channel name in
+    /// bold, the program, then the accent "Casting to <device>" line.
+    @ViewBuilder
+    private var header: some View {
+        VStack(spacing: 2) {
+            if let art = artURL, let url = URL(string: art) {
+                AsyncImage(url: url) { image in
+                    image.resizable().scaledToFit()
+                } placeholder: {
+                    glyphIcon
+                }
+                .frame(maxWidth: 96, maxHeight: 44)
+            } else {
+                glyphIcon
+            }
+            Text(title)
+                .scaledFont(.headline.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            if let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .scaledFont(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(1)
+            }
+            Text(statusText)
+                .scaledFont(.caption)
+                .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                .lineLimit(1)
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var glyphIcon: some View {
+        Image(systemName: "sparkles.tv")
+            .font(.system(size: 30))  // glyph in a fixed box: not text, stays fixed
+            .foregroundStyle(ThemeManager.shared.accent)
+            .frame(height: 40)
+    }
+
+    /// Stand-in for the rewind bar when the transport cannot seek: a full
+    /// accent bar with the LIVE label, same slot as Android's.
+    private var liveLabel: some View {
+        VStack(spacing: 6) {
+            Capsule()
+                .fill(ThemeManager.shared.accent)
+                .frame(height: 4)
+            Text("LIVE")
+                .scaledFont(.caption2.weight(.semibold))
+                .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+
+    /// Skip back / forward (Settings > Skip Intervals) with the channel flip
+    /// on either side, so the channel-switch actions survive the condensed
+    /// layout.
+    private var skipRow: some View {
+        HStack(spacing: 18) {
+            transportButton("chevron.down", label: "Channel down",
+                            size: 44, action: onChannelDown)
+            transportButton(SkipIntervals.backSymbol(skipBackSeconds),
+                            label: "Skip back \(skipBackSeconds) seconds",
+                            size: 44) { seek(-Int64(skipBackSeconds) * 1000) }
+            transportButton(SkipIntervals.forwardSymbol(skipForwardSeconds),
+                            label: "Skip forward \(skipForwardSeconds) seconds",
+                            size: 44) { seek(Int64(skipForwardSeconds) * 1000) }
+            transportButton("chevron.up", label: "Channel up",
+                            size: 44, action: onChannelUp)
+        }
+    }
+
+    private var bottomRow: some View {
+        HStack(spacing: 22) {
+            transportButton("chevron.down", label: "Collapse", size: 50) { dismiss() }
+            Button(action: onTogglePlayPause) {
+                ZStack {
+                    Circle().fill(ThemeManager.shared.accent).frame(width: 64, height: 64)
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 26, weight: .bold))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(.black)
+                }
+            }
+            .accessibilityLabel(isPlaying ? "Pause" : "Play")
+            if companion != nil {
+                transportButton("list.bullet", label: "Channel list and options",
+                                size: 50) { showOptions = true }
+            }
+            transportButton("xmark", label: stopLabel, size: 50, action: onStop)
+        }
+    }
+
+    /// Skip Intervals skip: the companion transport seeks its live-rewind buffer; the other
+    /// transports flip nothing, so the buttons stay out of the way there.
+    /// Home-indicator inset: the detent height is the sheet's own height, so
+    /// the content must clear the safe area at the bottom.
+    private static var bottomInset: CGFloat {
+        let inset = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow?.safeAreaInsets.bottom }
+            .first ?? 0
+        return max(12, inset)
+    }
+
+    private func seek(_ deltaMs: Int64) {
+        guard let companion, companion.remoteState.canSeek else { return }
+        companion.seekBy(deltaMs)
+    }
+
+    /// Live-rewind scrubber + Go Live (companion only, when a rewind
+    /// buffer is rolling on the TV).
+    @ViewBuilder
+    private func rewindBar(_ companion: CompanionClient) -> some View {
+        let s = companion.remoteState
+        // The shared remote-session scrubber (identical on Cast and
+        // AirPlay), in wall-clock seconds; release seeks the TV's buffer.
+        let window = RemoteSeekWindow(start: Double(s.windowStartMs) / 1000,
+                                      end: Double(s.windowEndMs) / 1000,
+                                      position: Double(s.positionWallMs) / 1000,
+                                      isLive: true)
+        VStack(spacing: 4) {
+            RemoteTimelineScrubber(window: window) { target in
+                debugLog("[Cast] scrub seek to \(Int(target))s (companion wall clock)")
+                companion.seekToWall(Int64(target * 1000))
+            }
+            if !s.isLive {
+                HStack {
+                    Spacer()
+                    Button("Go Live") { companion.goLive() }
+                        .foregroundStyle(ThemeManager.shared.accent)
+                }
+                .scaledFont(.caption)
+            }
+        }
+    }
+
+    private func transportButton(_ symbol: String, label: String,
+                                 size: CGFloat = 58,
+                                 action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(Color.white.opacity(0.12)).frame(width: size, height: size)
+                Image(systemName: symbol)
+                    .font(.system(size: size * 0.38, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                    .foregroundStyle(.white)
+            }
+        }
+        .accessibilityLabel(label)
+    }
+}
+
+// MARK: - Remote session sheet (Cast + AirPlay, 2026-09-21 production recording)
+
+/// The ONE expanded sheet for Google Cast and AirPlay (Apple TV and Roku),
+/// laid out exactly like the production Google Cast session sheet in the
+/// 2026-09-21 screen recording; only the transport wording differs
+/// ("Casting to" / "Stop Casting" vs "AirPlay to" / "Stop AirPlay").
+/// The companion remote keeps RemoteControlScreen (scrubber, Disconnect).
+///  - idle route: "Close" on the left, "Connected" centered, nothing else.
+///  - playing (and connecting, controls disabled): logo, channel, accent
+///    "AirPlay to <receiver>", program + LIVE badge, time range + progress,
+///    Channel Down / Up, Back / Pause / Forward, Options, Stop AirPlay.
+struct RemoteSessionSheet: View {
+    /// idle: connected / route selected, nothing playing (production
+    /// 2026-09-25): transport glyph, device name, "Connected. Select a
+    /// channel to start." and a single Change Device button.
+    enum Mode { case connecting, playing, idle }
+    /// `.companion`: the AstralTV Remote driving the AstralTV TV app (Logan
+    /// 2026-10-11: the Remote sheet is the Cast sheet; only the glyph, the
+    /// "Controlling X" line and the Disconnect wording differ).
+    /// `.radio`: Radio Mode (local audio-only playback, Logan 2026-10-13):
+    /// the same sheet; the Change Device slot is "Switch to Video Mode".
+    enum Transport { case cast, airPlay, companion, radio }
+
+    var transport: Transport
+    var mode: Mode
+    var channelName: String
+    var statusText: String
+    var artURL: String?
+    /// Channel whose now-airing programme the sheet shows. Resolved live
+    /// against the same sources as the Live TV list row (item fields when
+    /// they cover now, else GuideStore's bulk EPG), so it never drifts from
+    /// the list and rolls over on its own when the programme changes.
+    var channelID: String?
+    /// Shown as the title when no programme is known (e.g. the cast
+    /// payload's EPG subtitle).
+    var fallbackSubtitle: String?
+    var isPlaying: Bool
+    /// The locally resolved channel, for the AirPlay Options sheet (Cast
+    /// anchors its options on the controller's own castingContent).
+    var item: ChannelDisplayItem?
+    var onTogglePlayPause: () -> Void
+    var onChannelUp: () -> Void
+    var onChannelDown: () -> Void
+    var onSeek: (Double) -> Void
+    var onStop: () -> Void
+    /// Idle only: "Change Cast Device" / "Change AirPlay Device".
+    var onChangeDevice: () -> Void = {}
+    /// Under the Stop button (Logan 2026-09-27: the resolution lines belong
+    /// in the expanded sheet, not the collapsed card): the "Receiver:" stat
+    /// and, while the phone transcodes, the two-line note.
+    var footnoteLines: [String] = []
+    /// The session's seekable window, polled about once a second while
+    /// the sheet is open. Non-nil turns the timeline into a scrubber; nil
+    /// (plain live) keeps the read-only programme bar.
+    var seekWindow: (() -> RemoteSeekWindow?)? = nil
+    /// Scrub release: one absolute seek, in the window's seconds.
+    var onSeekTo: (Double) -> Void = { _ in }
+    /// Phone-side Multiview composite (2026-10-06): live only, one grid, so
+    /// Channel Up/Down and Back/Forward are hidden; Play/Pause, Options and
+    /// Stop stay.
+    var compositeMultiview: Bool = false
+    /// A Multiview the AstralTV Android TV app runs over Cast Connect (Logan
+    /// 2026-10-08): its channels with the audio one marked and the Layout
+    /// row; no channel flips, skips or Play/Pause (no single transport).
+    var nativeMultiview: NativeMultiviewState? = nil
+    /// Companion only: drop the link while the TV keeps playing.
+    var onDisconnect: () -> Void = {}
+    /// Companion only: the client whose Options sheet (Stream Info, tracks,
+    /// speed) the Options button opens.
+    var companion: CompanionClient? = nil
+    /// Add Channel row (Logan 2026-10-11): above Layout in the Multiview
+    /// section; the only Multiview row for a single cast. nil hides it.
+    var onAddChannel: (() -> Void)? = nil
+    /// Radio only: back to the full player, no re-tune.
+    var onSwitchToVideo: () -> Void = {}
+    /// Radio only: the stream is unavailable. Non-nil shows the error,
+    /// the retry countdown, and Retry Now, and disables Play / Pause.
+    var failure: Failure? = nil
+    struct Failure {
+        var message: String
+        var retryLine: String
+        var onRetry: () -> Void
+    }
+
+    @State private var contentHeight: CGFloat = 320
+    @State private var liveWindow: RemoteSeekWindow?
+    @State private var showOptions = false
+    /// Observes only this channel's now/next cell (the programme block
+    /// reads the store directly at its TimelineView tick).
+    @StateObject private var nowNext = GuideNowNextWatch()
+    @ObservedObject private var channelStore = ChannelStore.shared
+    @AppStorage(SkipIntervals.backKey) private var skipBackSeconds = SkipIntervals.defaultBack
+    @AppStorage(SkipIntervals.forwardKey) private var skipForwardSeconds = SkipIntervals.defaultForward
+    @Environment(\.dismiss) private var dismiss
+
+    private var accent: Color { ThemeManager.shared.accent }
+
+    var body: some View {
+        let _ = nowNext.bind(channelID)
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Group {
+                if mode == .idle { idleContent } else { playingContent }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 22)
+            .padding(.bottom, 8)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { height in
+                let rounded = (height * 2).rounded() / 2
+                if abs(contentHeight - rounded) > 0.5 { contentHeight = rounded }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .presentationDetents([.height(contentHeight + Self.bottomInset), .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(Color.sheetBackground)
+        .task {
+            guard let seekWindow else { return }
+            while !Task.isCancelled {
+                let w = seekWindow()
+                if w != liveWindow { liveWindow = w }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+        .modifier(RemoteAddChannelPresenter(host: .sheet))
+        .sheet(isPresented: $showOptions) {
+            if transport == .companion, let companion {
+                RemoteOptionsSheet(companion: companion)
+            } else if transport == .cast {
+                CastOptionsSheet(cast: AstralCastController.shared)
+            } else {
+                CastOptionsSheet(cast: AstralCastController.shared, airPlayItem: item, airPlay: true,
+                                 radio: transport == .radio)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var addChannelRow: some View {
+        if let onAddChannel {
+            Button(action: onAddChannel) {
+                HStack {
+                    Text("Add Channel")
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Image(systemName: "plus")
+                        .scaledFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(accent)
+                }
+                .padding(.horizontal, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(mode != .playing)
+            .accessibilityLabel("Add Channel")
+        }
+    }
+
+    // MARK: Idle
+
+    private var idleContent: some View {
+        VStack(spacing: 14) {
+            VStack(spacing: 4) {
+                transportGlyph
+                Text(channelName)
+                    .scaledFont(.title3.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(statusText)
+                    .scaledFont(.subheadline)
+                    .foregroundStyle(Color.contrastText(accent))
+                    .lineLimit(2)
+            }
+            .multilineTextAlignment(.center)
+            wideButton {
+                Label(changeDeviceTitle, systemImage: transportGlyphName)
+                    .foregroundStyle(.white)
+            } background: { Color.white.opacity(0.12) } action: {
+                if transport == .companion { onDisconnect() } else { onChangeDevice() }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: Playing / connecting
+
+    private var playingContent: some View {
+        let enabled = mode == .playing
+        return VStack(spacing: 14) {
+            header
+            if let native = nativeMultiview {
+                NativeMultiviewPanel(state: native)
+            } else if compositeMultiview {
+                MultiviewCompositePreviewGrid()
+                addChannelRow
+                MultiviewCompositeLayoutRow()
+            } else {
+                addChannelRow
+            }
+            if let failure { failureBlock(failure) }
+            programBlock
+            Group {
+                if !compositeMultiview && nativeMultiview == nil {
+                    HStack(spacing: 24) {
+                        labeledButton("chevron.down", label: "Channel Down", action: onChannelDown)
+                        labeledButton("chevron.up", label: "Channel Up", action: onChannelUp)
+                    }
+                }
+                HStack(alignment: .top, spacing: 0) {
+                    if !compositeMultiview && nativeMultiview == nil {
+                        labeledButton(SkipIntervals.backSymbol(skipBackSeconds),
+                                      label: "Back \(skipBackSeconds)s") {
+                            onSeek(-Double(skipBackSeconds))
+                        }
+                    }
+                    if nativeMultiview == nil {
+                    Button(action: onTogglePlayPause) {
+                        VStack(spacing: 6) {
+                            ZStack {
+                                Circle().fill(accent).frame(width: 72, height: 72)
+                                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.system(size: 30, weight: .bold))  // glyph in a fixed box: not text, stays fixed
+                                    .foregroundStyle(.black)
+                            }
+                            Text(isPlaying ? "Pause" : "Play")
+                                .scaledFont(.caption)
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                        .frame(width: Self.buttonColumnWidth)
+                    }
+                    .accessibilityLabel(isPlaying ? "Pause" : "Play")
+                    .disabled(failure != nil)
+                    .opacity(failure != nil ? 0.4 : 1)
+                    }
+                    if !compositeMultiview && nativeMultiview == nil {
+                        labeledButton(SkipIntervals.forwardSymbol(skipForwardSeconds),
+                                      label: "Forward \(skipForwardSeconds)s") {
+                            onSeek(Double(skipForwardSeconds))
+                        }
+                    }
+                }
+                wideButton {
+                    Label("Options", systemImage: "list.bullet")
+                        .foregroundStyle(.white)
+                } background: { Color.white.opacity(0.12) } action: { showOptions = true }
+            }
+            .disabled(!enabled)
+            .opacity(enabled ? 1 : 0.4)
+            // Outside the disabled group on purpose: a session stuck connecting
+            // is exactly when the user wants a different device. Ends the current
+            // session first (the same path as Stop) so the new device never
+            // races a still-live one, then opens the same picker as the idle sheet.
+            wideButton {
+                Label(changeDeviceTitle, systemImage: transportGlyphName)
+                    .foregroundStyle(.white)
+            } background: { Color.white.opacity(0.12) } action: {
+                // AstralTV Remote: the same slot drops the link and leaves the
+                // TV playing (the Remote's Disconnect).
+                if transport == .companion { onDisconnect(); return }
+                if transport == .radio { onSwitchToVideo(); return }
+                debugLog("[Remote] Change \(transport == .cast ? "Cast" : "AirPlay") Device while playing: stopping, then opening the picker")
+                // The channel follows the user to the next receiver (Logan
+                // 2026-09-27: the switch to the Streamer connected and then
+                // sat idle "awaiting channel pick").
+                if transport == .cast { AstralCastController.shared.rememberHandoff() }
+                onStop()
+                onChangeDevice()
+            }
+            wideButton {
+                Label(stopTitle, systemImage: "stop.fill")
+                    .foregroundStyle(.red)
+            } background: { Color.red.opacity(0.15) } action: { onStop() }
+            if !footnoteLines.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(footnoteLines, id: \.self) { line in
+                        Text(line)
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Radio Mode on a failed stream: the player overlay's error text,
+    /// countdown, and Retry Now.
+    private func failureBlock(_ f: Failure) -> some View {
+        VStack(spacing: 8) {
+            if !f.message.isEmpty {
+                Text(verbatim: f.message)
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(f.retryLine)
+                .scaledFont(.subheadline)
+                .foregroundStyle(.white.opacity(0.7))
+            wideButton {
+                Label(PlaybackFailureCopy.retryNow, systemImage: "arrow.clockwise")
+                    .foregroundStyle(.black)
+            } background: { accent } action: { f.onRetry() }
+        }
+    }
+
+    private func wideButton<L: View>(@ViewBuilder _ label: () -> L,
+                                     background: () -> Color,
+                                              action: @escaping () -> Void) -> some View {
+        let bg = background()
+        return Button(action: action) {
+            label()
+                .scaledFont(.body.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(bg, in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+
+    private var header: some View {
+        VStack(spacing: 4) {
+            if let art = artURL, let url = URL(string: art) {
+                AsyncImage(url: url) { image in
+                    image.resizable().scaledToFit()
+                } placeholder: {
+                    transportGlyph
+                }
+                .frame(maxWidth: 140, maxHeight: 72)
+            } else {
+                transportGlyph
+            }
+            Text(channelName)
+                .scaledFont(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Text(statusText)
+                .scaledFont(.subheadline)
+                .foregroundStyle(Color.contrastText(accent))
+                .lineLimit(1)
+        }
+        .multilineTextAlignment(.center)
+    }
+
+    private var transportGlyphName: String {
+        switch transport {
+        case .cast: return RemoteSessionCard.Transport.cast.glyph
+        case .airPlay: return RemoteSessionCard.Transport.airPlay.glyph
+        case .companion: return RemoteSessionCard.Transport.companion.glyph
+        case .radio: return RemoteSessionCard.Transport.radio.glyph
+        }
+    }
+
+    private var changeDeviceTitle: String {
+        switch transport {
+        case .cast: return "Change Cast Device"
+        case .airPlay: return "Change AirPlay Device"
+        case .companion: return "Disconnect (leave TV playing)"
+        case .radio: return "Switch to Video Mode"
+        }
+    }
+
+    private var stopTitle: String {
+        switch transport {
+        case .cast: return "Stop Casting"
+        case .airPlay: return "Stop AirPlay"
+        case .companion: return "Stop and Disconnect"
+        case .radio: return "Stop"
+        }
+    }
+
+    private var transportGlyph: some View {
+        Image(systemName: transportGlyphName)
+            .font(.system(size: 40))  // glyph in a fixed box: not text, stays fixed
+            .foregroundStyle(accent)
+            .frame(height: 56)
+    }
+
+    /// Now-airing programme for `channelID` at `now`, same precedence as
+    /// ChannelRow.liveProgram: the channel item's current-program fields
+    /// (only while they still cover `now`), else GuideStore's EPG.
+    static func nowAiring(channelID: String?, at now: Date = Date())
+        -> (title: String, start: Date, end: Date)? {
+        guard let channelID else { return nil }
+        if let item = ChannelStore.shared.channels.first(where: { $0.id == channelID }),
+           let title = item.currentProgram, !title.isEmpty,
+           let start = item.currentProgramStart, let end = item.currentProgramEnd,
+           start <= now, end > now {
+            return (title, start, end)
+        }
+        if let p = GuideStore.shared.liveProgram(for: channelID, at: now) {
+            return (p.title, p.start, p.end)
+        }
+        return nil
+    }
+
+    private var programBlock: some View {
+        // Ticks every 30 s: the bar advances and the programme rolls over.
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            let prog = Self.nowAiring(channelID: channelID, at: context.date)
+            let title = prog?.title ?? fallbackSubtitle
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    if let title, !title.isEmpty {
+                        Text(title)
+                            .scaledFont(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    // Recording: red dot + red LIVE on a red-tinted capsule.
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.red).frame(width: 5, height: 5)
+                        Text("LIVE").scaledFont(.caption2.weight(.semibold))
+                    }
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.red.opacity(0.15), in: Capsule())
+                }
+                if let window = liveWindow, mode == .playing {
+                    // Seekable session (VOD, catch-up, DVR, live with a
+                    // rewind window): the timeline is a scrubber.
+                    RemoteTimelineScrubber(window: window, onCommit: onSeekTo)
+                } else if let prog, prog.end > prog.start {
+                    Text("\(prog.start.formatted(date: .omitted, time: .shortened)) - \(prog.end.formatted(date: .omitted, time: .shortened))")
+                        .scaledFont(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    let total = prog.end.timeIntervalSince(prog.start)
+                    let elapsed = context.date.timeIntervalSince(prog.start)
+                    ProgressView(value: min(max(elapsed / total, 0), 1))
+                        .tint(accent)
+                } else {
+                    // Unknown programme: an empty track, never a full bar.
+                    ProgressView(value: 0).tint(accent)
+                }
+            }
+        }
+    }
+
+    private static let buttonColumnWidth: CGFloat = 104
+
+    private func labeledButton(_ symbol: String, label: String,
+                               action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                ZStack {
+                    Circle().fill(Color.white.opacity(0.12)).frame(width: 52, height: 52)
+                    Image(systemName: symbol)
+                        .font(.system(size: 20, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(.white)
+                }
+                Text(label)
+                    .scaledFont(.caption)
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+            // Same column width for every button: "Forward 60s" is wider
+            // than "Back 5s", and unequal labels pulled the row's centre
+            // 20 pt left of the sheet's (Logan 2026-09-27).
+            .frame(width: Self.buttonColumnWidth)
+        }
+        .accessibilityLabel(label)
+    }
+
+    private static var bottomInset: CGFloat {
+        let inset = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow?.safeAreaInsets.bottom }
+            .first ?? 0
+        return max(12, inset)
+    }
+}
+
+// MARK: - Multiview composite preview grid
+
+/// The composite preview surface: an AVSampleBufferDisplayLayer the
+/// compositor enqueues each composed frame into from its own queue
+/// (MultiviewCompositePreviewSink), so frames never touch SwiftUI or the
+/// main thread (Logan 2026-10-08: the old 5 fps UIImage publish stuttered).
+struct MultiviewCompositePreviewLayerView: UIViewRepresentable {
+    final class LayerView: UIView {
+        override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+        var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            let t0 = CACurrentMediaTime()
+            if window != nil {
+                MultiviewCompositePreviewSink.shared.attach(displayLayer)
+            } else {
+                MultiviewCompositePreviewSink.shared.detach(displayLayer)
+            }
+            MultiviewCompositePreviewSink.shared.addMainTime(CACurrentMediaTime() - t0)
+        }
+    }
+    func makeUIView(context: Context) -> LayerView {
+        let v = LayerView()
+        v.isUserInteractionEnabled = false
+        v.backgroundColor = .black
+        v.displayLayer.videoGravity = .resize
+        return v
+    }
+    func updateUIView(_ uiView: LayerView, context: Context) {}
+}
+
+/// Top of the remote controls sheet while the phone sends a Multiview
+/// composite (Android parity, 2026-10-06): the composite's tiles in its own
+/// layout. Tap a tile: the audio moves there (the receiver follows without
+/// a restart). Long-press and drag a tile onto another: the two swap
+/// places and the composite re-lays out live (Logan 2026-10-07, round 2).
+/// A long-press released on the same tile opens the tile menu (round 6:
+/// Logan long-pressed the preview tiles to remove channels and nothing
+/// appeared, because the release only armed Move Tile): Make Audio, Move
+/// Tile (the next tap on another tile swaps, a tap on it again cancels)
+/// and Remove from Multiview.
+/// Focused tile: 4 pt accent border; others: 2 pt gray.
+struct MultiviewCompositePreviewGrid: View {
+    @ObservedObject private var store = MultiviewStore.shared
+    /// Live frames (Logan 2026-10-07): the composite itself, scaled down,
+    /// so the sheet shows what the receiver shows.
+    @ObservedObject private var composite = MultiviewCompositeSession.shared
+    /// Only the first-frame flag publishes here; the frames themselves go
+    /// to the display layer below without a SwiftUI update.
+    @ObservedObject private var preview = MultiviewCompositePreview.shared
+    @ObservedObject private var theme = ThemeManager.shared
+
+    /// The tile picked up by the long-press (drag source or Move Tile).
+    @State private var lifted: String?
+    @State private var dragPoint: CGPoint?
+    @State private var dragging = false
+    /// A long-press release also ends as a tap; that tap is ignored.
+    @State private var pressEndedAt: Date = .distantPast
+    /// Where the current touch went down: a long-press released without
+    /// moving can end before its drag reports a location.
+    @State private var touchDown: CGPoint?
+    /// The spatial event id of the touch `touchDown` belongs to.
+    @State private var touchID: SpatialEventCollection.Event.ID?
+    /// The current touch already became a long-press (round 7, device log
+    /// 2026-10-07 15:45:36.311: the release of the long-press that opened
+    /// the tile menu also ended as a tap, which moved the audio focus to
+    /// that tile in the same millisecond, before Remove was picked). The
+    /// tap fires before the sequenced gesture's onEnded sets
+    /// `pressEndedAt`, so this flag is what stops it.
+    @State private var longPressFired = false
+    /// The tile whose long-press menu is open.
+    @State private var menuTileID: String?
+    /// The tile whose Switch Stream sheet is open (menu > Switch Stream).
+    @State private var switchStreamTileID: String?
+
+    var body: some View {
+        let tiles = Array(store.tiles.prefix(MultiviewCompositeLayout.maxTiles))
+        // The composite session's layout (Layout row), so the hit rects
+        // follow a live re-layout; the stored preference until it runs.
+        let mode = composite.isActive ? composite.layoutMode
+            : (MultiviewLayoutMode(rawValue: UserDefaults.standard.string(forKey: MultiviewLayoutMode.storageKey) ?? "") ?? .auto)
+        // Same spacing the composite draws with (Settings > Multiview >
+        // Padding Between Tiles), so the hit rects match the frame.
+        let rects = MultiviewCompositeLayout.tileRects(count: tiles.count, mode: mode,
+                                                       spacing: MultiviewCompositeStyle.current().spacingPx)
+        let live: Bool? = preview.hasFrame ? true : nil
+        GeometryReader { geo in
+            let scale = geo.size.width / CGFloat(MultiviewCompositeLayout.width)
+            let scaled = rects.map { CGRect(x: $0.minX * scale, y: $0.minY * scale,
+                                            width: $0.width * scale, height: $0.height * scale) }
+            let hit: (CGPoint) -> String? = { p in
+                guard let i = scaled.firstIndex(where: { $0.contains(p) }), i < tiles.count else { return nil }
+                return tiles[i].id
+            }
+            let target = dragPoint.flatMap(hit)
+            ZStack(alignment: .topLeading) {
+                Color.black
+                // Always mounted so the layer is attached before the first
+                // frame; it stays black until frames arrive.
+                MultiviewCompositePreviewLayerView()
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                ForEach(Array(zip(tiles.indices, scaled)), id: \.0) { i, r in
+                    let tile = tiles[i]
+                    let focused = tile.id == store.audioTileID
+                    let isLifted = tile.id == lifted
+                    let isTarget = dragging && target == tile.id && target != lifted
+                    // Rings and badges hug the fitted picture, not the slot
+                    // (Logan 2026-10-11: rings floated above and below the
+                    // letterboxed picture). Same fit the compositor draws:
+                    // the tile's video aspect, 16:9 fallback.
+                    let v = MultiviewCompositeLayout.videoRect(
+                        in: r, aspect: store.tileVideoAspects[tile.id] ?? (16.0 / 9.0))
+                    ZStack {
+                        if live == nil {
+                            // Until the first composed frame: the names.
+                            Color.white.opacity(0.08)
+                            Text(tile.item.name)
+                                .scaledFont(.caption)
+                                .foregroundStyle(.white)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                                .padding(4)
+                        } else {
+                            // The frame already carries the indicator.
+                            Color.clear
+                        }
+                        if isLifted || isTarget { Color.white.opacity(0.18) }
+                    }
+                    .overlay(Rectangle().strokeBorder(focused ? theme.accent : Color.gray,
+                                                      lineWidth: focused ? 4 : 2)
+                        .opacity(live == nil ? 1 : 0))
+                    // Lifted tile: the accent ring (tvOS Move Tile ring),
+                    // from the long-press threshold until release.
+                    .overlay(Rectangle().strokeBorder(theme.accent, lineWidth: 4)
+                        .opacity(isLifted ? 1 : 0))
+                    .overlay(Rectangle().strokeBorder(Color.white, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                        .opacity(isTarget ? 1 : 0))
+                    .frame(width: v.width, height: v.height)
+                    .offset(x: v.minX, y: v.minY)
+                    .allowsHitTesting(false)
+                    .accessibilityElement()
+                    .accessibilityLabel("\(tile.item.name)\(focused ? ", audio" : "")")
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction { store.setAudio(to: tile.id) }
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                LongPressGesture(minimumDuration: 0.35)
+                    .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .local))
+                    .onChanged { value in
+                        switch value {
+                        case .second(true, let drag):
+                            // The press held for the minimum duration. Not
+                            // `.first(true)`: a LongPressGesture reports
+                            // that the moment the finger goes down, so every
+                            // plain tap was marked as a long-press and
+                            // ignored (round 8: no tap ever moved the audio,
+                            // Logan had to use Make Audio).
+                            longPressFired = true
+                            // Lift at the long-press threshold (Logan
+                            // 2026-10-11): the drag reports nothing until
+                            // the finger moves, so the touch-down point
+                            // picks the tile and its ring shows at once.
+                            if lifted == nil || !dragging,
+                               let start = drag?.startLocation ?? touchDown,
+                               let id = hit(start) {
+                                if lifted != id { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
+                                lifted = id
+                                dragging = true
+                            }
+                            if let drag { dragPoint = drag.location }
+                        default:
+                            break
+                        }
+                    }
+                    .onEnded { value in
+                        // A tap still to come is covered by `pressEndedAt`.
+                        defer { dragging = false; dragPoint = nil; pressEndedAt = Date(); longPressFired = false; touchDown = nil }
+                        guard case .second(true, let drag) = value else { return }
+                        guard let drag, let from = lifted, dragging else {
+                            // Long-press released before the drag reported:
+                            // the menu for the tile under the finger.
+                            let buzzed = lifted != nil
+                            lifted = nil
+                            if let p = touchDown, let id = hit(p) { openMenu(id, haptic: !buzzed) }
+                            return
+                        }
+                        if let to = hit(drag.location), to != from {
+                            swapTiles(from, to)
+                        } else if hit(drag.location) == from {
+                            // Released on the same tile: the tile menu.
+                            lifted = nil
+                            openMenu(from, haptic: false) // the lift already buzzed
+                        } else {
+                            lifted = nil
+                        }
+                    }
+            )
+            .simultaneousGesture(
+                // The touch-down point, reported the moment the finger lands
+                // (iPad 2026-10-11: a DragGesture tracker did not report a
+                // new touch before the long-press threshold, so the lift
+                // used the previous touch's point and picked the other
+                // tile). Keyed by the event id so each touch records its own point.
+                SpatialEventGesture(coordinateSpace: .local)
+                    .onChanged { events in
+                        guard let e = events.first(where: { $0.phase == .active }) else { return }
+                        if touchID != e.id {
+                            // A new touch.
+                            touchID = e.id
+                            touchDown = e.location
+                            longPressFired = false
+                        }
+                    }
+            )
+            .simultaneousGesture(
+                SpatialTapGesture().onEnded { value in
+                    if longPressFired {
+                        longPressFired = false
+                        return
+                    }
+                    guard !dragging, Date().timeIntervalSince(pressEndedAt) > 0.25,
+                          let id = hit(value.location) else { return }
+                    if let from = lifted {
+                        if id != from { swapTiles(from, id) } else { lifted = nil }
+                        return
+                    }
+                    debugLog("[MV-CAST] preview tap tile=\(id): audio")
+                    store.setAudio(to: id)
+                }
+            )
+        }
+        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .confirmationDialog(menuTitle, isPresented: Binding(
+            get: { menuTileID != nil },
+            set: { if !$0 { menuTileID = nil } }
+        ), titleVisibility: .visible) {
+            if let id = menuTileID {
+                if id != store.audioTileID {
+                    Button("Make Audio") {
+                        debugLog("[MV-CAST] preview menu: Make Audio tile=\(id)")
+                        store.setAudio(to: id)
+                    }
+                }
+                if switchStreamTarget(id) != nil {
+                    Button("Switch Stream") {
+                        debugLog("[MV-CAST] switch stream tile=\(id): picker opened")
+                        switchStreamTileID = id
+                    }
+                }
+                if store.tiles.count > 1 {
+                    Button("Move Tile") {
+                        debugLog("[MV-CAST] preview menu: Move Tile tile=\(id)")
+                        lifted = id
+                    }
+                }
+                Button("Remove from Multiview", role: .destructive) {
+                    debugLog("[MV-CAST] preview menu: Remove from Multiview tile=\(id) (\(store.tiles.count - 1) left)")
+                    if lifted == id { lifted = nil }
+                    store.remove(id: id)
+                }
+                Button("Cancel", role: .cancel) {}
+            }
+        }
+        // Switch Stream for the tile's channel: the same SwitchStreamView
+        // the Multiview tile menu opens. A confirmed switch posts
+        // .switchStreamReprime; Dispatcharr swaps the upstream on the
+        // tile's existing socket, the tile's remuxer re-gates, and the
+        // composite keeps decoding from that remuxer's ingest tap, so the
+        // other tiles never restart.
+        .sheet(isPresented: Binding(
+            get: { switchStreamTileID != nil },
+            set: { if !$0 { switchStreamTileID = nil } }
+        )) {
+            if let id = switchStreamTileID, let t = switchStreamTarget(id) {
+                SwitchStreamView(
+                    channelID: t.channelID,
+                    channelUUID: t.uuid,
+                    channelName: t.name,
+                    onClose: { switchStreamTileID = nil },
+                    onSwitched: { streamID in
+                        debugLog("[MV-CAST] switch stream tile=\(id) channel=\(t.name) stream=\(streamID) confirmed; tile keeps its connection, composite unchanged")
+                    }
+                )
+            } else {
+                EmptyView()
+            }
+        }
+        .onAppear { debugLog("[MV-CAST] preview grid shown (remote controls sheet)") }
+        .onDisappear { debugLog("[MV-CAST] preview grid hidden") }
+    }
+
+    private var menuTitle: String {
+        menuTileID.flatMap { id in store.tiles.first { $0.id == id }?.item.name } ?? "Multiview"
+    }
+
+    /// Dispatcharr only, same fail-closed admin gate as the player's
+    /// Switch Stream row; nil hides the menu item.
+    private func switchStreamTarget(_ id: String) -> (channelID: Int, uuid: String, name: String)? {
+        guard let server = ChannelStore.shared.activeServer,
+              server.type == .dispatcharrAPI, server.dispatcharrCanSwitchStream,
+              let tile = store.tiles.first(where: { $0.id == id }),
+              let channelID = tile.item.dispatcharrChannelID,
+              let uuid = tile.item.uuid, !uuid.isEmpty else { return nil }
+        return (channelID, uuid, tile.item.name)
+    }
+
+    private func openMenu(_ id: String, haptic: Bool = true) {
+        if haptic { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
+        debugLog("[MV-CAST] preview long-press tile=\(id): tile menu")
+        menuTileID = id
+    }
+
+    private func swapTiles(_ a: String, _ b: String) {
+        lifted = nil
+        debugLog("[MV-CAST] composite swap \(a) <-> \(b)")
+        store.swap(a, b)
+    }
+}
+
+// MARK: - Multiview composite layout row
+
+/// Below the composite preview: the composite's grid layout, from the same
+/// options Settings > Player > Multiview offers for the current tile count
+/// (Android parity, 2026-10-07). Changes the composite live for this
+/// session (Cast and AirPlay share the compositor); the preview follows.
+/// The cast sheet's view of a Multiview the AstralTV Android TV app runs over
+/// Cast Connect (Logan 2026-10-08). There is no phone-side frame to preview,
+/// so the channels are listed in grid order: the audio channel carries the
+/// speaker, a tap gives a channel the audio on the TV. Below, the Layout row
+/// with the options the TV reports. Android NativeMultiviewPanel parity.
+struct NativeMultiviewPanel: View {
+    let state: NativeMultiviewState
+    private var accent: Color { ThemeManager.shared.accent }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(state.channels.enumerated()), id: \.offset) { i, ch in
+                let focused = i == state.focus
+                Button {
+                    debugLog("[MV-CAST] native panel: Make Audio tile=\(i)")
+                    AstralCastController.shared.setNativeMultiviewFocus(i)
+                } label: {
+                    HStack {
+                        Text(ch.name.isEmpty ? "Channel \(i + 1)" : ch.name)
+                            .scaledFont(.subheadline)
+                            .foregroundStyle(focused ? accent : .white)
+                            .lineLimit(1)
+                        Spacer()
+                        if focused {
+                            Image(systemName: "speaker.wave.2.fill")
+                                .foregroundStyle(accent)
+                                .accessibilityLabel("Audio")
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(focused)
+            }
+            if state.layouts.count > 1 {
+                HStack {
+                    Text("Layout")
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Menu {
+                        Picker("Layout", selection: Binding(
+                            get: { state.layout },
+                            set: { m in
+                                debugLog("[MV-CAST] native panel layout menu: \(m.displayName)")
+                                AstralCastController.shared.setNativeMultiviewLayout(m)
+                            }
+                        )) {
+                            ForEach(state.layouts) { m in
+                                Label(m.displayName, systemImage: m.symbolName).tag(m)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(state.layout.displayName)
+                            Image(systemName: "chevron.up.chevron.down")
+                        }
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(.white.opacity(0.8))
+                    }
+                    .accessibilityLabel("Layout, \(state.layout.displayName)")
+                }
+                .padding(.horizontal, 4)
+                .padding(.top, 4)
+            }
+        }
+    }
+}
+
+struct MultiviewCompositeLayoutRow: View {
+    @ObservedObject private var store = MultiviewStore.shared
+    @ObservedObject private var composite = MultiviewCompositeSession.shared
+
+    var body: some View {
+        let count = min(store.tiles.count, MultiviewCompositeLayout.maxTiles)
+        let options = MultiviewLayoutMode.available(forTileCount: count)
+        // A pick that does not apply to this count draws as Default.
+        let current = options.contains(composite.layoutMode) ? composite.layoutMode : .auto
+        if !options.isEmpty {
+            HStack {
+                Text("Layout")
+                    .scaledFont(.subheadline)
+                    .foregroundStyle(.white)
+                Spacer()
+                Menu {
+                    Picker("Layout", selection: Binding(
+                        get: { current },
+                        set: { composite.setLayout($0) }
+                    )) {
+                        ForEach(options) { m in
+                            Label(m.displayName, systemImage: m.symbolName).tag(m)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(current.displayName)
+                        Image(systemName: "chevron.up.chevron.down")
+                    }
+                    .scaledFont(.subheadline)
+                    .foregroundStyle(.white.opacity(0.8))
+                }
+                .accessibilityLabel("Layout, \(current.displayName)")
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+}
+
+// MARK: - Remote timeline scrubber (Cast, AirPlay, AstralTV Remote)
+
+/// Seekable window for the remote-session timeline scrub, in the session's
+/// own seconds (Cast stream position, AirPlay player time, companion
+/// wall clock).
+struct RemoteSeekWindow: Equatable {
+    var start: Double
+    var end: Double
+    var position: Double
+    var isLive: Bool
+}
+
+/// The remote-session timeline scrubber, styled like the player's scrubber
+/// bar. Dragging moves only the thumb and the time label; release seeks
+/// once, then the thumb holds at the target until the receiver reports a
+/// position within 4 s of it, or 6 s pass.
+struct RemoteTimelineScrubber: View {
+    let window: RemoteSeekWindow
+    let onCommit: (Double) -> Void
+
+    @State private var isDragging = false
+    @State private var dragFraction: CGFloat = 0
+    @State private var pendingTarget: Double?
+    @State private var settleTask: Task<Void, Never>?
+
+    private var span: Double { max(window.end - window.start, 1) }
+
+    var body: some View {
+        let liveFraction = CGFloat(min(max((window.position - window.start) / span, 0), 1))
+        let shown = (isDragging || pendingTarget != nil) ? dragFraction : liveFraction
+        let shownSeconds = window.start + Double(shown) * span
+        VStack(spacing: 4) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.25))
+                        .frame(height: isDragging ? 5 : 3)
+                    Capsule()
+                        .fill(Color.accentPrimary)
+                        .frame(width: geo.size.width * shown, height: isDragging ? 5 : 3)
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: isDragging ? 18 : 13, height: isDragging ? 18 : 13)
+                        .shadow(color: .black.opacity(0.4), radius: 3)
+                        .offset(x: geo.size.width * shown - (isDragging ? 9 : 6.5))
+                }
+                .frame(height: 22)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            settleTask?.cancel()
+                            pendingTarget = nil
+                            isDragging = true
+                            dragFraction = max(0, min(1, value.location.x / max(geo.size.width, 1)))
+                        }
+                        .onEnded { value in
+                            let f = max(0, min(1, value.location.x / max(geo.size.width, 1)))
+                            dragFraction = f
+                            let target = window.start + Double(f) * span
+                            pendingTarget = target
+                            withAnimation(.easeOut(duration: 0.15)) { isDragging = false }
+                            onCommit(target)
+                            settleTask?.cancel()
+                            settleTask = Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                                guard !Task.isCancelled else { return }
+                                pendingTarget = nil
+                            }
+                        }
+                )
+            }
+            .frame(height: 22)
+            .animation(.easeInOut(duration: 0.12), value: isDragging)
+            Text(label(shownSeconds: shownSeconds))
+                .scaledFont(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.7))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .onChange(of: window.position) { _, position in
+            if let t = pendingTarget, abs(position - t) < 4 {
+                settleTask?.cancel()
+                pendingTarget = nil
+            }
+        }
+    }
+
+    private func label(shownSeconds: Double) -> String {
+        if window.isLive {
+            let behind = max(0, window.end - shownSeconds)
+            if behind < 5 && !isDragging && pendingTarget == nil { return "LIVE" }
+            return "-\(Self.clock(behind)) behind live"
+        }
+        return "\(Self.clock(shownSeconds - window.start)) / \(Self.clock(span))"
+    }
+
+    static func clock(_ seconds: Double) -> String {
+        let t = Int(max(0, seconds.isFinite ? seconds : 0))
+        let h = t / 3600, m = (t % 3600) / 60, s = t % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+    }
+}
+
+// MARK: - Companion options sheet (audio / subtitles / speed / aspect / info)
+
+/// Full options picker for the companion remote -- parity with the Android
+/// CastRemoteOverlay's Options menu. Drives the TV via CompanionClient.
+struct RemoteOptionsSheet: View {
+    @ObservedObject var companion: CompanionClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var showSwitchStream = false
+    @State private var showRecord = false
+
+
+    /// The controlled channel resolved locally, for actions the phone drives
+    /// against Dispatcharr itself (Record) -- same anchor as Switch Stream
+    /// but without the admin-credentials gate.
+    private var controlledItem: ChannelDisplayItem? {
+        guard let cid = companion.controllingChannelID, cid.hasPrefix("disp:")
+        else { return nil }
+        let uuid = String(cid.dropFirst(5))
+        return ChannelStore.shared.channels.first(where: { $0.uuid == uuid })
+    }
+
+    /// The controlled channel resolved on THIS phone, when Switch Stream can
+    /// work: Dispatcharr swaps the source server-side while the TV keeps
+    /// playing the same proxy URL, so the phone can drive the swap directly
+    /// (same pk/uuid/admin gate as the native player's Switch Stream row).
+    private var switchStreamTarget: (id: Int, uuid: String, name: String)? {
+        guard let cid = companion.controllingChannelID,
+              cid.hasPrefix("disp:"),
+              ChannelStore.shared.activeServer?.dispatcharrCanSwitchStream ?? false
+        else { return nil }
+        let uuid = String(cid.dropFirst(5))
+        guard let item = ChannelStore.shared.channels.first(where: { $0.uuid == uuid }),
+              let pk = item.dispatcharrChannelID
+        else { return nil }
+        return (pk, uuid, item.name)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                let s = companion.remoteState
+                // Row order and titles are the cross-platform Options list
+                // (Logan 2026-09-27); Android's CastRemoteSheet reads the same.
+                if switchStreamTarget != nil {
+                    Section {
+                        Button {
+                            showSwitchStream = true
+                        } label: {
+                            Label("Switch Stream", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    } footer: {
+                        Text("Swaps this channel's upstream. The TV keeps playing; the picture follows in a few seconds.")
+                    }
+                }
+                Section {
+                    if controlledItem?.dispatcharrChannelID != nil {
+                        Button {
+                            CompanionClient.clog("Record Current Program opened for \(controlledItem?.name ?? "?")")
+                            showRecord = true
+                        } label: {
+                            Label("Record Current Program", systemImage: "record.circle")
+                        }
+                    }
+                    RemoteTrackRows(state: s,
+                                    onAudio: { companion.setAudioTrack($0) },
+                                    onText: { companion.setTextTrack($0) },
+                                    onSpeed: { companion.setSpeed($0) })
+                    Button {
+                        companion.setAspect(RemoteOptionLabels.nextScale(s.aspect))
+                    } label: {
+                        OptionValueLabel(title: "Video Scale", icon: "aspectratio",
+                                         value: RemoteOptionLabels.scale(s.aspect))
+                    }
+                    Menu {
+                        ForEach(RemoteOptionLabels.sleepChoices, id: \.minutes) { c in
+                            Button(c.label) { companion.armSleepTimer(minutes: c.minutes) }
+                        }
+                    } label: {
+                        OptionValueLabel(title: "Sleep Timer", icon: "timer",
+                                         value: RemoteOptionLabels.sleep(companion.sleepEndsAt))
+                    }
+                }
+                if !s.streamInfo.isEmpty {
+                    Section("Stream Info") {
+                        Text(s.streamInfo).scaledFont(.footnote.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Options")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showSwitchStream) {
+                if let t = switchStreamTarget {
+                    SwitchStreamView(channelID: t.id, channelUUID: t.uuid, channelName: t.name)
+                }
+            }
+            .sheet(isPresented: $showRecord) {
+                if let item = controlledItem {
+                    let now = Date()
+                    RecordProgramSheet(
+                        programTitle: item.currentProgram ?? "\(item.name) live recording",
+                        programDescription: item.currentProgramDescription ?? "",
+                        channelID: item.id,
+                        channelName: item.name,
+                        scheduledStart: item.currentProgramStart ?? now,
+                        scheduledEnd: (item.currentProgramEnd.flatMap { $0 > now ? $0 : nil })
+                            ?? now.addingTimeInterval(3600),
+                        isLive: true,
+                        dispatcharrChannelID: item.dispatcharrChannelID,
+                        streamURL: item.streamURL
+                    )
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+}
+
+// MARK: - Shared Options rows (cross-platform list, Logan 2026-09-27)
+
+/// Wording for the Options rows' value lines. One place so Cast, AirPlay and
+/// the companion remote cannot drift from each other or from Android's
+/// CastRemoteSheet / CastControl.AspectMode labels.
+enum RemoteOptionLabels {
+    static let speeds: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+    /// Wire keys predate the "Video Scale" naming (CastControl.AspectMode):
+    /// "zoom" is Fill (aspect kept, cropped), "fill" is Stretch.
+    static let scales: [(key: String, label: String)] =
+        [("fit", "Fit"), ("zoom", "Fill"), ("fill", "Stretch")]
+    static let sleepChoices: [(minutes: Int, label: String)] =
+        [(0, "Off"), (30, "30 minutes"), (60, "1 hour"), (90, "1.5 hours"), (120, "2 hours")]
+
+    /// "Normal" or "1.25x"; whole numbers keep one decimal ("2.0x") because
+    /// that is how Android prints the same Float.
+    static func speed(_ s: Double) -> String {
+        abs(s - 1) < 0.01 ? "Normal" : "\(number(s))x"
+    }
+    /// Picker choice label, Android's PLAYBACK_SPEEDS wording.
+    static func speedChoice(_ s: Double) -> String {
+        abs(s - 1) < 0.01 ? "Normal (1.0x)" : "\(number(s))x"
+    }
+    private static func number(_ s: Double) -> String {
+        s == s.rounded() ? String(format: "%.1f", s) : String(format: "%g", s)
+    }
+    static func scale(_ key: String) -> String {
+        scales.first(where: { $0.key == key })?.label ?? "Fit"
+    }
+    /// Tap cycles Fit, Fill, Stretch, as Android's AspectMode.next().
+    static func nextScale(_ key: String) -> String {
+        let i = scales.firstIndex(where: { $0.key == key }) ?? 0
+        return scales[(i + 1) % scales.count].key
+    }
+    static func subtitles(_ s: CompanionClient.RemoteState) -> String {
+        s.textOff ? "Off" : (s.text.first(where: { $0.selected })?.label ?? "On")
+    }
+    static func sleep(_ end: Date?) -> String {
+        guard let end else { return "Off" }
+        let mins = max(1, Int(end.timeIntervalSinceNow / 60) + 1)
+        return "\(mins)m left"
+    }
+}
+
+/// Icon + title with the current value on the trailing side.
+struct OptionValueLabel: View {
+    let title: String
+    let icon: String
+    let value: String?
+    var body: some View {
+        HStack {
+            Label(title, systemImage: icon).foregroundStyle(.primary)
+            Spacer()
+            if let value { Text(value).foregroundStyle(.secondary) }
+        }
+    }
+}
+
+/// Audio Track, Subtitles and Playback Speed: the three rows every transport
+/// can honor, each pushing a checkmark picker.
+struct RemoteTrackRows: View {
+    let state: CompanionClient.RemoteState
+    let onAudio: (String) -> Void
+    /// nil selects Off.
+    let onText: (String?) -> Void
+    let onSpeed: (Double) -> Void
+    /// Radio Mode: Audio Track only (no video to caption, live has no speed).
+    var audioOnly: Bool = false
+
+    var body: some View {
+        NavigationLink {
+            OptionPickerList(title: "Audio Track",
+                             choices: state.audio.map { ($0.id, $0.label, $0.selected) },
+                             emptyText: "No audio tracks reported.") { if let id = $0 { onAudio(id) } }
+        } label: {
+            OptionValueLabel(title: "Audio Track", icon: "music.note",
+                             value: state.audio.first(where: { $0.selected })?.label)
+        }
+        if !audioOnly {
+        NavigationLink {
+            OptionPickerList(title: "Subtitles",
+                             choices: [(nil, "Off", state.textOff)]
+                                + state.text.map { ($0.id, $0.label, $0.selected) },
+                             emptyText: nil) { onText($0) }
+        } label: {
+            OptionValueLabel(title: "Subtitles", icon: "captions.bubble",
+                             value: RemoteOptionLabels.subtitles(state))
+        }
+        NavigationLink {
+            OptionPickerList(title: "Playback Speed",
+                             choices: RemoteOptionLabels.speeds.map {
+                                 (String($0), RemoteOptionLabels.speedChoice($0), abs(state.speed - $0) < 0.01)
+                             },
+                             emptyText: nil) { if let v = $0.flatMap(Double.init) { onSpeed(v) } }
+        } label: {
+            OptionValueLabel(title: "Playback Speed", icon: "gauge.with.dots.needle.33percent",
+                             value: RemoteOptionLabels.speed(state.speed))
+        }
+        }
+    }
+}
+
+/// Checkmark list; picking a row applies it and pops back to Options.
+private struct OptionPickerList: View {
+    let title: String
+    let choices: [(id: String?, label: String, selected: Bool)]
+    let emptyText: String?
+    let onSelect: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        List {
+            if choices.isEmpty, let emptyText {
+                Text(emptyText).foregroundStyle(.secondary)
+            }
+            ForEach(Array(choices.enumerated()), id: \.offset) { _, c in
+                Button {
+                    onSelect(c.id)
+                    dismiss()
+                } label: {
+                    HStack {
+                        Text(c.label).foregroundStyle(.primary)
+                        Spacer()
+                        if c.selected {
+                            Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// The AirPlay session's AVPlayer media selection and rate, shaped like the
+/// receiver snapshot so the same rows render it. Track ids are the option's
+/// index in its selection group.
+@MainActor
+final class AirPlayMediaOptions: ObservableObject {
+    @Published private(set) var state = CompanionClient.RemoteState()
+    private var audible: AVMediaSelectionGroup?
+    private var legible: AVMediaSelectionGroup?
+
+    func load() async {
+        guard let player = AirPlayMonitor.shared.attachedPlayer,
+              let item = player.currentItem else { return }
+        audible = try? await item.asset.loadMediaSelectionGroup(for: .audible)
+        legible = try? await item.asset.loadMediaSelectionGroup(for: .legible)
+        refresh()
+    }
+
+    private func refresh() {
+        guard let player = AirPlayMonitor.shared.attachedPlayer,
+              let item = player.currentItem else { return }
+        var s = CompanionClient.RemoteState()
+        if let g = audible {
+            let current = item.currentMediaSelection.selectedMediaOption(in: g)
+            s.audio = g.options.enumerated().map {
+                .init(id: String($0.offset), label: $0.element.displayName, selected: $0.element == current)
+            }
+        }
+        if let g = legible {
+            let current = item.currentMediaSelection.selectedMediaOption(in: g)
+            s.text = g.options.enumerated().map {
+                .init(id: String($0.offset), label: $0.element.displayName, selected: $0.element == current)
+            }
+            s.textOff = current == nil
+        }
+        // A paused player reads rate 0; the chosen speed is defaultRate.
+        s.speed = Double(player.defaultRate)
+        state = s
+    }
+
+    func selectAudio(_ id: String) {
+        guard let g = audible, let i = Int(id), g.options.indices.contains(i) else { return }
+        AirPlayMonitor.shared.attachedPlayer?.currentItem?.select(g.options[i], in: g)
+        refresh()
+    }
+
+    func selectText(_ id: String?) {
+        guard let g = legible, let item = AirPlayMonitor.shared.attachedPlayer?.currentItem else { return }
+        if let id, let i = Int(id), g.options.indices.contains(i) {
+            item.select(g.options[i], in: g)
+        } else {
+            item.select(nil, in: g)
+        }
+        refresh()
+    }
+
+    func setSpeed(_ speed: Double) {
+        guard let player = AirPlayMonitor.shared.attachedPlayer else { return }
+        player.defaultRate = Float(speed)
+        if player.rate != 0 { player.rate = Float(speed) }
+        refresh()
+    }
+}
+
+// MARK: - Cast options sheet (task #267, Android cast-options parity)
+
+/// Options for the BASIC cast transport (web receiver). The receiver has
+/// no control channel, so unlike RemoteOptionsSheet everything here is
+/// phone-driven: Switch Stream swaps the Dispatcharr upstream behind the
+/// proxy's unchanged ingest URL (the reprime observer in
+/// AstralCastController re-splices the proxy), Record talks to the
+/// Dispatcharr DVR API directly, the sleep timer is a phone-side countdown
+/// that stops the cast, and Stream Info renders the local HLS proxy's own
+/// stats (there is no player on the phone to ask). The receiver-state rows
+/// (audio/subtitles/speed/scale/audio only) speak the control namespace the
+/// AstralTV Android TV receiver implements; on AirPlay the ones AVPlayer can
+/// carry (audio/subtitles/speed) drive the local player instead.
+struct CastOptionsSheet: View {
+    @ObservedObject var cast: AstralCastController
+    /// AirPlay reuses this sheet (production parity): the channel comes from
+    /// the local session, and the Cast-only rows (Sleep Timer, proxy Stream
+    /// Info) are hidden.
+    var airPlayItem: ChannelDisplayItem? = nil
+    /// AirPlay without a channel item (a Multiview composite: device log
+    /// 2026-10-07, the AirPlay composite sheet showed the Cast proxy's
+    /// "Waiting for the cast proxy to report.").
+    var airPlay: Bool = false
+    /// Radio Mode session (local audio only): footer wording only.
+    var radio: Bool = false
+    private var isAirPlay: Bool { airPlay || airPlayItem != nil }
+    @Environment(\.dismiss) private var dismiss
+    @State private var showSwitchStream = false
+    @State private var showRecord = false
+    @State private var stats: CastHLSProxySession.Stats?
+    @State private var airPlayInfo: AirPlayStreamInfo?
+
+    @StateObject private var airPlayOptions = AirPlayMediaOptions()
+
+    /// The receiver page handles the track, speed, scale and audio-only
+    /// commands since 2026-09-27 (gh-pages 877c7681), so the rows act on
+    /// both receiver targets once the receiver has answered hello.
+    private var receiverControls: Bool { cast.receiverTarget != .unknown }
+
+    /// The channel the TV is playing, resolved locally (castingContent
+    /// carries the id; ChannelStore has the Dispatcharr fields).
+    private var castItem: ChannelDisplayItem? {
+        if let airPlayItem { return airPlayItem }
+        guard let id = cast.castingContent?.mediaID else { return nil }
+        return ChannelStore.shared.channels.first(where: { $0.id == id })
+    }
+
+    /// Same pk/uuid/admin gate as the native player's Switch Stream row
+    /// (and the companion sheet's).
+    private var switchStreamTarget: (id: Int, uuid: String, name: String)? {
+        guard ChannelStore.shared.activeServer?.dispatcharrCanSwitchStream ?? false,
+              let item = castItem,
+              let uuid = item.uuid, !uuid.isEmpty,
+              let pk = item.dispatcharrChannelID
+        else { return nil }
+        return (pk, uuid, item.name)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                // Row order and titles are the cross-platform Options list
+                // (Logan 2026-09-27); Android's CastRemoteSheet reads the same.
+                if switchStreamTarget != nil {
+                    Section {
+                        Button {
+                            showSwitchStream = true
+                        } label: {
+                            Label("Switch Stream", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    } footer: {
+                        Text(radio
+                             ? "Audio keeps playing while the stream switches."
+                             : "Swaps this channel's upstream. The TV keeps playing; the picture follows in a few seconds.")
+                    }
+                }
+                Section {
+                    if castItem?.dispatcharrChannelID != nil {
+                        Button {
+                            showRecord = true
+                        } label: {
+                            Label("Record Current Program", systemImage: "record.circle")
+                        }
+                    }
+                    if isAirPlay {
+                        // AVPlayer carries its media selection and rate to the
+                        // receiver. It has no scale the receiver honors and no
+                        // way to drop the video track, so those rows are Cast only.
+                        RemoteTrackRows(state: airPlayOptions.state,
+                                        onAudio: { airPlayOptions.selectAudio($0) },
+                                        onText: { airPlayOptions.selectText($0) },
+                                        onSpeed: { airPlayOptions.setSpeed($0) },
+                                        audioOnly: radio)
+                    } else {
+                        let s = cast.remoteState
+                        Group {
+                            RemoteTrackRows(state: s,
+                                            onAudio: { cast.setRemoteAudioTrack($0) },
+                                            onText: { cast.setRemoteTextTrack($0) },
+                                            onSpeed: { cast.setRemoteSpeed($0) })
+                            Button {
+                                cast.setRemoteAspect(RemoteOptionLabels.nextScale(s.aspect))
+                            } label: {
+                                OptionValueLabel(title: "Video Scale", icon: "aspectratio",
+                                                 value: RemoteOptionLabels.scale(s.aspect))
+                            }
+                        }
+                        .disabled(!receiverControls)
+                        Menu {
+                            ForEach(RemoteOptionLabels.sleepChoices, id: \.minutes) { c in
+                                Button(c.label) { cast.armSleepTimer(minutes: c.minutes) }
+                            }
+                        } label: {
+                            OptionValueLabel(title: "Sleep Timer", icon: "timer",
+                                             value: RemoteOptionLabels.sleep(cast.sleepEndsAt))
+                        }
+                    }
+                }
+                if isAirPlay {
+                    // Logan 2026-10-07: the AirPlay sheet had no Stream Info.
+                    // Same last section as Cast (and Android's Cast sheet),
+                    // read from the player the receiver is showing.
+                    Section("Stream Info") {
+                        if let airPlayInfo {
+                            AirPlayStreamInfoCard(info: airPlayInfo, radio: radio)
+                                .listRowInsets(EdgeInsets())
+                                .listRowBackground(Color.clear)
+                        } else {
+                            Text("Waiting for the AirPlay player to report.")
+                                .scaledFont(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if !isAirPlay {
+                Section("Stream Info") {
+                    if let stats {
+                        CastStreamInfoCard(stats: stats,
+                                           receiverName: cast.connectedDeviceName,
+                                           receiverVideo: cast.receiverVideoLine,
+                                           composite: MultiviewCompositeStreamInfo.isActive(.cast),
+                                           compositeSource: MultiviewCompositeStreamInfo.sourceHost())
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
+                    } else {
+                        Text("Waiting for the cast proxy to report.")
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    // Same three lines as the cast card.
+                    if let note = cast.transcodeNote {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(note.source)
+                            Text(note.phone)
+                            Text(note.receiver)
+                        }
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                }
+            }
+            .navigationTitle("Options")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showSwitchStream) {
+                if let t = switchStreamTarget {
+                    SwitchStreamView(channelID: t.id, channelUUID: t.uuid, channelName: t.name)
+                }
+            }
+            .sheet(isPresented: $showRecord) {
+                if let item = castItem {
+                    let now = Date()
+                    RecordProgramSheet(
+                        programTitle: item.currentProgram ?? "\(item.name) live recording",
+                        programDescription: item.currentProgramDescription ?? "",
+                        channelID: item.id,
+                        channelName: item.name,
+                        scheduledStart: item.currentProgramStart ?? now,
+                        scheduledEnd: (item.currentProgramEnd.flatMap { $0 > now ? $0 : nil })
+                            ?? now.addingTimeInterval(3600),
+                        isLive: true,
+                        dispatcharrChannelID: item.dispatcharrChannelID,
+                        streamURL: item.streamURL
+                    )
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        // ~1 Hz stats poll while the sheet is up; statsSnapshot is one
+        // short hop onto the proxy's session queue.
+        .task {
+            if isAirPlay {
+                await airPlayOptions.load()
+                while !Task.isCancelled {
+                    airPlayInfo = AirPlayStreamInfo.snapshot()
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                return
+            }
+            // The receiver pushes a snapshot after every change; this asks
+            // for the current one so the rows are filled on open.
+            cast.requestRemoteState()
+            while !Task.isCancelled {
+                stats = CastHLSProxySession.shared.statsSnapshot()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+}
+
+/// Composite Stream Info rows (Logan 2026-10-07, round 3). A composite cast
+/// used to show the proxy box (SOURCE 127.0.0.1: the proxy ingests the
+/// phone's own composite) with four plain-text lines under it. The facts now
+/// live inside the box as rows: SOURCE carries the tiles' upstream host the
+/// way the AirPlay box does, COMPOSITE the grid size and rate, FORMAT the
+/// container, AUDIO the composite's audio. Both sheets use the same rows.
+enum MultiviewCompositeStreamInfo {
+    @MainActor static func isActive(_ transport: MultiviewCompositeSession.Transport) -> Bool {
+        MultiviewCompositeSession.shared.transport == transport
+    }
+
+    /// "1280x720 at 30 fps".
+    static var compositeValue: String {
+        "\(MultiviewCompositeLayout.width)x\(MultiviewCompositeLayout.height) at \(MultiviewCompositeLayout.fps) fps"
+    }
+
+    /// The composite encoder is VideoToolbox H.264 (MultiviewCompositor).
+    static let videoValue = "H.264"
+    static let audioValue = "AAC-LC stereo 48 kHz"
+
+    /// Cast: the proxy remuxes the composite TS to fMP4 for the receiver.
+    /// AirPlay: the TS is served as is.
+    static func formatValue(_ transport: MultiviewCompositeSession.Transport) -> String {
+        transport == .cast ? "MPEG-TS to fMP4" : "MPEG-TS muxed"
+    }
+
+    /// Distinct upstream hosts of the Multiview tiles, comma separated
+    /// (host only: XC URLs carry credentials in the path).
+    @MainActor static func sourceHost() -> String? {
+        var hosts: [String] = []
+        for tile in MultiviewStore.shared.tiles {
+            if let h = tile.streamURL.host, !h.isEmpty, !hosts.contains(h) { hosts.append(h) }
+        }
+        return hosts.isEmpty ? nil : hosts.joined(separator: ", ")
+    }
+}
+
+/// AirPlay Stream Info (Logan 2026-10-07, round 2): the Cast sheet's facts
+/// for the AirPlay session. Video facts come from the serving tile's own
+/// source (its remuxer's H.264 SPS: size and declared rate), then from the
+/// tile's AVPlayerItem tracks and access log; the external-playback path
+/// (no LAN serving) reads the player alone.
+struct AirPlayStreamInfo: Equatable {
+    var receiver: String
+    /// Upstream host of the playing stream (the server the phone ingests
+    /// from), e.g. the Dispatcharr host; Multiview: the tiles' hosts.
+    var source: String
+    var delivery: String
+    var container: String
+    var video: String
+    var audio: String
+    var bitrate: String
+    var buffer: String
+    var health: String
+    /// "1280x720 at 30 fps" for a Multiview composite, nil otherwise.
+    var composite: String? = nil
+
+    @MainActor static func snapshot() -> AirPlayStreamInfo? {
+        let monitor = AirPlayMonitor.shared
+        let facts = AirPlayTileDelivery.servingFacts
+        guard let player = facts?.player ?? monitor.attachedPlayer else { return nil }
+        let item = player.currentItem
+        let composite = MultiviewCompositeSession.shared.transport == .airPlay
+        let assetTracks = item?.tracks.compactMap(\.assetTrack) ?? []
+
+        // Delivery path and container.
+        let delivery: String
+        let container: String
+        if facts != nil {
+            delivery = "phone serves HLS to the TV over Wi-Fi"
+            let audioForm = facts?.aacRewrite == true ? "audio AAC rewrite" : "audio passthrough"
+            container = composite
+                ? MultiviewCompositeStreamInfo.formatValue(.airPlay) : "MPEG-TS muxed, \(audioForm)"
+        } else {
+            delivery = "AVPlayer external playback"
+            container = "as the source sends it"
+        }
+
+        // Video: codec, resolution, fps.
+        var video: String
+        if composite {
+            video = MultiviewCompositeStreamInfo.videoValue
+        } else {
+            var codec = "H.264"
+            var size = ""
+            var fps: Double = 0
+            var interlaced = false
+            if let pic = facts?.remuxer?.sourceVideoPicture {
+                size = "\(pic.width)x\(pic.height)"
+                fps = pic.fps ?? 0
+                interlaced = pic.isInterlaced
+            }
+            if let track = assetTracks.first(where: { $0.mediaType == .video }) {
+                if let desc = track.formatDescriptions.first {
+                    codec = fourCCName(CMFormatDescriptionGetMediaSubType(desc as! CMFormatDescription))
+                }
+                if fps <= 0, track.nominalFrameRate > 0 { fps = Double(track.nominalFrameRate) }
+                if size.isEmpty, track.naturalSize.width > 0 {
+                    size = "\(Int(track.naturalSize.width))x\(Int(track.naturalSize.height))"
+                }
+            }
+            if size.isEmpty, let ps = item?.presentationSize, ps.width > 0 {
+                size = "\(Int(ps.width))x\(Int(ps.height))"
+            }
+            video = codec + "  " + (size.isEmpty ? "size detecting" : size + (interlaced ? "i" : ""))
+            if fps > 0 { video += String(format: " at %@fps", fpsText(fps)) }
+        }
+
+        // Audio: codec and channels.
+        var audio: String
+        if facts?.aacRewrite == true {
+            audio = "AAC-LC stereo (2 ch, rewritten from \(facts?.remuxer?.sourceAudioCodec ?? "source"))"
+        } else {
+            var codec = facts?.remuxer?.sourceAudioCodec ?? "detecting"
+            var channels = 0
+            if let track = assetTracks.first(where: { $0.mediaType == .audio }),
+               let desc = track.formatDescriptions.first {
+                let fd = desc as! CMAudioFormatDescription
+                if codec == "detecting" || codec == "unknown" {
+                    codec = fourCCName(CMFormatDescriptionGetMediaSubType(fd))
+                }
+                if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee {
+                    channels = Int(asbd.mChannelsPerFrame)
+                }
+            }
+            audio = codec + (channels > 0 ? "  \(channels) ch" : "  channels from the source")
+            if facts != nil { audio += "  passthrough" }
+            // Android parity wording for the composite.
+            if composite { audio = MultiviewCompositeStreamInfo.audioValue }
+        }
+
+        let event = item?.accessLog()?.events.last
+        var bitrate = "measuring"
+        if let e = event, e.indicatedBitrate > 0 || e.observedBitrate > 0 {
+            bitrate = e.indicatedBitrate > 0 ? "\(Int(e.indicatedBitrate / 1000)) kbps indicated" : "indicated n/a"
+            bitrate += e.observedBitrate > 0 ? "  \(Int(e.observedBitrate / 1000)) kbps observed" : "  observed n/a"
+        }
+        let now = player.currentTime().seconds
+        let ahead = (item?.loadedTimeRanges ?? []).map(\.timeRangeValue)
+            .first(where: { $0.start.seconds <= now + 0.5 && $0.end.seconds >= now })
+            .map { $0.end.seconds - now } ?? 0
+        var buffer = String(format: "%.1fs ahead", max(0, ahead))
+        if let link = facts?.link, link.reservoirSegments > 0 {
+            buffer += String(format: "  LAN %d segs (%.1fs)", link.reservoirSegments, link.reservoirSeconds)
+        }
+        // SOURCE: the upstream host, never loopback (a composite tile's
+        // remuxer ingests the phone's own composite stream).
+        var source = composite ? MultiviewCompositeStreamInfo.sourceHost() : nil
+        if source == nil, let h = facts?.remuxer?.sourceHost, !isLoopback(h) { source = h }
+        if source == nil, let h = (item?.asset as? AVURLAsset)?.url.host, !isLoopback(h) { source = h }
+        let health = "drops \(max(0, event?.numberOfDroppedVideoFrames ?? 0))  stalls \(max(0, event?.numberOfStalls ?? 0))"
+        return AirPlayStreamInfo(receiver: monitor.deviceName ?? "AirPlay", source: source ?? "-", delivery: delivery, container: container,
+                                 video: video, audio: audio, bitrate: bitrate, buffer: buffer, health: health,
+                                 composite: composite ? MultiviewCompositeStreamInfo.compositeValue : nil)
+    }
+
+    private static func isLoopback(_ host: String) -> Bool {
+        host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+    }
+
+    private static func fourCCName(_ sub: FourCharCode) -> String {
+        switch sub {
+        case kCMVideoCodecType_H264: return "H.264"
+        case kCMVideoCodecType_HEVC: return "HEVC"
+        case kAudioFormatMPEG4AAC: return "AAC-LC"
+        case kAudioFormatAC3: return "AC-3"
+        case kAudioFormatEnhancedAC3: return "E-AC-3"
+        default:
+            let cc = [24, 16, 8, 0].map { Character(UnicodeScalar(UInt8((sub >> $0) & 0xFF))) }
+            return String(cc).trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    private static func fpsText(_ fps: Double) -> String {
+        abs(fps.rounded() - fps) < 0.01 ? String(format: "%.0f", fps) : String(format: "%.2f", fps)
+    }
+}
+
+struct AirPlayStreamInfoCard: View {
+    @Environment(\.astralTextScale) private var textScale
+    let info: AirPlayStreamInfo
+    /// Radio Mode: local audio only, the video track is not decoded.
+    var radio: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if radio {
+                row(label: "MODE", value: "Radio Mode")
+            } else {
+                row(label: "TV", value: info.receiver)
+            }
+            row(label: "SOURCE", value: info.source)
+            row(label: "VIA", value: radio ? "AVPlayer (local)" : info.delivery)
+            if let composite = info.composite {
+                row(label: "COMPOSITE", value: composite)
+            }
+            row(label: "FORMAT", value: info.container)
+            row(label: "VIDEO", value: radio ? "\(info.video) (not decoded)" : info.video)
+            row(label: "AUDIO", value: info.audio)
+            row(label: "RATE", value: info.bitrate)
+            row(label: "BUFFER", value: info.buffer)
+            row(label: "HEALTH", value: info.health)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func row(label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .scaledFont(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundColor(Color.contrastText(Color.accentPrimary))
+                // COMPOSITE (9 characters) is the one label wider than the
+                // column; it shrinks to fit instead of wrapping.
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(width: TextScale.grow(46, textScale), alignment: .trailing)
+            Text(value)
+                .scaledFont(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(.primary.opacity(0.9))
+        }
+    }
+}
+
+/// The proxy's own numbers in the app's Stream Info card treatment
+/// (StreamInfoCardView's monospaced label/value rows): what the phone is
+/// ingesting, what it serves, and how the pipeline is pacing.
+private struct CastStreamInfoCard: View {
+    @Environment(\.astralTextScale) private var textScale
+    let stats: CastHLSProxySession.Stats
+    let receiverName: String?
+    /// "1920x1080 at 60fps" from the receiver's own telemetry.
+    let receiverVideo: String?
+    /// A phone-side Multiview composite is on this cast.
+    var composite: Bool = false
+    /// The tiles' upstream host(s) for a composite (the proxy itself ingests
+    /// the phone's loopback composite, so `ingestHost` reads 127.0.0.1).
+    var compositeSource: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if composite {
+                row(label: "SOURCE", value: compositeSource ?? "-")
+                row(label: "COMPOSITE", value: MultiviewCompositeStreamInfo.compositeValue)
+                row(label: "FORMAT", value: MultiviewCompositeStreamInfo.formatValue(.cast))
+                row(label: "VIDEO", value: stats.videoCodec ?? MultiviewCompositeStreamInfo.videoValue)
+                row(label: "AUDIO", value: MultiviewCompositeStreamInfo.audioValue)
+            } else {
+                row(label: "SOURCE", value: stats.ingestHost)
+                row(label: "VIDEO", value: stats.videoCodec ?? "detecting")
+                row(label: "AUDIO", value: stats.audioPath ?? "detecting")
+            }
+            row(label: "SEGS", value: "\(stats.segmentsProduced) produced  gen \(stats.generation)")
+            row(label: "RATE", value: rateLine)
+            row(label: "PROXY", value: "HLS on port \(stats.port)")
+            row(label: "TV", value: receiverName ?? "-")
+            row(label: "RECEIVER", value: receiverVideo ?? "waiting")
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    /// Latest completed per-8-segment rollup (the same numbers the proxy
+    /// logs); "measuring" until the first rollup lands (~24 s in).
+    private var rateLine: String {
+        guard let kbps = stats.lastRollupKbps else { return "measuring" }
+        var line = "\(kbps) kbps"
+        if let avg = stats.lastRollupAvgSegmentSeconds {
+            line += String(format: "  avg seg %.2fs", avg)
+        }
+        return line
+    }
+
+    @ViewBuilder
+    private func row(label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .scaledFont(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundColor(Color.contrastText(Color.accentPrimary))
+                // COMPOSITE (9 characters) is the one label wider than the
+                // column; it shrinks to fit instead of wrapping.
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(width: TextScale.grow(46, textScale), alignment: .trailing)
+            Text(value)
+                .scaledFont(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(.primary.opacity(0.9))
+        }
+    }
+}
+
+// MARK: - Floating "Control TV" pill
+
+/// Shown above the tab bar whenever a controllable AstralTV TV is discovered on
+/// the LAN -- so the phone can act as a remote for whatever the TV is already
+/// playing WITHOUT first opening a channel here (user request 2026-07-16).
+struct CompanionControlFAB: View {
+    @ObservedObject private var theme: ThemeManager = .shared
+    var action: () -> Void
+    /// Circle diameter. 48 pt matches the minimized tab button; beside the
+    /// Kept Live card it takes the card's measured height (Logan 2026-10-05).
+    var size: CGFloat = 48
+    var body: some View {
+        // Same shape and material as the iOS 26 minimized tab-bar button it
+        // sits opposite (measured on Logan's screenshot 2026-09-09: a 52 pt
+        // plain regular-glass circle, no accent tint, no shadow). Earlier
+        // systems keep the tinted glass.
+        Button(action: action) {
+            Image(systemName: "tv.and.mediabox")
+                .font(.system(size: 19, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                .foregroundStyle(theme.accent)
+                .frame(width: size, height: size)
+        }
+        .modifier(CompanionFABChrome())
+        .accessibilityLabel("Control a TV")
+    }
+}
+
+private struct KeptPillChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, tvOS 26.0, *) {
+            content.glassEffect(.regular, in: Capsule())
+        } else {
+            content
+                .background(.regularMaterial, in: Capsule())
+                .clipShape(Capsule())
+        }
+    }
+}
+
+private struct CompanionFABChrome: ViewModifier {
+    @ObservedObject private var theme: ThemeManager = .shared
+    func body(content: Content) -> some View {
+        // Always glass on 26+, whatever the app's Liquid Glass style: the
+        // system's minimized tab button ignores that setting, and the flat
+        // fallback fill read as a solid navy disc next to it (pixel check
+        // 2026-09-09).
+        if #available(iOS 26.0, tvOS 26.0, *) {
+            // Measured from the live view hierarchy (2026-09-09, [TABBAR]
+            // dump): the minimized tab button is a 48 pt _UITabBarPlatterView
+            // backed by ClearGlassView, but regular glass is what matches it
+            // pixel for pixel on device (sampled 2026-09-09); clear ran darker.
+            content.glassEffect(.regular, in: Circle())
+        } else {
+            content
+                .liquidGlass(cornerRadius: 26)
+                .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
+        }
+    }
+}
+
+// MARK: - Companion device picker sheet
+
+/// Lists discovered AstralTV Android TVs; pick one -> connect (remembered token
+/// auto-authenticates), or the TV shows a 6-digit code entered inline here.
+// MARK: - Unified sectioned output picker (task #225)
+
+/// Discovered Google Cast devices for the unified picker. The SDK's
+/// GCKUICastButton owns its own modal chooser; the sectioned sheet needs the
+/// raw device list, so this thin wrapper mirrors GCKDiscoveryManager into
+/// SwiftUI. Listener callbacks arrive on the main thread per the Cast SDK
+/// contract; the Task hop keeps that assumption out of the type system the
+/// same way AstralCastController's own observers do.
+final class CastDeviceList: NSObject, ObservableObject, GCKDiscoveryManagerListener {
+    @Published private(set) var devices: [GCKDevice] = []
+
+    private var manager: GCKDiscoveryManager {
+        GCKCastContext.sharedInstance().discoveryManager
+    }
+
+    func start() {
+        manager.add(self)
+        manager.startDiscovery()
+        reload()
+        debugLog("[Cast] picker start: discovery state=\(manager.discoveryState.rawValue), devices=\(manager.deviceCount)")
+    }
+
+    func stop() {
+        manager.remove(self)
+    }
+
+    private func reload() {
+        let m = manager
+        var list: [GCKDevice] = []
+        for i in 0..<m.deviceCount { list.append(m.device(at: i)) }
+        devices = list
+        debugLog("[Cast] picker list: discovery state=\(m.discoveryState.rawValue), devices=\(list.count) \(list.map { $0.friendlyName ?? $0.deviceID })")
+    }
+
+    func didUpdateDeviceList() {
+        // Cast SDK delivers listener callbacks on the main thread (SDK
+        // contract), so the @Published mutation in reload() is main-safe
+        // without an executor hop.
+        reload()
+    }
+}
+
+/// Task #225: ONE sectioned output picker replacing the separate Cast /
+/// AirPlay / Control-a-TV chrome buttons (Android CastControls.kt "Cast to"
+/// dialog twin, plus the iOS-only AirPlay section). Fixed section order:
+///
+///   "AstralTV Remote" - companion devices (full native player on the TV,
+///                      no codec limits)
+///   "Google Cast"    - Cast SDK devices (web receiver, Dispatcharr-only)
+///   "AirPlay"        - hands off to the system route sheet
+///
+/// A section renders only when its transport is currently usable for the
+/// playing content -- the host passes the same gates the three buttons used.
+/// Transports are mutually exclusive (Android parity): picking one tears the
+/// other down first.
+struct CastPickerSheet: View {
+    /// Cast section gate: devices may exist AND the channel is basic-castable.
+    let showGoogleCast: Bool
+    /// AirPlay section gate: the session rides AVPlayer (video routes exist).
+    let showAirPlay: Bool
+
+    @ObservedObject private var companion = CompanionClient.shared
+    @ObservedObject private var castController = AstralCastController.shared
+    @ObservedObject private var airPlay = AirPlayMonitor.shared
+    @StateObject private var castDevices = CastDeviceList()
+    @ObservedObject private var nativeRegistry = CastNativeDeviceRegistry.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var code = ""
+
+    /// One Cast row, used by both the "AstralTV on TV" and "Google Cast"
+    /// sections so their behavior stays identical.
+    @ViewBuilder
+    private func castDeviceRow(_ device: GCKDevice) -> some View {
+        let connecting = castController.connectingDeviceID == device.deviceID
+        let otherConnecting = castController.connectingDeviceID != nil && !connecting
+        Button {
+            if !companion.isControlling { companion.disconnect() }
+            // Session start AND the channel to load live in one place now
+            // (guide pill parity with the in-player chrome).
+            castController.beginSession(with: device)
+        } label: {
+            HStack {
+                Label(device.friendlyName ?? "Cast device", systemImage: "sparkles.tv")
+                Spacer()
+                if connecting {
+                    Text("Connecting…").foregroundStyle(.secondary)
+                    ProgressView()
+                }
+            }
+        }
+        // Selection feedback (Logan 2026-09-11: the sheet looked inert after
+        // the tap): the tapped row spins, the rest dim until the attempt
+        // settles.
+        .disabled(otherConnecting)
+        .opacity(otherConnecting ? 0.4 : 1)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                // Active connection first, with its teardown action (the
+                // Android dialog's "Stop casting" / "Disconnect TV" buttons).
+                if castController.isCasting {
+                    Section {
+                        Button(role: .destructive) {
+                            castController.stopCasting()
+                        } label: {
+                            Label("Stop casting", systemImage: "stop.circle")
+                        }
+                    }
+                }
+                if companion.isControlling {
+                    Section {
+                        Button(role: .destructive) {
+                            companion.disconnect()
+                        } label: {
+                            Label("Disconnect TV", systemImage: "stop.circle")
+                        }
+                    }
+                }
+                if case .needsPairing(let name) = companion.conn {
+                    Section("Enter the code shown on \(name ?? "the TV")") {
+                        TextField("6-digit code", text: $code)
+                            .keyboardType(.numberPad)
+                            .scaledFont(.title3.monospaced())
+                        Button("Pair") {
+                            companion.submitPairingCode(code)
+                            code = ""
+                        }
+                        .disabled(code.trimmingCharacters(in: .whitespaces).count < 6)
+                    }
+                } else if case .connecting(let name) = companion.conn {
+                    Section {
+                        HStack {
+                            ProgressView()
+                            Text("Connecting to \(name ?? "TV")…").padding(.leading, 8)
+                        }
+                    }
+                }
+                if !companion.devices.isEmpty {
+                    Section("AstralTV Remote") {
+                        ForEach(companion.devices) { tv in
+                            Button {
+                                // One remote target at a time (Android parity).
+                                castController.stopCasting()
+                                companion.connect(to: tv)
+                            } label: {
+                                Label(tv.name, systemImage: "tv")
+                            }
+                        }
+                    }
+                }
+                if showGoogleCast {
+                    // Devices that have run the AstralTV Android TV app via
+                    // Cast Connect get their own section, so the better path
+                    // is the obvious one to pick.
+                    let nativeDevices = castDevices.devices.filter {
+                        nativeRegistry.isNative($0.deviceID)
+                    }
+                    if !nativeDevices.isEmpty {
+                        Section {
+                            ForEach(nativeDevices, id: \.deviceID) { device in
+                                castDeviceRow(device)
+                            }
+                        } header: {
+                            Text("AstralTV on TV")
+                        } footer: {
+                            Text("Plays in the AstralTV app on the TV: no phone processing, full quality.")
+                        }
+                    }
+                    Section("Google Cast") {
+                        if castDevices.devices.isEmpty {
+                            Text("Searching for devices…")
+                                .foregroundStyle(.secondary)
+                        }
+                        ForEach(castDevices.devices.filter { !nativeRegistry.isNative($0.deviceID) },
+                                id: \.deviceID) { device in
+                            castDeviceRow(device)
+                        }
+                        if let error = castController.connectError {
+                            Text(error)
+                                .scaledFont(.footnote)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+                if showAirPlay {
+                    Section("AirPlay") {
+                        Button {
+                            dismiss()
+                            // The system route sheet replaces this one; see
+                            // AirPlayMenuTrigger for the hidden-picker detail.
+                            AirPlayMenuTrigger.present()
+                        } label: {
+                            if case .probing = airPlay.phase {
+                                // Cast parity: the connecting row shows the
+                                // receiver with a spinner.
+                                HStack {
+                                    Label(airPlay.deviceName ?? "AirPlay", systemImage: "airplay.video")
+                                    Spacer()
+                                    Text("Connecting…").foregroundStyle(.secondary)
+                                    ProgressView()
+                                }
+                            } else {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label("AirPlay", systemImage: "airplay.video")
+                                Text("Choose a TV, then start a channel")
+                                    .scaledFont(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            }
+                        }
+                    }
+                }
+                if companion.devices.isEmpty && !showGoogleCast && !showAirPlay {
+                    Text("No AstralTV devices found. Open AstralTV on your TV, then check again.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle(
+                castController.isCasting || companion.isControlling ? "Connected" : "Cast to"
+            )
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") {
+                        // Cancel an in-flight / unpaired companion attempt so
+                        // it doesn't stay retained + spinning after the sheet
+                        // is gone; a fully connected session is left alone.
+                        if !companion.isControlling { companion.disconnect() }
+                        dismiss()
+                    }
+                }
+            }
+        }
+        // Unconditional: the device-list mirror must run even while the gate
+        // still reads unavailable, or a sheet opened before the first
+        // discovery results can never grow the Google Cast section.
+        .onAppear { castDevices.start() }
+        .onDisappear { castDevices.stop() }
+        // Freshly connected on either transport -> the picker's job is done.
+        // The user stays on the page they were on; the remote-session card
+        // above the tab bar takes over (rule 1, Logan 2026-09-12).
+        .onChange(of: companion.isControlling) { _, controlling in
+            if controlling { dismiss() }
+        }
+        // 2026-09-21 production recording: the title flips "Cast to" ->
+        // "Connected" (navigationTitle reads isCasting), holds briefly so
+        // the user sees it, then the sheet dismisses onto the idle card.
+        .onChange(of: castController.state) { _, state in
+            if case .connected = state {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(600))
+                    if castController.isCasting { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+struct CompanionPickerSheet: View {
+    @ObservedObject private var companion = CompanionClient.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var code = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if case .needsPairing(let name) = companion.conn {
+                    Section("Enter the code shown on \(name ?? "the TV")") {
+                        TextField("6-digit code", text: $code)
+                            .keyboardType(.numberPad)
+                            .scaledFont(.title3.monospaced())
+                        Button("Pair") {
+                            companion.submitPairingCode(code)
+                            code = ""
+                        }
+                        .disabled(code.trimmingCharacters(in: .whitespaces).count < 6)
+                    }
+                } else if case .connecting(let name) = companion.conn {
+                    Section {
+                        HStack {
+                            ProgressView()
+                            Text("Connecting to \(name ?? "TV")…").padding(.leading, 8)
+                        }
+                    }
+                }
+                Section("AstralTV devices") {
+                    if companion.devices.isEmpty {
+                        Text("No AstralTV devices found. Open AstralTV on your TV, then check again.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(companion.devices) { tv in
+                        Button {
+                            companion.connect(to: tv)
+                        } label: {
+                            Label(tv.name, systemImage: "tv")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Control a TV")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") {
+                        // Cancel an in-flight / unpaired attempt so it doesn't
+                        // stay retained + spinning after the sheet is gone
+                        // (review 2026-07-16). A fully connected session is
+                        // left alone -- its cover takes over.
+                        if !companion.isControlling { companion.disconnect() }
+                        dismiss()
+                    }
+                }
+            }
+        }
+        // Freshly connected -> the picker's job is done; the remote cover
+        // (HomeView) takes over. presentationDetents keep it compact.
+        .onChange(of: companion.isControlling) { _, controlling in
+            if controlling { dismiss() }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+// AirPlayMonitor moved to App/AirPlayMonitor.swift (phases + receiver, 2026-09-21 rebuild).
+
+// MARK: - Remote session card (Logan 2026-09-12)
+
+/// The ONE card for all three transports (Google Cast, AirPlay, AstralTV
+/// Remote companion). It sits above the bottom tab bar on every tab for as
+/// long as a session is live, so choosing a device never moves the user off
+/// the page they were on, and tapping it opens the applicable remote controls
+/// in a sheet. Sized off the Android CastMiniController/CastTransportCard (dp
+/// map 1:1 to points on phone) and finished like the channel list rows
+/// (Logan 2026-09-12): theme card fill with the 10% accent hairline, 12 pt
+/// corners, 16 pt side margins (the list's own margin), 6 pt above the tab
+/// bar, 44 pt art tile, and THREE lines -- channel name, program, then the
+/// accent status line -- with accent play/pause and X trailing.
+struct RemoteSessionCard: View {
+
+    enum Transport {
+        case cast, airPlay, companion, carPlay, radio
+
+        var glyph: String {
+            switch self {
+            case .radio: return "radio"
+            case .cast: return "sparkles.tv"
+            case .airPlay: return "airplay.video"
+            case .companion: return "tv.and.mediabox"
+            case .carPlay: return "car.fill"
+            }
+        }
+    }
+
+    let transport: Transport
+    let title: String
+    let status: String
+    var artURL: String? = nil
+    let isPlaying: Bool
+    /// Android parity (CastMiniController.showTransport): hidden while nothing
+    /// is playing on the other screen yet, since there is nothing to pause.
+    var showTransport: Bool = true
+    /// Extra lines under the status line (Cast: the transcode note and what
+    /// the receiver presents). Empty keeps the card at its three lines.
+    var detailLines: [String] = []
+    let onTap: () -> Void
+    let onTogglePlayPause: () -> Void
+    let onStop: () -> Void
+    /// Add Channel (Logan 2026-10-11): the + beside the X; nil hides it
+    /// (no Multiview possible, or at the tile cap).
+    var onAddChannel: (() -> Void)? = nil
+    /// Radio Mode on a failed stream: the transport button is Retry Now
+    /// (Play / Pause has nothing to act on).
+    var onRetry: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Leading tile, Android CastMiniController: the channel logo, or
+            // the transport glyph when nothing is playing yet.
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.black.opacity(0.25))
+                if let artURL, let url = URL(string: artURL) {
+                    AsyncImage(url: url) { image in
+                        image.resizable().scaledToFit()
+                    } placeholder: {
+                        Image(systemName: transport.glyph)
+                            .font(.system(size: 20))  // glyph in a fixed box: not text, stays fixed
+                            .foregroundStyle(ThemeManager.shared.accent)
+                    }
+                    .frame(width: 38, height: 38)
+                } else {
+                    Image(systemName: transport.glyph)
+                        .font(.system(size: 20))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(ThemeManager.shared.accent)
+                }
+            }
+            .frame(width: 44, height: 44)
+            // THREE lines like the Android card: channel bold, program, then
+            // the accent status line ("Controlling <TV>" / "Casting to <TV>").
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .scaledFont(.subheadline.weight(.bold))
+                    .lineLimit(1)
+                Text(status)
+                    .scaledFont(.caption)
+                    .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                    .lineLimit(1)
+                ForEach(detailLines, id: \.self) { line in
+                    // Wraps rather than truncates: the note names the codec,
+                    // size and rate, and a cut-off line loses exactly those.
+                    Text(line)
+                        .scaledFont(.caption2)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if showTransport, let onRetry {
+                Button(action: onRetry) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 18, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(ThemeManager.shared.accent)
+                        .frame(width: 38, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(PlaybackFailureCopy.retryNow)
+            } else if showTransport {
+                Button(action: onTogglePlayPause) {
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 18, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(ThemeManager.shared.accent)
+                        .frame(width: 38, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isPlaying ? "Pause" : "Play")
+            }
+            if let onAddChannel {
+                Button(action: onAddChannel) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 17, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(ThemeManager.shared.accent)
+                        .frame(width: 38, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add Channel")
+            }
+            // X is accent-colored on Android too, and it always ends the
+            // session (see HomeView: stop on the TV, then close the card).
+            Button(action: onStop) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 17, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                    .foregroundStyle(ThemeManager.shared.accent)
+                    .frame(width: 38, height: 40)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop")
+        }
+        // 18 pt on both: the iPhone card is a capsule now too, so the
+        // transport buttons need the same clearance from the rounded ends.
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .modifier(SurfaceStyle())
+        .contentShape(Rectangle())
+        .onTapGesture {
+            debugLog("[Cast] card tap")
+            onTap()
+        }
+        .modifier(RemoteAddChannelPresenter(host: .card))
+        .onAppear { debugLog("[Cast] card show") }
+        .onDisappear { debugLog("[Cast] card hide") }
+        .accessibilityElement(children: .contain)
+    }
+
+    /// iPhone (Logan 2026-10-05): the Kept Live pill's capsule and plain
+    /// glass, so the two stack as matching capsules; HomeView sets the side
+    /// insets from the measured tab bar capsule. iPad (Logan 2026-10-05): the tab pill's capsule and surface;
+    /// the dock sets the width, so no side margins.
+    private struct SurfaceStyle: ViewModifier {
+        func body(content: Content) -> some View {
+            if PadTabPill.isActive {
+                content.modifier(PadPillSurface(shape: Capsule()))
+            } else {
+                content.modifier(KeptPillChrome())
+            }
+        }
+    }
+
+    /// 12 pt: the channel list card's radius, kept here so the card still
+    /// lines up with the lists it floats over.
+    fileprivate static let radius: CGFloat = 12
+
+    /// The tab bar's own tone: near-black over the glass backdrop, so the
+    /// card and the bar read as one material instead of two tiles.
+    private static let glassTint = Color.black.opacity(0.45)
+    /// The bar's hairline is a faint white, not an accent line.
+    private static let hairline = Color.white.opacity(0.10)
+
+    @ViewBuilder
+    static var cardSurface: some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        Group {
+            if #available(iOS 26.0, *) {
+                // Same call MinimizedTabButton uses for the minimized bar
+                // pill, so the card picks up the identical Liquid Glass.
+                Color.clear
+                    .glassEffect(.regular, in: shape)
+                    .overlay { shape.fill(glassTint) }
+            } else {
+                shape
+                    .fill(.regularMaterial)
+                    .overlay { shape.fill(glassTint) }
+            }
+        }
+        .overlay { shape.strokeBorder(hairline, lineWidth: 1) }
+        .shadow(color: .black.opacity(0.25), radius: 10, y: 3)
+    }
+
+}
+
+// MARK: - Remote session Add Channel (Logan 2026-10-11)
+
+/// "Add Channel" on the remote-session card and sheet (Cast, AirPlay,
+/// AstralTV Remote, where the receiver can take a Multiview). Opens the
+/// Multiview add-channel picker. A composite cast takes the pick as one
+/// more tile (the running-Multiview add path, e1dcbd2); a single-channel
+/// cast becomes a two-channel Multiview on the receiver through the same
+/// "Play on <receiver>" path the staged set uses. Android twin: same
+/// wording and placement.
+@MainActor
+final class RemoteAddChannel: ObservableObject {
+    static let shared = RemoteAddChannel()
+    enum Host { case card, sheet }
+
+    @Published private(set) var presentedOn: Host?
+    /// Single cast: the channel the receiver plays, staged as tile 1 while
+    /// the picker is open. nil while adding to a running composite.
+    private var singleItem: ChannelDisplayItem?
+    /// The store was seeded here (no local Multiview ran), so a cancel
+    /// clears it again.
+    private var seeded = false
+    private var baseline = 0
+    private var bag: AnyCancellable?
+
+    private init() {
+        bag = MultiviewStore.shared.$tiles
+            .map(\.count)
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] n in self?.tilesChanged(count: n) }
+    }
+
+    /// Whether the action shows. `single`: the channel of a single-channel
+    /// session, nil when none (or the session is a composite).
+    static func available(single: ChannelDisplayItem?) -> Bool {
+        let store = MultiviewStore.shared
+        if MultiviewCompositeSession.shared.isActive {
+            return MultiviewCompositeSession.eligible(count: store.tiles.count + 1)
+        }
+        guard single != nil else { return false }
+        return PlayWhereRouter.multiviewReceiverName(count: 2) != nil
+    }
+
+    func open(from host: Host, single: ChannelDisplayItem?) {
+        let store = MultiviewStore.shared
+        guard Self.available(single: single) else { return }
+        if MultiviewCompositeSession.shared.isActive {
+            singleItem = nil
+            seeded = false
+        } else {
+            guard let single else { return }
+            singleItem = single
+            seeded = false
+            if PlayerSession.shared.mode != .multiview {
+                store.reset()
+                store.isStagingFromGuide = false
+                if case .needsWarning = store.add(single, server: ChannelStore.shared.activeServer) {
+                    _ = store.add(single, server: ChannelStore.shared.activeServer, bypassWarning: true)
+                }
+                seeded = true
+            }
+        }
+        baseline = store.tiles.count
+        debugLog("[MV-CAST] Add Channel opened on \(host == .card ? "card" : "sheet") single=\(singleItem?.name ?? "-") tiles=\(baseline)")
+        presentedOn = host
+    }
+
+    /// Picker dismissed (Done, swipe, or after the pick).
+    func dismissed() {
+        guard presentedOn != nil else { return }
+        presentedOn = nil
+        if singleItem != nil, seeded, MultiviewStore.shared.tiles.count <= baseline,
+           PlayerSession.shared.mode != .multiview {
+            MultiviewStore.shared.reset()
+            debugLog("[MV-CAST] Add Channel cancelled: staged single cleared")
+        }
+        singleItem = nil
+        seeded = false
+    }
+
+    private func tilesChanged(count: Int) {
+        guard presentedOn != nil, let single = singleItem, count > baseline else { return }
+        // The pick turns the single cast into a two-channel Multiview on
+        // the receiver (native or the phone composite).
+        let channels = MultiviewStore.shared.tiles.map(\.item)
+        debugLog("[MV-CAST] Add Channel: \(single.name) + \(channels.last?.name ?? "?") -> Multiview on the receiver")
+        singleItem = nil
+        seeded = false
+        presentedOn = nil
+        PlayWhereRouter.shared.playMultiviewOnReceiver(channels: channels, focus: 0)
+    }
+}
+
+/// Presents the add-channel picker for `RemoteAddChannel` on one host.
+struct RemoteAddChannelPresenter: ViewModifier {
+    let host: RemoteAddChannel.Host
+    @ObservedObject private var flow = RemoteAddChannel.shared
+
+    func body(content: Content) -> some View {
+        content.sheet(isPresented: Binding(
+            get: { flow.presentedOn == host },
+            set: { if !$0 { flow.dismissed() } }
+        )) {
+            AddToMultiviewSheet(isPresented: Binding(
+                get: { flow.presentedOn == host },
+                set: { if !$0 { flow.dismissed() } }
+            ))
+            .presentationDetents([.fraction(0.45), .large])
+            .presentationDragIndicator(.visible)
+        }
+    }
+}
+
+// MARK: - Multiview dock card + sheet (Logan 2026-10-06)
+
+/// Derived visibility for the Multiview dock card, so HomeView observes one
+/// Bool instead of MultiviewStore (which publishes constantly in a session).
+/// Visible while channels are staged from Live TV and no Multiview session
+/// is up.
+@MainActor
+final class MultiviewDockState: ObservableObject {
+    static let shared = MultiviewDockState()
+    @Published private(set) var visible = false
+    private var bag: AnyCancellable?
+
+    private init() {
+        let store = MultiviewStore.shared
+        bag = Publishers.CombineLatest3(store.$isStagingFromGuide,
+                                        store.$tiles.map(\.isEmpty),
+                                        PlayerSession.shared.$mode.map { $0 == .multiview })
+            .map { staging, empty, inMV in staging && !empty && !inMV }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] v in
+                self?.visible = v
+                debugLog("[MV-Tile] dock card \(v ? "show" : "hide")")
+            }
+    }
+
+    /// Card Play: the default behavior (Play Here; with a session whose
+    /// receiver can run Multiview, the play-where prompt).
+    static func play() {
+        let store = MultiviewStore.shared
+        // One channel staged (Logan 2026-10-11, Android parity): the
+        // channel tap path (play-where prompt for a single live channel,
+        // then standard single-channel playback), not Multiview.
+        if let only = PlayerSession.shared.soleStagedChannel {
+            // The set is consumed either way (Play Here or Play on the
+            // receiver), so it clears now and the closure plays the channel.
+            let playingInMini = PlayerSession.shared.miniPlayerSeedTile?.item.id == only.id
+            clearStaging(reason: "Play with one channel staged (\(only.name))")
+            PlayWhereRouter.shared.request(title: only.name, item: .live(only)) {
+                if playingInMini {
+                    NowPlayingManager.shared.expand()
+                } else {
+                    _ = PlayerSession.shared.begin(item: only, server: ChannelStore.shared.activeServer)
+                }
+            }
+            return
+        }
+        let items = store.tiles.map(\.item)
+        let focus = store.tiles.firstIndex(where: { $0.id == store.audioTileID }) ?? 0
+        DebugLogger.shared.log("[MV-Tile] staging mode: user tapped Play (count=\(items.count))",
+                               category: "Playback", level: .info)
+        PlayWhereRouter.shared.requestMultiview(channels: items, focus: focus, play: playHereNow)
+    }
+
+    /// Enter Multiview on this device over the staged tiles.
+    static func playHereNow() {
+        MultiviewStore.shared.isStagingFromGuide = false
+        PlayerSession.shared.enterMultiview(seeding: nil, server: ChannelStore.shared.activeServer)
+    }
+
+    /// After the receiver took the set, the phone has nothing staged.
+    static func clearStaging(reason: String) {
+        let store = MultiviewStore.shared
+        guard PlayerSession.shared.mode != .multiview else { return }
+        let n = store.tiles.count
+        store.reset()
+        store.isStagingFromGuide = false
+        DebugLogger.shared.log("[MV-Tile] staging mode: \(reason) (count=\(n))",
+                               category: "Playback", level: .info)
+    }
+}
+
+/// The Multiview staging dock card: the exact shape of KeptLiveCard's dock
+/// body (44 pt tile, title and subtitle, 18/8 pt padding, same capsule
+/// surface). Tapping the body opens the Multiview sheet; Play plays.
+struct MultiviewDockCard: View {
+    @ObservedObject private var store = MultiviewStore.shared
+    let onShowSheet: () -> Void
+
+    var body: some View {
+        let names = store.tiles.map(\.item.name)
+        let title = names.count == 1 ? "1 channel staged for Multiview"
+            : "\(names.count) channels staged for Multiview"
+        return HStack(spacing: 12) {
+            Button(action: onShowSheet) {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.black.opacity(0.25))
+                        Image(systemName: "rectangle.split.2x2")
+                            .font(.system(size: 20))  // glyph in a fixed box: not text, stays fixed
+                            .foregroundStyle(ThemeManager.shared.accent)
+                    }
+                    .frame(width: 44, height: 44)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(title)
+                            .scaledFont(.subheadline.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text(names.joined(separator: ", "))
+                            .scaledFont(.caption)
+                            .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show channels staged for Multiview")
+            Button { MultiviewDockState.play() } label: {
+                Text("Play")
+                    .scaledFont(.subheadline.weight(.semibold))
+                    .foregroundStyle(ThemeManager.shared.accent)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .frame(minHeight: 40)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Play Multiview")
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .modifier(MultiviewDockSurface())
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Same as KeptLiveCard's dock surface: iPad tab-pill capsule, iPhone
+    /// plain glass capsule.
+    private struct MultiviewDockSurface: ViewModifier {
+        func body(content: Content) -> some View {
+            if PadTabPill.isActive {
+                content.modifier(PadPillSurface(shape: Capsule()))
+            } else {
+                content.modifier(KeptPillChrome())
+            }
+        }
+    }
+}
+
+/// Multiview in the background (Logan 2026-10-07, round 2): a pinch-in on
+/// the local Multiview (2 or more tiles, iPhone and iPad) leaves it for the
+/// browse screens with NO mini player. The tiles keep playing headless in
+/// place (HomeView hides the container like the composite does): muted
+/// except the focused tile, which keeps its audio. A dock card returns to
+/// the fullscreen Multiview exactly as it was; Stop ends the tiles.
+@MainActor
+final class MultiviewBackgroundSession: ObservableObject {
+    static let shared = MultiviewBackgroundSession()
+    @Published private(set) var isActive = false
+    private var bag: Set<AnyCancellable> = []
+
+    private init() {
+        // Anything else that ends or takes over the Multiview ends the
+        // background state (a single-channel tune, the session closing, a
+        // composite cast, an expand from elsewhere).
+        PlayerSession.shared.$mode
+            .sink { [weak self] mode in
+                guard let self, self.isActive, mode != .multiview else { return }
+                self.clear(reason: "multiview ended")
+            }
+            .store(in: &bag)
+        MultiviewCompositeSession.shared.$transport
+            .sink { [weak self] t in
+                guard let self, self.isActive, t != nil else { return }
+                self.clear(reason: "composite cast took the tiles")
+            }
+            .store(in: &bag)
+        NowPlayingManager.shared.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.isActive, !NowPlayingManager.shared.isMinimized else { return }
+                self.clear(reason: "expanded")
+            }
+            .store(in: &bag)
+    }
+
+    /// True when a pinch-in may send the Multiview to the background.
+    static var canEnter: Bool {
+        PlayerSession.shared.mode == .multiview
+            && MultiviewStore.shared.tiles.count >= 2
+            && !MultiviewCompositeSession.shared.isActive
+            && !AirPlayMonitor.shared.hostsHeadless
+            && !shared.isActive
+    }
+
+    func enter() {
+        guard Self.canEnter else { return }
+        isActive = true
+        debugLog("[MV-BG] background enter tiles=\(MultiviewStore.shared.tiles.count)")
+        AppOrientationLock.release()
+        NowPlayingManager.shared.applyMinimized()
+    }
+
+    /// Card tap: back to the fullscreen Multiview as it was (the tiles
+    /// never stopped, so nothing restarts).
+    func returnToFullscreen() {
+        guard isActive else { return }
+        isActive = false
+        debugLog("[MV-BG] return")
+        NowPlayingManager.shared.expand()
+    }
+
+    /// Card Stop: end the tiles.
+    func stop() {
+        guard isActive else { return }
+        isActive = false
+        debugLog("[MV-BG] stop")
+        PlayerSession.shared.stop()
+    }
+
+    private func clear(reason: String) {
+        isActive = false
+        debugLog("[MV-BG] background cleared (\(reason))")
+    }
+}
+
+/// The Multiview-in-the-background dock card: the staging card's shape
+/// (44 pt icon tile, title and subtitle, 18/8 pt padding, the dock
+/// capsule). Tap returns to the fullscreen Multiview; Stop ends it.
+struct MultiviewBackgroundCard: View {
+    @ObservedObject private var store = MultiviewStore.shared
+    @ObservedObject private var session = MultiviewBackgroundSession.shared
+
+    var body: some View {
+        let names = store.tiles.map(\.item.name)
+        return HStack(spacing: 12) {
+            Button { session.returnToFullscreen() } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.black.opacity(0.25))
+                        Image(systemName: "rectangle.split.2x2")
+                            .font(.system(size: 20))  // glyph in a fixed box: not text, stays fixed
+                            .foregroundStyle(ThemeManager.shared.accent)
+                    }
+                    .frame(width: 44, height: 44)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Multiview playing in background")
+                            .scaledFont(.subheadline.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text(names.joined(separator: ", "))
+                            .scaledFont(.caption)
+                            .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Return to Multiview")
+            Button { session.stop() } label: {
+                Text("Stop")
+                    .scaledFont(.subheadline.weight(.semibold))
+                    .foregroundStyle(ThemeManager.shared.accent)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .frame(minHeight: 40)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop Multiview")
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .modifier(Surface())
+        .accessibilityElement(children: .contain)
+    }
+
+    private struct Surface: ViewModifier {
+        func body(content: Content) -> some View {
+            if PadTabPill.isActive {
+                content.modifier(PadPillSurface(shape: Capsule()))
+            } else {
+                content.modifier(KeptPillChrome())
+            }
+        }
+    }
+}
+
+/// "Multiview" sheet from the dock card: staged channels with logo and name,
+/// swipe to remove, Reorder/Finish (the Switch Stream pattern), Clear, and
+/// the play buttons with the play-where sheet's wording.
+struct MultiviewStagedSheet: View {
+    @ObservedObject private var store = MultiviewStore.shared
+    @ObservedObject private var cast = AstralCastController.shared
+    @ObservedObject private var companion = CompanionClient.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var editMode: EditMode = .inactive
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(store.tiles) { tile in
+                        HStack(spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Color.black.opacity(0.25))
+                                if let url = tile.item.logoURL {
+                                    AsyncImage(url: url) { image in
+                                        image.resizable().scaledToFit()
+                                    } placeholder: {
+                                        Image(systemName: "tv")
+                                            .font(.system(size: 16))  // glyph in a fixed box: not text, stays fixed
+                                            .foregroundStyle(ThemeManager.shared.accent)
+                                    }
+                                    .frame(width: 38, height: 38)
+                                } else {
+                                    Image(systemName: "tv")
+                                        .font(.system(size: 16))  // glyph in a fixed box: not text, stays fixed
+                                        .foregroundStyle(ThemeManager.shared.accent)
+                                }
+                            }
+                            .frame(width: 44, height: 44)
+                            Text(tile.item.name)
+                                .lineLimit(1)
+                        }
+                    }
+                    .onDelete { offsets in
+                        for id in offsets.map({ store.tiles[$0].id }) { store.remove(id: id) }
+                        if store.tiles.isEmpty { store.isStagingFromGuide = false }
+                    }
+                    .onMove { store.move(fromOffsets: $0, toOffset: $1) }
+                }
+                Section {
+                    Button("Clear", role: .destructive) {
+                        MultiviewDockState.clearStaging(reason: "user tapped Clear")
+                        dismiss()
+                    }
+                }
+            }
+            .navigationTitle("Multiview")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button(editMode.isEditing ? "Finish" : "Reorder") {
+                        withAnimation { editMode = editMode.isEditing ? .inactive : .active }
+                    }
+                    .disabled(store.tiles.count < 2 && !editMode.isEditing)
+                }
+            }
+            .environment(\.editMode, $editMode)
+            .safeAreaInset(edge: .bottom, spacing: 0) { playButtons }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .onChange(of: store.tiles.isEmpty) { _, empty in if empty { dismiss() } }
+    }
+
+    private var playButtons: some View {
+        // Re-read on every cast/companion publish (observed above).
+        let receiver = PlayWhereRouter.multiviewReceiverName(count: store.tiles.count)
+        let limitNote = PlayWhereRouter.multiviewLimitNote(count: store.tiles.count)
+        return VStack(spacing: 10) {
+            Button {
+                dismiss()
+                PlayWhereRouter.shared.playMultiviewHere(play: MultiviewDockState.playHereNow)
+            } label: {
+                Text("Play Here")
+                    .scaledFont(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(ThemeManager.shared.accent)
+            if let receiver {
+                Button {
+                    let items = store.tiles.map(\.item)
+                    let focus = store.tiles.firstIndex(where: { $0.id == store.audioTileID }) ?? 0
+                    dismiss()
+                    PlayWhereRouter.shared.playMultiviewOnReceiver(channels: items, focus: focus)
+                } label: {
+                    Text("Play on \(receiver)")
+                        .scaledFont(.body.weight(.semibold))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.bordered)
+                .tint(ThemeManager.shared.accent)
+            }
+            if let limitNote {
+                // The receiver only takes the phone composite (2 to 4).
+                Text(limitNote)
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .disabled(store.tiles.isEmpty)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.bar)
+    }
+}
+
+/// Kept Live card (Logan 2026-10-04): channels flipped away from that
+/// "Keep Recent Channels Live" is still ingesting. Same surface, margins and
+/// dock as RemoteSessionCard. One channel: logo, "Keeping <name> live",
+/// Stop. More: a header with Stop All and one row per channel, each with its
+/// own Stop. Tapping a channel tunes it (adopts the retained remuxer).
+struct KeptLiveCard: View {
+    let channels: [KeptLiveChannels.Channel]
+    let onTune: (KeptLiveChannels.Channel) -> Void
+    let onStop: (KeptLiveChannels.Channel) -> Void
+    let onStopAll: () -> Void
+    /// Opens the per-channel list when several channels are kept.
+    var onShowList: () -> Void = {}
+    /// Dock card (Logan 2026-10-05): the exact shape of RemoteSessionCard on
+    /// iPhone and iPad: same 44 pt tile, title and subtitle lines, 18 pt side
+    /// padding, 8 pt vertical padding and the same capsule surface, so both
+    /// cards come out the same height and radius. Several channels stay one
+    /// capsule; tapping it calls `onShowList`.
+    var dockCard: Bool = false
+
+    var body: some View {
+        if dockCard { dockCardBody } else { fullBody }
+    }
+
+    private var dockCardBody: some View {
+        let multi = channels.count > 1
+        let title = multi ? "Keeping \(channels.count) channels live"
+            : "Keeping \(channels.first?.name ?? "") live"
+        let subtitle = multi ? channels.map(\.name).joined(separator: ", ")
+            : "Tap to watch \(channels.first?.name ?? "")"
+        return HStack(spacing: 12) {
+            Button {
+                if multi { onShowList() } else if let ch = channels.first { onTune(ch) }
+            } label: {
+                HStack(spacing: 12) {
+                    if multi {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.black.opacity(0.25))
+                            Image(systemName: "rectangle.stack.badge.play")
+                                .font(.system(size: 20))  // glyph in a fixed box: not text, stays fixed
+                                .foregroundStyle(ThemeManager.shared.accent)
+                        }
+                        .frame(width: 44, height: 44)
+                    } else if let ch = channels.first {
+                        logo(ch, box: 44, image: 38, cornerRadius: 8)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(title)
+                            .scaledFont(.subheadline.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text(subtitle)
+                            .scaledFont(.caption)
+                            .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(multi ? "Show kept channels" : "Watch \(channels.first?.name ?? "")")
+            if multi {
+                stopButton("Stop All", label: "Stop all kept channels", action: onStopAll)
+            } else if let ch = channels.first {
+                stopButton("Stop", label: "Stop keeping \(ch.name) live") { onStop(ch) }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .modifier(KeptDockSurface())
+        .onAppear {
+            debugLog("[AVP-RETAIN] kept dock card show (\(channels.count))")
+            RadioStopTrace.log("kept dock card onAppear", since: CACurrentMediaTime())
+        }
+        .onDisappear { debugLog("[AVP-RETAIN] kept dock card hide") }
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Same as RemoteSessionCard.SurfaceStyle: iPad tab-pill capsule, iPhone
+    /// plain glass capsule.
+    private struct KeptDockSurface: ViewModifier {
+        func body(content: Content) -> some View {
+            if PadTabPill.isActive {
+                content.modifier(PadPillSurface(shape: Capsule()))
+            } else {
+                content.modifier(KeptPillChrome())
+            }
+        }
+    }
+
+    private func logo(_ ch: KeptLiveChannels.Channel, box: CGFloat, image: CGFloat, cornerRadius: CGFloat? = nil) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius ?? box / 5.5, style: .continuous)
+                .fill(Color.black.opacity(0.25))
+            if let url = ch.logoURL {
+                AsyncImage(url: url) { image in
+                    image.resizable().scaledToFit()
+                } placeholder: {
+                    Image(systemName: "tv")
+                        .font(.system(size: 16))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(ThemeManager.shared.accent)
+                }
+                .frame(width: image, height: image)
+            } else {
+                Image(systemName: "tv")
+                    .font(.system(size: 16))  // glyph in a fixed box: not text, stays fixed
+                    .foregroundStyle(ThemeManager.shared.accent)
+            }
+        }
+        .frame(width: box, height: box)
+    }
+
+    private var fullBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if channels.count > 1 {
+                HStack(spacing: 12) {
+                    Image(systemName: "rectangle.stack.badge.play")
+                        .font(.system(size: 18))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundStyle(ThemeManager.shared.accent)
+                        .frame(width: 44)
+                    Text("Keeping \(channels.count) channels live")
+                        .scaledFont(.subheadline.weight(.bold))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    stopButton("Stop All", label: "Stop all kept channels", action: onStopAll)
+                }
+                ForEach(channels) { ch in
+                    row(ch, title: ch.name)
+                }
+            } else if let ch = channels.first {
+                row(ch, title: "Keeping \(ch.name) live")
+            }
+        }
+        .padding(.horizontal, PadTabPill.isActive ? 18 : 12)
+        .padding(.vertical, 8)
+        .modifier(KeptCardSurface(multiRow: channels.count > 1))
+        .onAppear { debugLog("[AVP-RETAIN] kept card show (\(channels.count))") }
+        .onDisappear { debugLog("[AVP-RETAIN] kept card hide") }
+        .accessibilityElement(children: .contain)
+    }
+
+    /// iPad (Logan 2026-10-05): the same capsule and PadPillSurface as the
+    /// remote-session card it stacks with; the dock sets the width, so no
+    /// side margins. Several kept channels stack rows, so that case keeps
+    /// the pill surface on a 24 pt rounded rectangle instead of a capsule
+    /// that would clip the row ends. iPhone and tvOS: unchanged.
+    private struct KeptCardSurface: ViewModifier {
+        let multiRow: Bool
+        func body(content: Content) -> some View {
+            if PadTabPill.isActive {
+                if multiRow {
+                    content.modifier(PadPillSurface(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+                } else {
+                    content.modifier(PadPillSurface(shape: Capsule()))
+                }
+            } else {
+                content
+                    .background { RemoteSessionCard.cardSurface }
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .padding(.horizontal, 16)
+            }
+        }
+    }
+
+    private func row(_ ch: KeptLiveChannels.Channel, title: String) -> some View {
+        HStack(spacing: 12) {
+            Button { onTune(ch) } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.black.opacity(0.25))
+                        if let url = ch.logoURL {
+                            AsyncImage(url: url) { image in
+                                image.resizable().scaledToFit()
+                            } placeholder: {
+                                Image(systemName: "tv")
+                                    .font(.system(size: 18))  // glyph in a fixed box: not text, stays fixed
+                                    .foregroundStyle(ThemeManager.shared.accent)
+                            }
+                            .frame(width: 38, height: 38)
+                        } else {
+                            Image(systemName: "tv")
+                                .font(.system(size: 18))  // glyph in a fixed box: not text, stays fixed
+                                .foregroundStyle(ThemeManager.shared.accent)
+                        }
+                    }
+                    .frame(width: 44, height: 44)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(title)
+                            .scaledFont(.subheadline.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text("Kept live since \(ch.since.formatted(date: .omitted, time: .shortened))")
+                            .scaledFont(.caption)
+                            .foregroundStyle(Color.contrastText(ThemeManager.shared.accent))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Watch \(ch.name)")
+            stopButton("Stop", label: "Stop keeping \(ch.name) live") { onStop(ch) }
+        }
+    }
+
+    private func stopButton(_ title: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .scaledFont(.subheadline.weight(.semibold))
+                .foregroundStyle(ThemeManager.shared.accent)
+                .padding(.horizontal, 10)
+                .frame(minHeight: 40)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+}
+
+
+// MARK: - Companion HOST (tvOS) -- phones control THIS Apple TV
+

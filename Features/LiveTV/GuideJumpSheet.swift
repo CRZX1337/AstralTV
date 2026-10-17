@@ -1,0 +1,165 @@
+import SwiftUI
+
+/// Guide jump-to-day (Roman via Discord, 2026-09-06): a day row and a
+/// time-of-day row. Picking a day lands on the same clock time as now on
+/// that day; a time pill moves to that hour. `onPick(nil)` means back to
+/// now. tvOS presents it as a system sheet with the app's pills.
+struct GuideJumpSheet: View {
+    let daysBack: Int
+    let daysAhead: Int
+    let onPick: (Date?) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var dayOffset = 0
+    @State private var slot: Slot = .sameTime
+    /// Bumped to ask the day row to re-center Today (Back to Now).
+    @State private var recenterToken = 0
+
+    enum Slot: CaseIterable {
+        case sameTime, morning, afternoon, evening, prime, late
+        /// Clock times, not descriptions (Logan 2026-09-10); Same Time stays.
+        var label: String {
+            guard let hour else { return "Same Time" }
+            let f = DateFormatter()
+            f.setLocalizedDateFormatFromTemplate("j")
+            let cal = Calendar.current
+            let date = cal.date(bySettingHour: hour, minute: 0, second: 0, of: Date()) ?? Date()
+            return f.string(from: date)
+        }
+        var hour: Int? {
+            switch self {
+            case .sameTime: return nil
+            case .morning: return 7
+            case .afternoon: return 13
+            case .evening: return 18
+            case .prime: return 20
+            case .late: return 23
+            }
+        }
+    }
+
+    private var dayOffsets: [Int] { Array(-max(0, daysBack)...max(1, daysAhead)) }
+
+    /// "Today, Sep 10" / "Tomorrow, Sep 11" / "Sat, Sep 12" (Logan 2026-09-10:
+    /// every day pill carries its date).
+    private func dayLabel(_ offset: Int) -> String {
+        let day = date(forDayOffset: offset, hour: nil)
+        let date = DateFormatter()
+        date.setLocalizedDateFormatFromTemplate("MMM d")
+        let name: String
+        switch offset {
+        case 0: name = "Today"
+        case 1: name = "Tomorrow"
+        case -1: name = "Yesterday"
+        default:
+            let f = DateFormatter()
+            f.setLocalizedDateFormatFromTemplate("EEE")
+            name = f.string(from: day)
+        }
+        return "\(name), \(date.string(from: day))"
+    }
+
+    private func date(forDayOffset offset: Int, hour: Int?) -> Date {
+        let cal = Calendar.current
+        let day = cal.date(byAdding: .day, value: offset, to: Date()) ?? Date()
+        guard let hour else { return day }
+        return cal.date(bySettingHour: hour, minute: 0, second: 0, of: day) ?? day
+    }
+
+    private var target: Date { date(forDayOffset: dayOffset, hour: slot.hour) }
+
+    private var summary: String {
+        let f = DateFormatter()
+        f.dateStyle = .full
+        f.timeStyle = .short
+        return f.string(from: target)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Day") {
+                    // Guide Days can load many days back, so the row would open
+                    // pinned to the furthest past day (Logan 2026-09-11): open
+                    // centered on Today, and re-center it on Back to Now.
+                    ScrollViewReader { proxy in
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(dayOffsets, id: \.self) { o in
+                                    chip(dayLabel(o), selected: dayOffset == o) { dayOffset = o }
+                                        .id(o)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .onAppear { centerToday(proxy, animated: false) }
+                        .onChange(of: recenterToken) { _, _ in centerToday(proxy, animated: true) }
+                    }
+                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                }
+                Section("Time") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Slot.allCases, id: \.self) { s in
+                                chip(s.label, selected: slot == s) { slot = s }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                }
+                Section {
+                    Button { onPick(target) } label: {
+                        HStack { Spacer(); Text("Go to \(summary)").bold(); Spacer() }
+                    }
+                    Button { backToNow() } label: {
+                        HStack { Spacer(); Text("Back to Now"); Spacer() }
+                    }
+                }
+            }
+            .navigationTitle("Jump To")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    /// Back to Now resets the selection and re-centers Today before handing
+    /// off, so the sheet is already on Today if it is shown again.
+    private func backToNow() {
+        dayOffset = 0
+        slot = .sameTime
+        recenterToken += 1
+        onPick(nil)
+    }
+
+    /// Centers Today's pill once the row has been laid out. The first pass runs
+    /// on the next runloop turn; a short retry covers the sheet's presentation
+    /// animation, where the initial pass can land before the pills have frames.
+    private func centerToday(_ proxy: ScrollViewProxy, animated: Bool) {
+        let scroll = {
+            if animated {
+                withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(0, anchor: .center) }
+            } else {
+                proxy.scrollTo(0, anchor: .center)
+            }
+        }
+        DispatchQueue.main.async(execute: scroll)
+        if !animated {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: scroll)
+        }
+    }
+
+    private func chip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .scaledFont(.system(size: 14, weight: .semibold))
+                .foregroundColor(selected ? .appBackground : .textPrimary)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(Capsule().fill(selected ? Color.accentPrimary : Color.elevatedBackground))
+        }
+        .buttonStyle(.plain)
+    }
+}

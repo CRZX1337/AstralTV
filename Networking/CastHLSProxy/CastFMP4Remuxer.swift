@@ -1,0 +1,2411 @@
+//
+//  CastFMP4Remuxer.swift
+//  Astral
+//
+//  MPEG-TS to fragmented-MP4 (CMAF) remuxer for the phone-local cast HLS
+//  proxy (GH #33 web-receiver rework, P2). Direct port of the Android
+//  implementation that survived a 4h10m hardware soak; behavior parity
+//  with that build is the contract here.
+//
+
+import Foundation
+
+/// A stream the cast HLS proxy cannot serve. H.264 and HEVC video pass
+/// through or transcode on the phone (the sender's `CastVideoPlan`); any
+/// other video codec refuses up front with the codec name for the
+/// user-facing message. AAC audio passes through, AC-3 / E-AC-3
+/// pass through only when the receiver reported support for them, MPEG
+/// audio transcodes on the phone, and everything else fires this.
+struct CastUnsupportedCodecError: Error, CustomStringConvertible {
+    /// Which elementary stream refused; the sender words a different
+    /// message for each.
+    /// Audio-only programs (GH #90, radio) are served by the remuxer's
+    /// audio-only mode, not refused.
+    enum Stream { case video, audio }
+    let codecName: String
+    var stream: Stream = .audio
+    var description: String { "cast HLS proxy cannot serve \(codecName)" }
+}
+
+/// The on-phone video transcode failed mid-ingest. Thrown from `feed` so
+/// the session reconnects with a fresh remuxer, which it builds with the
+/// video plan disabled (source passthrough) for the rest of the session.
+struct CastVideoTranscodeError: Error, CustomStringConvertible {
+    let reason: String
+    var description: String { "video transcode failed: \(reason)" }
+}
+
+/// Abstraction over the AudioToolbox transcoder so the remuxer's pure
+/// logic is testable off-device with a fake.
+protocol CastAudioTranscoding: AnyObject {
+    /// Queue one whole source frame (MPEG audio syncframe). Throws
+    /// `CastUnsupportedCodecError` when the platform has no decoder.
+    func feed(_ data: [UInt8], range: Range<Int>, ptsTicks: Int64, info: CastESFrameInfo) throws
+    /// Splice/reconnect: drop in-flight state and re-anchor output PTS.
+    func flush()
+    /// Final teardown of the converters.
+    func release()
+}
+
+/// Ingests raw TS bytes off the wire, demuxes to elementary streams, and
+/// emits CMAF init + media segments:
+///  - `onDemuxedInitSegments` fires once, as soon as SPS/PPS (and the
+///    audio config when the PMT declares audio) have been seen: a
+///    video-only ftyp + moov and, unless the mux is video-only, an
+///    audio-only one, timescale 90000 on both so PES 90 kHz timestamps
+///    ride through untouched.
+///  - `onDemuxedMediaSegments` fires per segment: one moof per
+///    rendition, each with its single traf, cut ONLY on video keyframes
+///    at the SAME boundary, targeting `targetSegmentTicks`.
+///    baseMediaDecodeTime is the segment's first DTS (video) or first
+///    frame PTS (audio) rebased to the generation start, carried through
+///    the 33-bit PTS wraparound by a per-track unwrapper.
+///
+/// H.264 and HEVC video are passthrough (Annex B converted to
+/// 4-byte-length avc1 samples, or hvc1 samples with the parameter sets
+/// moved to the hvcC) unless the sender's `CastVideoPlan` asks for the
+/// on-phone transcode, in which case the access units go through
+/// `CastVideoTranscoder` and the video track becomes hvc1 (HEVC) or a
+/// re-encoded avc1 (H.264 High 4.1); audio is ADTS AAC passthrough, AC-3 / E-AC-3
+/// passthrough, or an on-phone MPEG audio / AC-3 / E-AC-3 to AAC-LC
+/// stereo transcode. The AC-3 family is re-encoded only when the sender
+/// asked for it (`transcodeAC3`, a receiver that cannot decode AC-3).
+///
+/// Threading: single-caller. `feed` runs on the ingest queue only; no
+/// internal locking.
+final class CastFMP4Remuxer {
+
+    static let ticksPerSecond: Int64 = 90_000
+
+    /// Which track a built init or media segment carries. The receiver
+    /// loads the demuxed pair and nothing else (see
+    /// `onDemuxedInitSegments`).
+    private enum Rendition { case videoOnly, audioOnly }
+    private static let tsPacket = 188
+    private static let ptsWrap: Int64 = 1 << 33
+
+    private static let videoTrackID = 1
+    private static let audioTrackID = 2
+
+    /// ISO 13818-1 stream_type values this remux understands.
+    private static let streamTypeH264 = 0x1B
+    private static let streamTypeHEVC = 0x24
+    private static let streamTypeAACADTS = 0x0F
+
+    /// Names for the refusal message; anything not listed reports the
+    /// raw stream_type.
+    private static let streamTypeNames: [Int: String] = [
+        0x01: "MPEG-1 video", 0x02: "MPEG-2 video", 0x10: "MPEG-4 Part 2 video",
+        0x24: "HEVC video", 0x42: "AVS video", 0xEA: "VC-1 video",
+        0x03: "MP3 audio", 0x04: "MP2 audio", 0x11: "AAC-LATM audio",
+        0x81: "AC-3 audio", 0x87: "E-AC-3 audio", 0x82: "DTS audio", 0x8A: "DTS audio",
+    ]
+    private static let videoStreamTypes: Set<Int> = [0x01, 0x02, 0x10, 0x1B, 0x24, 0x42, 0xEA]
+    private static let audioStreamTypes: Set<Int> = [0x03, 0x04, 0x0F, 0x11, 0x81, 0x87, 0x82, 0x8A]
+
+    /// stream_types the audio passthrough can take instead of a refusal,
+    /// and only when the receiver reported AC-3 support. The same types
+    /// go through the on-phone transcode when `transcodeAC3` is set.
+    private static let passthroughSources: [Int: CastAudioSourceCodec] = [
+        0x81: .ac3, 0x87: .eac3,
+    ]
+
+    /// stream_types the on-phone audio transcode takes instead of a
+    /// refusal: MPEG-1 Layer I/II/III only (0x03 and 0x04 ride the same
+    /// decoder family). No MSE decodes them and their patents have
+    /// expired. The AC-3 family transcodes only under `transcodeAC3`.
+    private static let transcodeSources: [Int: CastAudioSourceCodec] = [
+        0x03: .mp2, 0x04: .mp2,
+    ]
+
+    /// What to do with audio the web receiver's MSE cannot decode.
+    /// `allowAC3Passthrough` flips AC-3 / E-AC-3 to a pure passthrough
+    /// (no decode, no encode, original channel layout) and is set by the
+    /// sender only for receivers that measured support for it; an AC-3
+    /// source without it is transcoded when `transcodeAC3` is set and
+    /// otherwise REFUSED by name. MPEG audio always uses the AudioToolbox
+    /// transcode; nothing else is ever re-encoded.
+    private let allowAC3Passthrough: Bool
+
+    /// AC-3 / E-AC-3 the receiver cannot decode is decoded on the phone
+    /// and re-encoded as AAC-LC stereo (2026-09-21, sender audio plan
+    /// `audio=transcode-aac`). Before this a Chromecast that answered
+    /// ac-3=no could not play any AC-3 channel at all: every load ended
+    /// in "unsupported codec, refusing to cast: AC-3 audio". Ignored when
+    /// `allowAC3Passthrough` is set (passthrough keeps the surround mix).
+    private let transcodeAC3: Bool
+
+    /// Speaker-layout label for the Stream Info audio path. Total decoded
+    /// channels (LFE included) to the familiar x.1 names.
+    private static func channelLabel(_ channels: Int) -> String {
+        switch channels {
+        case 1: return "mono"
+        case 2: return "stereo"
+        case 6: return "5.1"
+        case 8: return "7.1"
+        default: return "\(channels)ch"
+        }
+    }
+
+    /// DEMUXED renditions of the init segment (2026-09-13): the first
+    /// Data is a video-only moov, the second an audio-only moov carrying
+    /// the ac-3 / ec-3 / mp4a sample entry, nil for a video-only mux.
+    /// Both keep the mehd/mvhd 24 h declared duration.
+    ///
+    /// Why demuxed: measured on the Google TV Streamer's Cast runtime,
+    /// isTypeSupported("video/mp4; codecs=\"avc1.64002A,ac-3\"") and
+    /// isTypeSupported("video/mp4; codecs=\"ac-3\"") are both false, but
+    /// isTypeSupported("audio/mp4; codecs=\"ac-3\"") is TRUE, and Emby's
+    /// web receiver plays AC-3 through MediaCodecAudioDecoder from a
+    /// SEPARATE audio SourceBuffer. One muxed rendition can therefore only
+    /// ever declare an AAC codec string, which is what forces the
+    /// server-side AAC output profile; two renditions let the audio
+    /// declare what it really is.
+    ///
+    /// Audio-only mode (GH #90): the first Data is nil and the second is
+    /// the audio moov; there is no video rendition at all.
+    var onDemuxedInitSegments: ((Data?, Data?) -> Void)?
+
+    /// The two renditions of one cut, cut at exactly the same boundary and
+    /// carrying the same moof sequence number: the first Data holds the
+    /// video traf only, the second the audio traf only. When the
+    /// cut span carried no audio frame the audio rendition is STILL
+    /// emitted, as a zero-sample traf, so the two media playlists keep
+    /// identical sequence numbering; it is nil only for a video-only mux.
+    ///
+    /// The last Int64 is the sum of the segment's audio frame durations,
+    /// i.e. the audio rendition's own EXTINF. It may differ from the video
+    /// span by less than one audio frame, which HLS allows, and falls back
+    /// to the video span when the segment has no audio.
+    ///
+    /// Audio-only mode (GH #90): the video Data is EMPTY (there is no
+    /// video rendition; `isAudioOnly` says so), the audio Data carries the
+    /// segment, and both durations are the audio frames' own span.
+    var onDemuxedMediaSegments: ((_ video: Data, _ audio: Data?,
+                                  _ videoDurationTicks: Int64,
+                                  _ audioDurationTicks: Int64) -> Void)?
+
+    /// Per segment: the numbers needed to do the playhead-vs-buffer
+    /// arithmetic from the sender log alone.
+    ///
+    /// Added 2026-09-12 on Logan's order ("I need you to not guess. Add
+    /// something in logging so you can see it."): with
+    /// manifest.hls.sequenceMode=false the receiver takes segment
+    /// timestamps from the MEDIA (our tfdt boxes) and segment positions
+    /// from the PLAYLIST (accumulated EXTINF from 0), and on the
+    /// 15:10:03 Google TV Streamer session those two timelines only
+    /// agreed by luck: Shaka picked a start position of 2.439 s (window
+    /// end 11.311 s minus the 9 s presentation delay) BEFORE any media
+    /// was appended, then relocated to 0.016 s once it saw the buffer
+    /// (MediaGapJumped=1) and pinned at -58 ms in BUFFERING forever. The
+    /// receiver page prints nothing that reaches logcat, so these are
+    /// the only numbers we can actually read.
+    ///
+    /// All four Doubles are SECONDS RELATIVE TO `timelineBase`, i.e.
+    /// exactly what lands in the tfdt boxes divided by the 90 kHz tick
+    /// rate. `firstVideoPTSSeconds` is the video track's earliest
+    /// presentation time; `max(firstVideoPTSSeconds,
+    /// firstAudioPTSSeconds)` is where a two-track SourceBuffer's
+    /// buffered range actually BEGINS, because Chromium reports the
+    /// INTERSECTION of the tracks' ranges, not their union.
+    /// `firstAudioPTSSeconds` is -1.0 when the segment has no audio.
+    var onSegmentComposition: ((_ videoSamples: Int, _ audioSamples: Int,
+                                _ firstVideoDTSSeconds: Double, _ firstVideoPTSSeconds: Double,
+                                _ firstAudioPTSSeconds: Double,
+                                _ segmentStartSeconds: Double) -> Void)?
+
+    private let targetSegmentTicks: Int64
+    private let log: (String) -> Void
+    /// Injectable for the CLI tests (AudioToolbox codecs are not
+    /// exercised there); production uses the real transcoder.
+    private let transcoderFactory: (CastAudioSourceCodec,
+                                    @escaping (_ asc: [UInt8], _ sampleRate: Int) -> Void,
+                                    @escaping (_ data: [UInt8], _ ptsTicks: Int64) -> Void) -> CastAudioTranscoding
+
+    /// Decides passthrough vs transcode once the source SPS is known.
+    private let videoPlan: CastVideoPlan
+    /// Hop onto the ingest queue for transcoder output. nil (the CLI tests)
+    /// keeps the video path passthrough whatever the plan says.
+    private let videoDelivery: CastIngestDelivery?
+    private let videoTranscoderFactory: (CastVideoStreamInfo, CastVideoOutputSpec, Int64,
+                                         CastVideoTranscodeSink, @escaping CastIngestDelivery) -> CastVideoTranscoding
+
+    init(targetSegmentTicks: Int64 = 3 * CastFMP4Remuxer.ticksPerSecond,
+         allowAC3Passthrough: Bool = false,
+         transcodeAC3: Bool = false,
+         videoPlan: CastVideoPlan = .passthrough,
+         videoDelivery: CastIngestDelivery? = nil,
+         log: @escaping (String) -> Void = { _ in },
+         transcoderFactory: ((CastAudioSourceCodec,
+                              @escaping (_ asc: [UInt8], _ sampleRate: Int) -> Void,
+                              @escaping (_ data: [UInt8], _ ptsTicks: Int64) -> Void) -> CastAudioTranscoding)? = nil,
+         videoTranscoderFactory: ((CastVideoStreamInfo, CastVideoOutputSpec, Int64,
+                                   CastVideoTranscodeSink, @escaping CastIngestDelivery) -> CastVideoTranscoding)? = nil) {
+        self.targetSegmentTicks = targetSegmentTicks
+        self.allowAC3Passthrough = allowAC3Passthrough
+        self.transcodeAC3 = transcodeAC3
+        self.videoPlan = videoPlan
+        self.videoDelivery = videoDelivery
+        self.log = log
+        self.transcoderFactory = transcoderFactory ?? { source, onConfig, onFrame in
+            CastAudioTranscoder(source: source, onEncoderConfig: onConfig, onAACFrame: onFrame, log: log)
+        }
+        self.videoTranscoderFactory = videoTranscoderFactory ?? { info, spec, keyTicks, sink, deliver in
+            CastVideoTranscoder(source: info, spec: spec, targetKeyTicks: keyTicks,
+                                sink: sink, deliver: deliver, log: log)
+        }
+    }
+
+    // MARK: TS layer state
+
+    /// Packet-boundary carry: the ingest hands arbitrary chunk sizes and
+    /// Dispatcharr joins clients mid-packet, so bytes are re-aligned on a
+    /// verified triple 0x47 before anything downstream sees them.
+    private var carry: [UInt8] = []
+    private var needResync = true
+
+    private var pmtPID = -1
+    private var videoPID = -1
+    private var audioPID = -1
+    /// PMT parsed; `audioPID` < 0 after this means a video-only mux.
+    private var pmtSeen = false
+
+    // MARK: audio-only mode (GH #90)
+
+    /// The program is served audio-only: one audio rendition, no video
+    /// track, segments cut on audio frame boundaries every
+    /// `audioOnlySegmentTicks` with no keyframe dependency, and no video
+    /// plan or transcoder ever built. Entered when the PMT declares audio
+    /// and no video, or by the no-video fallback below (mirrors
+    /// TSHLSRemuxer).
+    private(set) var isAudioOnly = false
+    /// Audio-only segment target. Audio frames are all random access
+    /// points, so every cut lands exactly on a frame boundary once the
+    /// queue spans this much.
+    static let audioOnlySegmentTicks: Int64 = 2 * CastFMP4Remuxer.ticksPerSecond
+    /// No-video fallback, same rule as TSHLSRemuxer: a PMT that declares a
+    /// video PID which never sends a packet is audio-only once the audio
+    /// PTS has advanced `audioOnlyVideoGraceTicks` past its first PES.
+    /// Media time, not wall time: Dispatcharr delivers in 8 to 9.5 s
+    /// bursts.
+    private static let audioOnlyVideoGraceTicks: Int64 = 3 * CastFMP4Remuxer.ticksPerSecond
+    private var videoPacketSeen = false
+    private var firstAudioPTSWithoutVideo: Int64 = -1
+
+    private lazy var videoPES = PESAssembler { [weak self] payload, pts, dts in
+        try self?.onVideoAccessUnit(payload, pts33: pts, dts33: dts)
+    }
+    private lazy var audioPES = PESAssembler { [weak self] payload, pts, _ in
+        try self?.onAudioPES(payload, pts33: pts)
+    }
+
+    // MARK: codec config
+
+    /// From the PMT stream_type: 0x1B H.264, 0x24 HEVC.
+    private var videoCodec: CastVideoCodec = .h264
+    /// HEVC only.
+    private var vps: [UInt8]?
+    private var sps: [UInt8]?
+    private var pps: [UInt8]?
+    /// HEVC passthrough sample entry record, built once from the first
+    /// VPS / SPS / PPS.
+    private var passthroughHVCC: [UInt8]?
+    private var aacObjectType = 0
+    private var aacFreqIndex = -1
+    private var aacChannelConfig = 0
+
+    /// Latched once so the PCE strip is announced a single time instead of
+    /// for every frame of the connection.
+    private var aacPCELogged = false
+    private var initSent = false
+
+    // MARK: video path (passthrough or transcode)
+
+    private enum VideoMode { case undecided, passthrough, transcode }
+    private var videoMode: VideoMode = .undecided
+    private var videoTranscoder: CastVideoTranscoding?
+    /// The transcoder's output format: gates the init segment in transcode
+    /// mode and supplies the sample entry.
+    private var transcodedFormat: (codec: CastVideoOutputSpec.Codec, config: [UInt8], width: Int, height: Int)?
+    /// Parameter sets in force for the transcoder input (the latest in-band
+    /// ones; `vps` / `sps` / `pps` above latch the first).
+    private var transcodeVPS: [UInt8] = []
+    private var transcodeSPS: [UInt8] = []
+    private var transcodePPS: [UInt8] = []
+    /// Last transcoded sample PTS; output must be strictly increasing.
+    private var lastTranscodedPTS: Int64 = -1
+    private var transcodeFailure: String?
+    private var released = false
+
+    /// Stream Info card: "H.264 passthrough" / "H.264 -> HEVC 1920x1080@59.94".
+    private(set) var videoPathDescription: String?
+    /// The source facts the plan decided on; nil until the first SPS.
+    private(set) var sourceVideoInfo: CastVideoStreamInfo?
+    /// Fired once per remuxer (on the ingest queue) when the plan decides,
+    /// passthrough included, so the sender can show or clear the cast
+    /// card's transcode note.
+    var onVideoDecision: ((CastVideoPlanOutcome) -> Void)?
+    /// True once the video track is re-encoded (the master then declares the
+    /// output codec verbatim, no level relabel).
+    var videoIsTranscoded: Bool { videoMode == .transcode }
+    /// Fired once (on the ingest queue) when the transcode fails, before
+    /// `feed` throws `CastVideoTranscodeError`.
+    var onVideoTranscodeFailed: ((String) -> Void)?
+
+    // MARK: audio path
+
+    /// Human-readable audio path for the cast Options sheet's Stream
+    /// Info card ("AAC passthrough" / "AC-3 5.1 passthrough" /
+    /// "MP2 stereo -> AAC stereo"). Set at
+    /// PMT parse, refined with the channel layout once the framer sees
+    /// its first frame header.
+    private(set) var audioPathDescription: String?
+    /// Non-nil when the PMT's AC-3 / E-AC-3 audio rides through
+    /// untouched (receiver decodes it); mutually exclusive with
+    /// `audioSource`.
+    private var audioPassthrough: CastAudioSourceCodec?
+    /// First passthrough syncframe's bitstream config; gates the init
+    /// segment and writes the dac3 / dec3 box.
+    private var passthroughConfig: CastAC3SampleEntryConfig?
+    private var passthroughLogged = false
+
+    /// Non-nil when the PMT's audio is MPEG audio to be transcoded; nil
+    /// keeps the ADTS AAC passthrough path untouched. Mutually exclusive
+    /// with `audioPassthrough`.
+    private var audioSource: CastAudioSourceCodec?
+    private var transcoder: CastAudioTranscoding?
+    /// Encoder AudioSpecificConfig; gates the init segment the same way
+    /// the ADTS header does on the passthrough path.
+    private var transcodeASC: [UInt8]?
+    private var transcodeSampleRate = 0
+    private var transcodeLogged = false
+    /// Where the source audio clock should continue; a jump past the
+    /// discontinuity threshold flushes the codecs (splice/reconnect).
+    private var expectedSrcAudioPTS: Int64 = -1
+
+    /// RFC 6381 codec name for the audio the receiver will be handed, so
+    /// the playlist's CODECS attribute names the right decoder. nil for a
+    /// video-only mux.
+    var audioCodecsAttribute: String? {
+        if audioPID < 0 { return nil }
+        if let passthroughConfig { return passthroughConfig.codecsAttribute }
+        if let audioPassthrough { return audioPassthrough == .eac3 ? "ec-3" : "ac-3" }
+        return "mp4a.40.2"
+    }
+    // MARK: timeline
+
+    private var videoClock = PTSUnwrapper()
+    private var audioClock = PTSUnwrapper()
+    /// First queued video DTS; every tfdt is relative to this so the
+    /// receiver's timeline starts near zero.
+    private var timelineBase: Int64 = -1
+
+    /// First queued video PRESENTATION time (dts + composition offset).
+    ///
+    /// Audio is gated on this, not on `timelineBase`. The Cast receiver
+    /// appends our muxed segments in MSE 'sequence' AppendMode (Shaka's
+    /// HLS default; Chromium logs the multitrack warning on every one of
+    /// our loads), and in that mode Chromium ignores tfdt and anchors the
+    /// whole append on the PRESENTATION timestamp of the first coded
+    /// frame, which is our first video sample. Any audio between
+    /// `timelineBase` and that presentation time therefore lands before
+    /// zero and Chromium throws it away, logging on the Google TV
+    /// Streamer (2026-09-12 02:27:57, iPhone session):
+    ///
+    ///   Dropping audio frame (DTS -24000us PTS -24000us,-2667us) that is
+    ///     outside append window [0us, ...]
+    ///   Truncating audio buffer which overlaps append window start.
+    ///
+    /// The truncated frame is then the one that fails to decode
+    /// ("Failed to send audio packet for decoding ... timestamp=0",
+    /// "audio decoder fallback after initial decode error"), costing the
+    /// load a decoder swap and a reseek. Measured on dumped segments:
+    /// audio started 56 ms before the first video presentation time.
+    private var timelineBasePTS: Int64 = -1
+
+    // MARK: pending segment
+
+    private struct VideoSample {
+        let data: [UInt8]
+        let dts: Int64
+        let pts: Int64
+        let keyframe: Bool
+    }
+    private struct AudioSample {
+        let data: [UInt8]
+        let pts: Int64
+    }
+
+    private var videoQueue: [VideoSample] = []
+    private var audioQueue: [AudioSample] = []
+
+    /// Video samples of the NEXT segment, held while the cut waits for
+    /// audio, plus the cut they are waiting behind (-1 = none pending).
+    ///
+    /// Provider audio trails its video in the mux, so when the keyframe
+    /// that cuts a segment is demuxed the last ~170 ms of that segment's
+    /// audio has not been parsed yet. Cutting there shipped the segment
+    /// short, and the late frames then opened the NEXT segment with an
+    /// audio tfdt BELOW that segment's own start: a backwards audio
+    /// append, which Chromium's splicer trims or drops. So the cut waits
+    /// until the audio queue reaches it, bounded by `maxCutHoldTicks` so
+    /// a video-only or audio-starved stream still emits segments on time.
+    private var heldVideo: [VideoSample] = []
+    private var pendingCutDTS: Int64 = -1
+
+    /// How long a segment cut may wait for the audio that belongs in it.
+    /// Provider audio trailed its video by about 170 ms in the measured
+    /// casts; half a second of video is a generous bound that still keeps
+    /// the playlist growing when the audio PID dies mid-stream.
+    private static let maxCutHoldTicks: Int64 = CastFMP4Remuxer.ticksPerSecond / 2
+    /// Output AAC frame ticks: 1024 samples at the track sample rate.
+    private var audioFrameTicks: Int64 = 0
+    /// Audio frames can straddle PES packet boundaries; carry the tail.
+    /// The carry is NEVER cleared at a PES, segment or generation
+    /// boundary: it is the front bytes of a real frame, and dropping them
+    /// is one lost frame (21.33 ms) of audio.
+    private var audioCarry: [UInt8] = []
+
+    /// Presentation time the NEXT audio frame is expected at, 90 kHz:
+    /// the running audio clock, and the authority for every frame's
+    /// stamp. A frame's duration is definitional (1024 samples at the
+    /// declared rate) while a live provider's PES PTS cadence is not, and
+    /// a PES PTS describes the first access unit that COMMENCES in its
+    /// payload, so it cannot stamp a frame carried in from the previous
+    /// PES at all.
+    ///
+    /// Measured on a real ESPNU capture of the Dispatcharr AAC output
+    /// profile (2026-09-13): every audio PES is stamped exactly 9600
+    /// ticks after the one before it, five frames' worth, yet about one
+    /// PES in six carries SIX frames. Re-anchoring on every PES therefore
+    /// re-stamped a frame that had already been emitted, once per such
+    /// PES, and the segment census wandered 2 to 3 frames either side of
+    /// what the segment's own duration calls for. On the Google TV
+    /// Streamer that read as audio DEMUXER_UNDERFLOW with the video
+    /// renderer holding frames: 60 fps decoded with zero drops, about 47
+    /// fps actually presented, media clock ratio 1.0000.
+    private var audioRunPTS: Int64 = -1
+
+    /// How far the running audio clock may sit from a PES PTS before the
+    /// PES PTS wins. One PES worth of frames: the measured packing jitter
+    /// on the live capture was up to four frames, and a real splice moves
+    /// the clock far more than eight.
+    private static let maxAudioAnchorDriftFrames: Int64 = 8
+
+    /// Stamp one audio frame: continue `audioRunPTS`, re-anchoring to the
+    /// PES PTS only when the two have drifted further apart than
+    /// `maxAudioAnchorDriftFrames` frames, which no packing jitter
+    /// explains and a splice or a provider discontinuity does.
+    private func stampAudioFrame(pesAnchor: Int64, frameTicks: Int64) -> Int64 {
+        let tolerance = frameTicks > 0 ? frameTicks * Self.maxAudioAnchorDriftFrames : 0
+        if audioRunPTS < 0 || abs(pesAnchor - audioRunPTS) > tolerance {
+            audioRunPTS = pesAnchor
+        }
+        return audioRunPTS
+    }
+    private var lastVideoDuration: Int64 = 3_000 // ~30 fps fallback for the first delta
+    private var sequenceNumber = 0
+
+    /// Running total of the `durationTicks` already emitted by this
+    /// remuxer, i.e. the next segment's accumulated media START within
+    /// the generation. One remuxer is built per generation
+    /// (`CastHLSProxySession.startIngestLocked`), so the first segment of
+    /// a generation reports 0. This is the PLAYLIST timeline (accumulated
+    /// EXTINF from 0); the tfdt numbers above are the MEDIA timeline, and
+    /// the whole point of logging both is that nothing reconciles them.
+    private var emittedMediaTicks: Int64 = 0
+
+    /// Feed raw TS bytes off the wire. Throws `CastUnsupportedCodecError`
+    /// as soon as the PMT declares a codec the remux cannot carry.
+    func feed(_ data: Data) throws {
+        if let transcodeFailure { throw CastVideoTranscodeError(reason: transcodeFailure) }
+        var merged: [UInt8]
+        if carry.isEmpty {
+            merged = [UInt8](data)
+        } else {
+            merged = carry
+            merged.append(contentsOf: data)
+        }
+        if needResync {
+            guard let sync = Self.findSync(merged) else {
+                carry = Array(merged.suffix(Self.tsPacket * 2 + 1))
+                return
+            }
+            if sync > 0 { merged.removeFirst(sync) }
+            needResync = false
+        }
+        let whole = (merged.count / Self.tsPacket) * Self.tsPacket
+        carry = whole < merged.count ? Array(merged[whole...]) : []
+        var p = 0
+        while p < whole {
+            if merged[p] != 0x47 {
+                // Lost sync mid-stream (provider glitch): rescan from here.
+                needResync = true
+                carry = []
+                guard let resync = Self.findSync(Array(merged[p..<whole])) else { return }
+                p += resync
+                needResync = false
+                continue
+            }
+            try parsePacket(merged, p)
+            p += Self.tsPacket
+        }
+    }
+
+    /// Per-connection teardown the session calls once per ingest
+    /// connection, before the next generation begins: emit the pending
+    /// TAIL (see `flushGenerationTail`), then release the transcode
+    /// codecs (a no-op for passthrough muxes). The tail is flushed FIRST
+    /// so any audio the transcoder has already handed back is still in
+    /// the queue.
+    func release() {
+        flushGenerationTail()
+        transcoder?.release()
+        transcoder = nil
+        // Frames still inside the video transcoder are the outgoing
+        // channel's last fraction of a second; they are dropped.
+        videoTranscoder?.release()
+        videoTranscoder = nil
+        released = true
+    }
+
+    /// Emit this generation's pending tail as one last segment, with both
+    /// tracks ending together.
+    ///
+    /// Measured at two channel changes (session22.txt 17:23:50 and
+    /// 17:25:14): the receiver reported a 122-123 ms hole in its buffered
+    /// range at every splice, then flapped between seeking and BUFFERING
+    /// and gap-jumped. Provider audio trails its video in the mux, so when
+    /// the cut keyframe arrived the audio for the last ~120 ms of the
+    /// outgoing segment had not been demuxed yet; it stayed queued for a
+    /// segment the channel change then threw away. Generation 7's last
+    /// segment therefore declared 4.004 s of EXTINF while its audio
+    /// covered only 3.901 s (gen 7 seg 10: t=40.04, audio 39.927 plus 188
+    /// frames of 21.33 ms = 43.938 against a playlist end of 44.044), and
+    /// Shaka placed generation 8 at the PLAYLIST position, 103 ms past
+    /// where the audio actually stopped. Chromium reports a two-track
+    /// SourceBuffer as the INTERSECTION of its tracks, so that shortfall
+    /// plus the new generation's own start offset is the hole.
+    ///
+    /// The fix is to declare only what both tracks carry: trim the video
+    /// tail back to the audio end, emit the held audio with it, and let
+    /// the segment's EXTINF be that common end. The next generation then
+    /// starts where this one really stopped.
+    private func flushGenerationTail() {
+        if isAudioOnly {
+            // Audio-only: whatever is queued is one last, shorter segment.
+            if initSent { finalizeAudioOnlySegment() }
+            return
+        }
+        // A pending cut takes effect first: the held samples belong to a
+        // segment of their own, and the audio the cut was waiting for has
+        // either arrived by now or never will.
+        if pendingCutDTS >= 0 {
+            let cut = heldVideo.first?.dts ?? ((videoQueue.last?.dts ?? 0) + lastVideoDuration)
+            pendingCutDTS = -1
+            finalizeSegment(cutDTS: cut)
+            videoQueue.append(contentsOf: heldVideo)
+            heldVideo.removeAll(keepingCapacity: true)
+        }
+        guard initSent, let lastVideo = videoQueue.last else { return }
+        let videoEnd = lastVideo.dts + lastVideoDuration
+        let audioEnd = audioQueue.last.map { $0.pts + audioFrameTicks } ?? -1
+        var cut = videoEnd
+        if audioEnd >= 0, audioEnd < videoEnd {
+            // Video samples that begin at or after the audio end carry no
+            // audio at all; dropping them is what keeps the declared
+            // duration honest for BOTH tracks. One sample always stays so
+            // the segment still opens on its keyframe.
+            while videoQueue.count > 1, videoQueue[videoQueue.count - 1].dts >= audioEnd {
+                videoQueue.removeLast()
+            }
+            cut = max(audioEnd, videoQueue[videoQueue.count - 1].dts + 1)
+        }
+        let ticks = Double(Self.ticksPerSecond)
+        let videoEndSeconds = Double(videoEnd - timelineBase) / ticks
+        let audioEndSeconds = audioEnd < 0 ? -1.0 : Double(audioEnd - timelineBase) / ticks
+        let trimmedMs = Double(videoEnd - cut) * 1000.0 / ticks
+        log(String(format: "splice tail: video end %.3f audio end %.3f trimmed %.1f ms",
+                   videoEndSeconds, audioEndSeconds, trimmedMs))
+        finalizeSegment(cutDTS: cut)
+    }
+
+    // MARK: TS packet / PSI parsing
+
+    private func parsePacket(_ buf: [UInt8], _ off: Int) throws {
+        if buf[off + 1] & 0x80 != 0 { return }  // transport_error_indicator
+        let pusi = buf[off + 1] & 0x40 != 0
+        let pid = (Int(buf[off + 1] & 0x1F) << 8) | Int(buf[off + 2])
+        if buf[off + 3] & 0xC0 != 0 { return }  // scrambled
+        let afc = (Int(buf[off + 3]) >> 4) & 0x03
+        if afc == 0 || afc == 2 { return }      // no payload
+        var payloadStart = off + 4
+        if afc == 3 {
+            payloadStart += 1 + Int(buf[off + 4])
+            if payloadStart >= off + Self.tsPacket { return }
+        }
+        let payloadLen = off + Self.tsPacket - payloadStart
+        switch pid {
+        case 0:
+            parsePAT(buf, payloadStart, payloadLen, pusi)
+        case pmtPID where !pmtSeen:
+            try parsePMT(buf, payloadStart, payloadLen, pusi)
+        case videoPID:
+            videoPacketSeen = true
+            try videoPES.feed(buf, payloadStart, payloadLen, pusi)
+        case audioPID:
+            try audioPES.feed(buf, payloadStart, payloadLen, pusi)
+        default:
+            break
+        }
+    }
+
+    private func parsePAT(_ buf: [UInt8], _ start: Int, _ len: Int, _ pusi: Bool) {
+        guard pmtPID < 0, pusi, len >= 13 else { return }
+        let p = start + 1 + Int(buf[start]) // pointer_field
+        guard buf[p] == 0x00 else { return } // table_id PAT
+        let sectionLen = (Int(buf[p + 1] & 0x0F) << 8) | Int(buf[p + 2])
+        // Program loop: 8 bytes of fixed header after table_id/len, then
+        // 4-byte entries, 4-byte CRC at the end. First non-zero program
+        // wins; Dispatcharr and XC panels serve single-program muxes.
+        var q = p + 8
+        let end = min(p + 3 + sectionLen - 4, start + len)
+        while q + 3 < end {
+            let program = (Int(buf[q]) << 8) | Int(buf[q + 1])
+            let mapPID = (Int(buf[q + 2] & 0x1F) << 8) | Int(buf[q + 3])
+            if program != 0 {
+                pmtPID = mapPID
+                return
+            }
+            q += 4
+        }
+    }
+
+    private func parsePMT(_ buf: [UInt8], _ start: Int, _ len: Int, _ pusi: Bool) throws {
+        guard pusi, len >= 17 else { return }
+        let p = start + 1 + Int(buf[start]) // pointer_field
+        guard buf[p] == 0x02 else { return } // table_id PMT
+        let sectionLen = (Int(buf[p + 1] & 0x0F) << 8) | Int(buf[p + 2])
+        let sectionEnd = min(p + 3 + sectionLen - 4, start + len) // minus CRC
+        let programInfoLen = (Int(buf[p + 10] & 0x0F) << 8) | Int(buf[p + 11])
+        var q = p + 12 + programInfoLen
+        var video = -1, videoType = -1
+        var audio = -1, audioType = -1
+        while q + 4 < sectionEnd {
+            let streamType = Int(buf[q])
+            let esPID = (Int(buf[q + 1] & 0x1F) << 8) | Int(buf[q + 2])
+            let esInfoLen = (Int(buf[q + 3] & 0x0F) << 8) | Int(buf[q + 4])
+            if video < 0, Self.videoStreamTypes.contains(streamType) {
+                video = esPID; videoType = streamType
+            }
+            if audio < 0, Self.audioStreamTypes.contains(streamType) {
+                audio = esPID; audioType = streamType
+            }
+            q += 5 + esInfoLen
+        }
+        // Refuse before any media flows: the ingest surfaces this as the
+        // user-visible cast failure with the codec name.
+        if video >= 0, videoType != Self.streamTypeH264, videoType != Self.streamTypeHEVC {
+            throw CastUnsupportedCodecError(
+                codecName: Self.streamTypeNames[videoType] ?? String(format: "video stream_type 0x%02X", videoType),
+                stream: .video)
+        }
+        videoCodec = videoType == Self.streamTypeHEVC ? .hevc : .h264
+        if audio >= 0, audioType != Self.streamTypeAACADTS {
+            // The AC-3 family PASSES THROUGH to a receiver that measured
+            // support for it and is otherwise REFUSED by name (Logan
+            // 2026-09-13: no phone transcode of cast surround audio, and
+            // no server-side output profile either). MPEG audio routes
+            // through the on-phone transcode: no MSE decodes it and its
+            // patents have expired. Everything else refuses.
+            let name = Self.streamTypeNames[audioType]
+                ?? String(format: "audio stream_type 0x%02X", audioType)
+            // 2026-09-21: an AC-3 source for a receiver that cannot
+            // decode it transcodes to AAC-LC stereo on the phone when the
+            // sender planned it; the refusal remains for the case where
+            // the sender found no platform decoder.
+            if let source = Self.transcodeSources[audioType] {
+                audioSource = source
+            } else if let source = Self.passthroughSources[audioType], allowAC3Passthrough {
+                audioPassthrough = source
+            } else if let source = Self.passthroughSources[audioType], transcodeAC3 {
+                audioSource = source
+            } else {
+                log("unsupported cast audio: \(name)")
+                throw CastUnsupportedCodecError(codecName: name, stream: .audio)
+            }
+        }
+        if video < 0, audio < 0 {
+            throw CastUnsupportedCodecError(codecName: "no video stream in PMT", stream: .video)
+        }
+        if video < 0 {
+            // GH #90: audio and no video (radio). Served audio-only; the
+            // audio path rules above (passthrough, transcode, refusal)
+            // still apply unchanged.
+            isAudioOnly = true
+            videoPathDescription = "none (audio only)"
+            log("[AUDIO-ONLY] detected: no video track in PMT; serving audio-only "
+                + String(format: "(audio PID %d type 0x%02X), 2 s segments on audio frame boundaries", audio, audioType))
+        }
+        videoPID = video
+        audioPID = audio // may stay -1: video-only mux is fine
+        if audio < 0 {
+            audioPathDescription = "none (video only)"
+        } else if let source = audioPassthrough {
+            audioPathDescription = "\(source.displayName) passthrough"
+        } else if let source = audioSource {
+            audioPathDescription = "\(source.displayName) -> AAC stereo"
+        } else {
+            audioPathDescription = "AAC passthrough"
+        }
+        pmtSeen = true
+    }
+
+    // MARK: PES layer
+
+    /// Accumulates one PES packet per payload_unit_start and hands the
+    /// complete elementary payload plus its PTS/DTS (90 kHz, 33-bit) up.
+    private final class PESAssembler {
+        private let onComplete: (_ payload: [UInt8], _ pts: Int64, _ dts: Int64) throws -> Void
+        private var buf: [UInt8] = []
+        private var collecting = false
+
+        init(_ onComplete: @escaping (_ payload: [UInt8], _ pts: Int64, _ dts: Int64) throws -> Void) {
+            self.onComplete = onComplete
+        }
+
+        func feed(_ data: [UInt8], _ start: Int, _ len: Int, _ pusi: Bool) throws {
+            if pusi {
+                try flush()
+                collecting = true
+            }
+            if collecting { buf.append(contentsOf: data[start..<(start + len)]) }
+        }
+
+        func flush() throws {
+            guard collecting, !buf.isEmpty else { buf.removeAll(keepingCapacity: true); return }
+            let pes = buf
+            buf.removeAll(keepingCapacity: true)
+            collecting = false
+            guard pes.count >= 9, pes[0] == 0, pes[1] == 0, pes[2] == 1 else { return }
+            let flags = pes[7] & 0xC0
+            let headerLen = Int(pes[8])
+            let payloadOff = 9 + headerLen
+            guard payloadOff < pes.count else { return }
+            var pts: Int64 = -1
+            var dts: Int64 = -1
+            if flags & 0x80 != 0, headerLen >= 5 {
+                pts = Self.readTimestamp(pes, 9)
+                dts = (flags & 0x40 != 0 && headerLen >= 10) ? Self.readTimestamp(pes, 14) : pts
+            }
+            guard pts >= 0 else { return } // unstamped PES is useless to the segmenter
+            try onComplete(Array(pes[payloadOff...]), pts, dts)
+        }
+
+        private static func readTimestamp(_ b: [UInt8], _ off: Int) -> Int64 {
+            ((Int64(b[off]) & 0x0E) << 29)
+                | (Int64(b[off + 1]) << 22)
+                | ((Int64(b[off + 2]) & 0xFE) << 14)
+                | (Int64(b[off + 3]) << 7)
+                | ((Int64(b[off + 4]) & 0xFE) >> 1)
+        }
+    }
+
+    /// 33-bit 90 kHz to monotonic 64-bit. A backwards jump larger than
+    /// half the wrap range is a wraparound, not a rewind.
+    struct PTSUnwrapper {
+        private var last33: Int64 = -1
+        private var epoch: Int64 = 0
+
+        mutating func unwrap(_ ts33: Int64) -> Int64 {
+            if last33 >= 0 {
+                let delta = ts33 - last33
+                if delta < -(CastFMP4Remuxer.ptsWrap / 2) {
+                    epoch += CastFMP4Remuxer.ptsWrap
+                } else if delta > CastFMP4Remuxer.ptsWrap / 2, epoch > 0 {
+                    epoch -= CastFMP4Remuxer.ptsWrap
+                }
+            }
+            last33 = ts33
+            return epoch + ts33
+        }
+    }
+
+    // MARK: video path
+
+    private func onVideoAccessUnit(_ payload: [UInt8], pts33: Int64, dts33: Int64) throws {
+        // One PES with PUSI per access unit is the broadcast norm; split
+        // Annex B, harvest parameter sets, convert to 4-byte-length AVCC.
+        let nals = Self.splitAnnexB(payload)
+        guard !nals.isEmpty else { return }
+        var keyframe = false
+        for nal in nals {
+            let type = Self.nalType(nal, videoCodec)
+            switch videoCodec {
+            case .h264:
+                switch type {
+                case 5: keyframe = true
+                case 7:
+                    if sps == nil { sps = Array(nal) }
+                    transcodeSPS = Array(nal)
+                case 8:
+                    if pps == nil { pps = Array(nal) }
+                    transcodePPS = Array(nal)
+                default: break
+                }
+            case .hevc:
+                switch type {
+                // IRAP pictures (BLA, IDR, CRA and the reserved IRAP types):
+                // random access points a segment may open on.
+                case 16...23: keyframe = true
+                case 32:
+                    if vps == nil { vps = Array(nal) }
+                    transcodeVPS = Array(nal)
+                case 33:
+                    if sps == nil { sps = Array(nal) }
+                    transcodeSPS = Array(nal)
+                case 34:
+                    if pps == nil { pps = Array(nal) }
+                    transcodePPS = Array(nal)
+                default: break
+                }
+            }
+        }
+        if videoMode == .undecided {
+            guard sps != nil, pps != nil, videoCodec == .h264 || vps != nil else { return }
+            try decideVideoMode()
+        }
+        if videoMode == .transcode {
+            onTranscodeSourceAccessUnit(nals, pts33: pts33, dts33: dts33, keyframe: keyframe)
+            return
+        }
+        maybeEmitInit()
+        guard initSent else { return }
+        // Segments must open on a keyframe: drop leading non-IDR units at
+        // stream start (mid-GOP join) instead of shipping undecodable refs.
+        if videoQueue.isEmpty, timelineBase < 0, !keyframe { return }
+
+        let dts = videoClock.unwrap(dts33)
+        let pts = Self.unwrapPTSAgainstDTS(pts33, dts)
+        if timelineBase < 0 {
+            timelineBase = dts
+            // The composition offset of the first sample is what the
+            // receiver anchors on; see `timelineBasePTS`.
+            timelineBasePTS = pts
+        }
+
+        // AVCC conversion: length-prefixed NALs. H.264 keeps its parameter
+        // sets in-band (a mid-stream resolution change then stays
+        // decodable); HEVC is hvc1, whose sets live only in the hvcC.
+        let sample = Self.lengthPrefixed(nals, codec: videoCodec,
+                                         dropping: videoCodec == .hevc ? [32, 33, 34] : [])
+        enqueueVideoSample(VideoSample(data: sample, dts: dts, pts: pts, keyframe: keyframe))
+    }
+
+    /// nal_unit_type: 5 bits of the one-byte H.264 header, 6 bits of the
+    /// two-byte HEVC one.
+    private static func nalType(_ nal: ArraySlice<UInt8>, _ codec: CastVideoCodec) -> UInt8 {
+        let first = nal[nal.startIndex]
+        return codec == .hevc ? (first >> 1) & 0x3F : first & 0x1F
+    }
+
+    /// Queue one video sample for the segmenter (passthrough and transcode
+    /// paths alike). The cut rule: the first keyframe at or after
+    /// `targetSegmentTicks` of the segment's first DTS.
+    private func enqueueVideoSample(_ queued: VideoSample) {
+        if pendingCutDTS < 0, queued.keyframe, let first = videoQueue.first,
+           queued.dts - first.dts >= targetSegmentTicks {
+            pendingCutDTS = queued.dts
+        }
+        if pendingCutDTS >= 0 {
+            heldVideo.append(queued)
+            maybeCut(latestDTS: queued.dts)
+            return
+        }
+        videoQueue.append(queued)
+    }
+
+    /// 4-byte-length NAL units, skipping the given nal_unit_types.
+    private static func lengthPrefixed(_ nals: [ArraySlice<UInt8>], codec: CastVideoCodec,
+                                       dropping: Set<UInt8>) -> [UInt8] {
+        var sample = [UInt8]()
+        sample.reserveCapacity(nals.reduce(0) { $0 + 4 + $1.count })
+        for nal in nals where !dropping.contains(nalType(nal, codec)) {
+            let n = nal.count
+            sample.append(contentsOf: [UInt8((n >> 24) & 0xFF), UInt8((n >> 16) & 0xFF),
+                                       UInt8((n >> 8) & 0xFF), UInt8(n & 0xFF)])
+            sample.append(contentsOf: nal)
+        }
+        return sample
+    }
+
+    // MARK: video transcode
+
+    /// Runs once, at the first access unit that completes the parameter
+    /// sets (SPS + PPS, plus the VPS for HEVC): the sender's plan against
+    /// the source's SPS. Logs the plan line.
+    private func decideVideoMode() throws {
+        let sourceName = videoCodec.displayName
+        let parsed: CastVideoStreamInfo?
+        switch videoCodec {
+        case .h264: parsed = sps.flatMap { try? Self.parseSPSInfo($0) }
+        case .hevc: parsed = sps.flatMap { CastVideoCodecConfig.hevcStreamInfo(sps: $0, vps: vps) }
+        }
+        guard let info = parsed else {
+            if videoCodec == .hevc {
+                // Neither HEVC path can run blind: hvc1 passthrough needs the
+                // SPS fields for its hvcC, and the plan needs the size.
+                log("[Cast] video plan: source HEVC SPS unreadable -> refusing")
+                throw CastUnsupportedCodecError(codecName: "HEVC video with an unreadable SPS", stream: .video)
+            }
+            videoMode = .passthrough
+            videoPathDescription = "H.264 passthrough"
+            log("[Cast] video plan: source SPS unreadable -> passthrough")
+            return
+        }
+        sourceVideoInfo = info
+        var decision = videoPlan.decide(info)
+        if decision.output != nil, videoDelivery == nil {
+            decision = CastVideoDecision(output: nil, reason: "no transcode delivery queue")
+        }
+        if videoCodec == .hevc, decision.output == nil {
+            guard let vps, let sps, let pps,
+                  let record = CastVideoCodecConfig.buildHVCC(vps: vps, sps: sps, pps: pps) else {
+                log("[Cast] video plan: HEVC hvcC could not be built -> refusing")
+                throw CastUnsupportedCodecError(codecName: "HEVC video with an unreadable SPS", stream: .video)
+            }
+            passthroughHVCC = record
+        }
+        log(videoPlan.logLine(source: info, decision: decision))
+        onVideoDecision?(CastVideoPlanOutcome(source: info, decision: decision))
+        guard let spec = decision.output, let deliver = videoDelivery else {
+            videoMode = .passthrough
+            videoPathDescription = "\(sourceName) passthrough"
+            return
+        }
+        videoMode = .transcode
+        let fps = spec.outputFPS(info.fps).map(CastVideoPlan.fpsLabel).map { "@\($0)" } ?? ""
+        videoPathDescription = "\(sourceName) -> \(spec.codec.displayName) \(spec.width)x\(spec.height)\(fps)"
+        let sink = CastVideoTranscodeSink(
+            onFormat: { [weak self] codec, config, width, height in
+                self?.onTranscodedFormat(codec: codec, config: config, width: width, height: height)
+            },
+            onSample: { [weak self] data, pts, keyframe in
+                self?.onTranscodedSample(data, pts: pts, keyframe: keyframe)
+            },
+            onFailure: { [weak self] reason in
+                self?.onTranscodeFailed(reason)
+            })
+        videoTranscoder = videoTranscoderFactory(info, spec, targetSegmentTicks, sink, deliver)
+    }
+
+    /// Source access unit on the transcode path. The timeline is anchored
+    /// here, on the SOURCE IDR, not when the first encoded frame comes
+    /// back: output PTS are the source PTS, so the first encoded frame IS
+    /// this IDR's presentation time, and anchoring now lets the audio that
+    /// is demuxed while the encoder warms up queue instead of being gated.
+    private func onTranscodeSourceAccessUnit(_ nals: [ArraySlice<UInt8>], pts33: Int64, dts33: Int64,
+                                             keyframe: Bool) {
+        guard let videoTranscoder, !released else { return }
+        // The audio config has to be known before anything is anchored, so
+        // the init segment can go out with the encoder's first frame.
+        guard timelineBase >= 0 || (keyframe && audioConfigReady) else { return }
+        let dts = videoClock.unwrap(dts33)
+        let pts = Self.unwrapPTSAgainstDTS(pts33, dts)
+        if timelineBase < 0 {
+            // Encoded samples carry DTS == PTS, so the video tfdt base is
+            // the IDR's presentation time.
+            timelineBase = pts
+            timelineBasePTS = pts
+        }
+        // Parameter sets travel separately (the decoder format), AUD and
+        // filler mean nothing to VideoToolbox.
+        let sample: [UInt8]
+        let parameterSets: [[UInt8]]
+        switch videoCodec {
+        case .h264:
+            sample = Self.lengthPrefixed(nals, codec: .h264, dropping: [7, 8, 9, 12])
+            parameterSets = [transcodeSPS, transcodePPS]
+        case .hevc:
+            sample = Self.lengthPrefixed(nals, codec: .hevc, dropping: [32, 33, 34, 35, 38])
+            parameterSets = [transcodeVPS, transcodeSPS, transcodePPS]
+        }
+        guard !sample.isEmpty else { return }
+        videoTranscoder.feed(sample, pts: pts, dts: dts, keyframe: keyframe, parameterSets: parameterSets)
+    }
+
+    private func onTranscodedFormat(codec: CastVideoOutputSpec.Codec, config: [UInt8], width: Int, height: Int) {
+        guard !released, transcodedFormat == nil else { return }
+        transcodedFormat = (codec, config, width, height)
+        maybeEmitInit()
+    }
+
+    private func onTranscodedSample(_ data: [UInt8], pts: Int64, keyframe: Bool) {
+        guard !released, initSent, transcodeFailure == nil else { return }
+        // Monotonic output, and every segment (the first one included)
+        // opens on an encoder IDR.
+        if pts <= lastTranscodedPTS || pts < timelineBase { return }
+        if videoQueue.isEmpty, heldVideo.isEmpty, emittedMediaTicks == 0, !keyframe { return }
+        lastTranscodedPTS = pts
+        enqueueVideoSample(VideoSample(data: data, dts: pts, pts: pts, keyframe: keyframe))
+    }
+
+    private func onTranscodeFailed(_ reason: String) {
+        guard !released, transcodeFailure == nil else { return }
+        transcodeFailure = reason
+        onVideoTranscodeFailed?(reason)
+    }
+
+    /// Take the pending cut once the audio queue has caught up past it,
+    /// or once the hold has run longer than `maxCutHoldTicks` of video.
+    /// See `heldVideo` for why the cut waits at all.
+    private func maybeCut(latestDTS: Int64) {
+        let cut = pendingCutDTS
+        guard cut >= 0 else { return }
+        let audioEnd = audioQueue.last.map { $0.pts + audioFrameTicks } ?? Int64.max
+        let audioReady = audioPID < 0 || audioEnd >= cut
+        if !audioReady, latestDTS - cut < Self.maxCutHoldTicks { return }
+        pendingCutDTS = -1
+        finalizeSegment(cutDTS: cut)
+        videoQueue.append(contentsOf: heldVideo)
+        heldVideo.removeAll(keepingCapacity: true)
+    }
+
+    /// PTS shares DTS's wrap epoch; unwrap it relative to the unwrapped
+    /// DTS instead of running a second independent epoch counter (PTS can
+    /// legitimately sit slightly across the wrap point from DTS).
+    static func unwrapPTSAgainstDTS(_ pts33: Int64, _ dts64: Int64) -> Int64 {
+        let base = dts64 - (dts64 % ptsWrap)
+        var pts = base + pts33
+        if pts < dts64 - ptsWrap / 2 { pts += ptsWrap }
+        if pts > dts64 + ptsWrap / 2 { pts -= ptsWrap }
+        return pts
+    }
+
+    private static func splitAnnexB(_ payload: [UInt8]) -> [ArraySlice<UInt8>] {
+        var nals: [ArraySlice<UInt8>] = []
+        var i = 0
+        var nalStart = -1
+        let n = payload.count
+        while i + 2 < n {
+            if payload[i] == 0, payload[i + 1] == 0, payload[i + 2] == 1 {
+                if nalStart >= 0 {
+                    var end = i
+                    if end > nalStart, payload[end - 1] == 0 { end -= 1 } // 4-byte start code
+                    if end > nalStart { nals.append(payload[nalStart..<end]) }
+                }
+                nalStart = i + 3
+                i += 3
+            } else {
+                i += 1
+            }
+        }
+        if nalStart >= 0, nalStart < n { nals.append(payload[nalStart..<n]) }
+        return nals
+    }
+
+    // MARK: audio path
+
+    private func onAudioPES(_ payload: [UInt8], pts33: Int64) throws {
+        checkNoVideoFallback(pts33: pts33)
+        if let source = audioPassthrough {
+            onAC3PassthroughPES(source, payload, pts33: pts33)
+        } else if let source = audioSource {
+            try onTranscodeAudioPES(source, payload, pts33: pts33)
+        } else {
+            try onADTSAudioPES(payload, pts33: pts33)
+        }
+    }
+
+    /// The 3 s no-video fallback (mirrors TSHLSRemuxer): only before the
+    /// first init, only while the declared video PID has sent nothing.
+    private func checkNoVideoFallback(pts33: Int64) {
+        guard !isAudioOnly, !initSent, videoPID >= 0, !videoPacketSeen else { return }
+        if firstAudioPTSWithoutVideo < 0 || pts33 < firstAudioPTSWithoutVideo
+            || pts33 - firstAudioPTSWithoutVideo > 30 * Self.ticksPerSecond {
+            // First audio, or a wrap/jump: (re)start the window.
+            firstAudioPTSWithoutVideo = pts33
+            return
+        }
+        guard pts33 - firstAudioPTSWithoutVideo >= Self.audioOnlyVideoGraceTicks else { return }
+        log("[AUDIO-ONLY] detected: no video packets in 3 s (PMT video PID \(videoPID) silent, "
+            + "audio PID \(audioPID)); serving audio-only")
+        isAudioOnly = true
+        videoPID = -1
+        videoPathDescription = "none (audio only)"
+        maybeEmitInit()
+    }
+
+    /// Audio-only mode: anchor the timeline on the first audio frame
+    /// queued after the init went out (there is no video to anchor it).
+    private func anchorAudioOnlyTimeline(_ pts: Int64) {
+        guard isAudioOnly, initSent, timelineBase < 0 else { return }
+        timelineBase = pts
+        timelineBasePTS = pts
+    }
+
+    /// Audio-only mode: cut once the queued frames span the target.
+    /// Frames are stamped by the running audio clock, so each segment
+    /// starts exactly where the previous one ended.
+    private func maybeCutAudioOnly() {
+        guard isAudioOnly, let first = audioQueue.first, let last = audioQueue.last else { return }
+        if last.pts + audioFrameTicks - first.pts >= Self.audioOnlySegmentTicks {
+            finalizeAudioOnlySegment()
+        }
+    }
+
+    private func finalizeAudioOnlySegment() {
+        guard !audioQueue.isEmpty else { return }
+        let segAudio = audioQueue
+        audioQueue.removeAll(keepingCapacity: true)
+        sequenceNumber += 1
+        let audioSegment = buildMediaSegment(video: [], videoDurations: [], audio: segAudio,
+                                             rendition: .audioOnly)
+        let durationTicks = Int64(segAudio.count) * max(1, audioFrameTicks)
+        let firstAudioPTSSeconds = Double(segAudio[0].pts - timelineBase) / Double(Self.ticksPerSecond)
+        let segmentStartSeconds = Double(emittedMediaTicks) / Double(Self.ticksPerSecond)
+        emittedMediaTicks += durationTicks
+        onSegmentComposition?(0, segAudio.count, -1.0, -1.0, firstAudioPTSSeconds, segmentStartSeconds)
+        onDemuxedMediaSegments?(Data(), audioSegment, durationTicks, durationTicks)
+    }
+
+    /// AC-3 / E-AC-3 passthrough: frame the elementary stream and queue the whole syncframes as audio
+    /// samples. No decode, no encode, original channel layout; the init
+    /// segment carries an ac-3 / ec-3 sample entry (dac3 / dec3) and the
+    /// playlist names the matching CODECS value, so a receiver that
+    /// decodes AC-3 picks the right decoder.
+    private func onAC3PassthroughPES(_ source: CastAudioSourceCodec, _ payload: [UInt8], pts33: Int64) {
+        var data: [UInt8]
+        if audioCarry.isEmpty {
+            data = payload
+        } else {
+            data = audioCarry
+            data.append(contentsOf: payload)
+        }
+        audioCarry = []
+        let pesAnchor = audioClock.unwrap(pts33)
+        var p = 0
+        while p < data.count {
+            guard let info = CastAudioFrameParser.parseFrameHeader(source, data, p) else {
+                if data.count - p < 8 { break } // possibly a truncated header: carry it
+                p += 1 // scan to syncword (junk between frames happens on splices)
+                continue
+            }
+            let next = p + info.frameLength
+            if next > data.count { break } // partial frame: carry
+            // Reject a false sync inside frame data: the next frame must
+            // start on a syncword when it is already in the buffer.
+            if next + 1 < data.count, !CastAudioFrameParser.looksLikeSync(source, data, next) {
+                p += 1
+                continue
+            }
+            if passthroughConfig == nil,
+               let config = CastAudioFrameParser.parseAC3SampleEntryConfig(source, data, p) {
+                passthroughConfig = config
+                audioFrameTicks = Int64(info.samplesPerFrame) * Self.ticksPerSecond / Int64(info.sampleRate)
+                audioPathDescription = "\(source.displayName) \(Self.channelLabel(info.channels)) passthrough"
+                if !passthroughLogged {
+                    log("audio passthrough active: \(source.displayName) \(info.channels)ch "
+                        + "\(info.sampleRate)Hz, codecs=\(config.codecsAttribute)")
+                    passthroughLogged = true
+                }
+                maybeEmitInit()
+            }
+            let frameTicks = Int64(info.samplesPerFrame) * Self.ticksPerSecond / Int64(info.sampleRate)
+            let framePTS = stampAudioFrame(pesAnchor: pesAnchor, frameTicks: frameTicks)
+            audioRunPTS = framePTS + frameTicks
+            anchorAudioOnlyTimeline(framePTS)
+            if audioQueueOpen, framePTS >= timelineBasePTS {
+                audioQueue.append(AudioSample(data: Array(data[p..<next]), pts: framePTS))
+                maybeCutAudioOnly()
+            }
+            p = next
+        }
+        if p < data.count { audioCarry = Array(data[p...]) }
+    }
+
+    /// Transcode path: frame the elementary stream (MPEG audio
+    /// syncframes; `audioCarry` doubles as the generic audio carry),
+    /// stamp each frame's PTS (first frame of the PES rides the PES PTS,
+    /// followers step by the codec's frame duration, mirroring the ADTS
+    /// path), and hand the access units to the transcoder. Its AAC
+    /// output flows back through the closures wired in the factory.
+    private func onTranscodeAudioPES(_ source: CastAudioSourceCodec, _ payload: [UInt8], pts33: Int64) throws {
+        var data: [UInt8]
+        if audioCarry.isEmpty {
+            data = payload
+        } else {
+            data = audioCarry
+            data.append(contentsOf: payload)
+        }
+        audioCarry = []
+        let pesAnchor = audioClock.unwrap(pts33)
+        var p = 0
+        var firstFrameOfPES = true
+        while p < data.count {
+            guard let info = CastAudioFrameParser.parseFrameHeader(source, data, p) else {
+                if data.count - p < 8 { break } // possibly a truncated header: carry it
+                p += 1 // scan to syncword (junk between frames happens on splices)
+                continue
+            }
+            let next = p + info.frameLength
+            if next > data.count { break } // partial frame: carry
+            // Reject a false sync inside frame data: the next frame must
+            // start on a syncword when it is already in the buffer.
+            if next + 1 < data.count, !CastAudioFrameParser.looksLikeSync(source, data, next) {
+                p += 1
+                continue
+            }
+            let t: CastAudioTranscoding
+            if let existing = transcoder {
+                t = existing
+            } else {
+                t = transcoderFactory(source, { [weak self] asc, rate in
+                    guard let self else { return }
+                    self.transcodeASC = asc
+                    self.transcodeSampleRate = rate
+                    self.audioFrameTicks = 1024 * Self.ticksPerSecond / Int64(rate)
+                    self.maybeEmitInit()
+                }, { [weak self] frame, pts in
+                    self?.queueTranscodedAudio(frame, pts: pts)
+                })
+                transcoder = t
+            }
+            if !transcodeLogged {
+                if source != .mp2 {
+                    log("transcoding \(source.displayName) \(Self.channelLabel(info.channels)) "
+                        + "\(info.sampleRate) Hz -> AAC-LC stereo (receiver cannot decode \(source.displayName))")
+                }
+                log("audio transcode active: \(source.displayName) \(info.channels)ch \(info.sampleRate)Hz -> AAC-LC stereo")
+                audioPathDescription = "\(source.displayName) \(Self.channelLabel(info.channels)) -> AAC stereo"
+                transcodeLogged = true
+            }
+            let frameTicks = Int64(info.samplesPerFrame) * Self.ticksPerSecond / Int64(info.sampleRate)
+            let framePTS = stampAudioFrame(pesAnchor: pesAnchor, frameTicks: frameTicks)
+            audioRunPTS = framePTS + frameTicks
+            if firstFrameOfPES {
+                firstFrameOfPES = false
+                if expectedSrcAudioPTS >= 0,
+                   abs(framePTS - expectedSrcAudioPTS) > CastAudioTranscoder.discontinuityTicks {
+                    // Splice/reconnect: flush both codecs; the PTS mapper
+                    // re-anchors on the next output stamp.
+                    log("audio pts discontinuity (\((framePTS - expectedSrcAudioPTS) / 90)ms), flushing transcode codecs")
+                    t.flush()
+                }
+            }
+            try t.feed(data, range: p..<next, ptsTicks: framePTS, info: info)
+            expectedSrcAudioPTS = framePTS + frameTicks
+            p = next
+        }
+        if p < data.count { audioCarry = Array(data[p...]) }
+    }
+
+    /// Units the transcoded-audio gate has dropped in the current run of
+    /// drops; 0 while audio is flowing.
+    private var transcodeGatedUnits = 0
+
+    /// Encoder output lands here. Same gate as the passthrough path:
+    /// audio only queues once the init exists and video anchored the
+    /// timeline, and never before the first video PRESENTATION time.
+    /// The encoder starts on the first decodable audio frame, which on a
+    /// mid-GOP join is well before the first video keyframe, so the first
+    /// units of every session are dropped here; the drop and the resume
+    /// are logged once per run so the field log shows how much audio the
+    /// join cost.
+    private func queueTranscodedAudio(_ frame: [UInt8], pts: Int64) {
+        anchorAudioOnlyTimeline(pts)
+        guard audioQueueOpen, pts >= timelineBasePTS else {
+            transcodeGatedUnits += 1
+            if transcodeGatedUnits == 1 {
+                let seconds = Double(pts) / Double(Self.ticksPerSecond)
+                let base = Double(timelineBasePTS) / Double(Self.ticksPerSecond)
+                log(String(format: "transcoded audio gated: %d units dropped, pts %.3fs below timeline base %.3fs",
+                           transcodeGatedUnits, seconds, base))
+            }
+            return
+        }
+        if transcodeGatedUnits > 0 {
+            log("transcoded audio resumed after \(transcodeGatedUnits) gated units")
+            transcodeGatedUnits = 0
+        }
+        audioQueue.append(AudioSample(data: frame, pts: pts))
+        maybeCutAudioOnly()
+    }
+
+    private func onADTSAudioPES(_ payload: [UInt8], pts33: Int64) throws {
+        var data: [UInt8]
+        if audioCarry.isEmpty {
+            data = payload
+        } else {
+            data = audioCarry
+            data.append(contentsOf: payload)
+        }
+        audioCarry = []
+        let pesAnchor = audioClock.unwrap(pts33)
+        var p = 0
+        while p + 7 <= data.count {
+            guard data[p] == 0xFF, data[p + 1] & 0xF0 == 0xF0 else {
+                p += 1 // scan to syncword (junk between frames happens on splices)
+                continue
+            }
+            let protectionAbsent = data[p + 1] & 0x01 != 0
+            let profile = (Int(data[p + 2]) >> 6) & 0x03
+            let freqIndex = (Int(data[p + 2]) >> 2) & 0x0F
+            let chanConfig = ((Int(data[p + 2]) & 0x01) << 2) | ((Int(data[p + 3]) >> 6) & 0x03)
+            let frameLen = ((Int(data[p + 3]) & 0x03) << 11)
+                | (Int(data[p + 4]) << 3)
+                | ((Int(data[p + 5]) >> 5) & 0x07)
+            if frameLen < 7 || p + frameLen > data.count { break } // partial frame: carry
+            let headerLen = protectionAbsent ? 7 : 9
+            // channel_configuration 0 means the layout lives in a
+            // program_config_element at the start of the raw_data_block,
+            // which is exactly what Dispatcharr's AAC output profile
+            // emits (ffmpeg `-c:a aac -ac 2`, "Using a PCE to encode
+            // channel layout"). Two things break downstream: an
+            // AudioSpecificConfig cannot express config 0 at all, and the
+            // Google TV Streamer's C2SoftAacDec refuses every frame that
+            // still carries the PCE (measured: 5388 lines of "error
+            // 0x0005, substituting silence" in one session). Both are
+            // fixed losslessly here, per frame: derive the real channel
+            // count from the element for the ASC, and drop the element
+            // off the front of the block. No transcode, no re-encode.
+            var payloadStart = p + headerLen
+            var effectiveChanConfig = chanConfig
+            if chanConfig == 0,
+               let pce = Self.parseAACPCE(data, offset: p + headerLen, end: p + frameLen) {
+                // The PCE ends byte-aligned relative to the block start
+                // (`parseAACPCE` refuses to report one that does not), so
+                // the elements after it begin on a byte boundary and the
+                // rest of the block copies over verbatim: no bit
+                // shifting, and the block's existing id_syn_ele 7
+                // terminator plus its byte alignment still terminate the
+                // shortened block correctly.
+                // A channel_configuration implies the element types,
+                // their order AND their instance tags, not just a channel
+                // count, so the PCE can only be dropped when its element
+                // list is exactly the one some entry of Table 1.19
+                // implies. Deriving the config from the channel count
+                // alone was measured to destroy the audio outright:
+                // ffmpeg's "5.1(side)" PCE declares CPE(0), SCE(0),
+                // SCE(1), CPE(1) and no LFE element, and those frames
+                // presented as config 6 are rejected frame for frame by
+                // the Google TV Streamer's C2SoftAacDec (decoderErr
+                // 0x0005, 4360 times in one session) and by ffmpeg's own
+                // aac and aac_fixed decoders ("channel element 1.0 is not
+                // allocated", 189 of 189 frames).
+                let implied = pce.impliedChannelConfig
+                if implied == 0 {
+                    // Nothing lossless is left. Reordering the elements
+                    // into Table 1.19 order is not an option: they are
+                    // bit-packed, so re-serializing them needs a full AAC
+                    // syntax parser to find each element's bit length, and
+                    // ffmpeg's layout has no LFE element to reorder in the
+                    // first place. Emitting the PCE inside the ASC instead
+                    // (legal per 14496-3 1.6.2.1 when
+                    // channelConfiguration is 0) does not help either:
+                    // Chromium's SkipDecoderGASpecificConfig does
+                    // RCHECK(channel_config_ != 0) before it would ever
+                    // read a PCE out of the ASC (media/formats/mp4/aac.cc,
+                    // main as of 2026-09-12), so a config-0 ASC fails the
+                    // whole append with or without the element. Refuse by
+                    // name so the failure points at the profile instead of
+                    // casting silence.
+                    throw CastUnsupportedCodecError(
+                        codecName: "AAC with a \(pce.channels)-channel program_config_element "
+                            + "layout that no channel_configuration describes",
+                        stream: .audio)
+                }
+                payloadStart = p + headerLen + pce.lengthBytes
+                effectiveChanConfig = implied
+                if !aacPCELogged {
+                    aacPCELogged = true
+                    log("AAC PCE stripped: layout \(pce.channels) ch matches config \(implied)")
+                }
+            }
+            if payloadStart >= p + frameLen {
+                // A frame that is nothing but a PCE carries no audio.
+                p += frameLen
+                continue
+            }
+            if aacFreqIndex < 0 {
+                aacObjectType = profile + 1 // ADTS profile is MPEG-4 audioObjectType - 1
+                aacFreqIndex = freqIndex
+                aacChannelConfig = effectiveChanConfig
+                // The frame duration has to match the track's declared
+                // sample rate, so both come from the one sanitized config.
+                let cfg = Self.sanitizedAACConfig(objectType: profile + 1,
+                                                  freqIndex: freqIndex,
+                                                  channelConfig: effectiveChanConfig)
+                audioFrameTicks = 1024 * Self.ticksPerSecond / Int64(cfg.sampleRate)
+                maybeEmitInit()
+            }
+            if frameLen > headerLen {
+                // The running audio clock stamps every frame, carried
+                // frames included; the PES PTS only re-anchors it when
+                // the two disagree by more than one PES worth of frames.
+                // See `audioRunPTS` for what stamping the carried frame
+                // with the new PES PTS cost on the device.
+                let framePTS = stampAudioFrame(pesAnchor: pesAnchor, frameTicks: audioFrameTicks)
+                audioRunPTS = framePTS + audioFrameTicks
+                anchorAudioOnlyTimeline(framePTS)
+                if audioQueueOpen, framePTS >= timelineBasePTS {
+                    audioQueue.append(AudioSample(data: Array(data[payloadStart..<(p + frameLen)]), pts: framePTS))
+                    maybeCutAudioOnly()
+                }
+            }
+            p += frameLen
+        }
+        if p < data.count { audioCarry = Array(data[p...]) }
+    }
+
+    /// Audio config for the AAC sample entry, validated against what the
+    /// web receiver's parser will accept.
+    struct AACTrackConfig: Equatable {
+        let objectType: Int
+        let freqIndex: Int
+        let channelConfig: Int
+        let sampleRate: Int
+        /// mp4a `channelcount`, kept consistent with `channelConfig`.
+        let channels: Int
+        /// The 2-byte MPEG-4 AudioSpecificConfig for the esds.
+        let asc: [UInt8]
+    }
+
+    /// ADTS channel counts per channelConfiguration (ISO 14496-3 Table
+    /// 1.19); index 7 is 7.1, so it is 8 channels, not 7.
+    private static let aacChannelCounts = [0, 1, 2, 3, 4, 5, 6, 8]
+
+    /// A program_config_element found at the start of a raw_data_block.
+    ///
+    /// `lengthBytes` is the element's size measured from the block start,
+    /// which is always a whole number of bytes: the PCE byte-aligns
+    /// relative to the block start before `comment_field_bytes`, and the
+    /// comment itself is a whole number of bytes after it (ISO/IEC
+    /// 14496-3 4.4.1.1). That is what lets the PCE be removed with a
+    /// byte-wise copy instead of shifting the whole remaining payload
+    /// left bit by bit; `parseAACPCE` refuses to report a PCE that does
+    /// not end aligned, so the byte-wise caller can never corrupt a frame.
+    struct AACPCEInfo: Equatable {
+        /// Channels the declared layout adds up to: CPE 2, SCE 1, LFE 1.
+        let channels: Int
+        /// PCE size in bytes, measured from the raw_data_block start.
+        let lengthBytes: Int
+        /// True when the first front element is a channel_pair_element,
+        /// i.e. the element the stripped frame will start with is the
+        /// stereo pair a channel_configuration of 2 implies.
+        let firstIsCPE: Bool
+        /// The element list the PCE declares, in bitstream order, as
+        /// (id_syn_ele, instance tag) pairs: 0 SCE, 1 CPE, 3 LFE.
+        var elements: [(Int, Int)] = []
+
+        static func == (a: AACPCEInfo, b: AACPCEInfo) -> Bool {
+            a.channels == b.channels && a.lengthBytes == b.lengthBytes
+                && a.firstIsCPE == b.firstIsCPE
+                && a.elements.count == b.elements.count
+                && zip(a.elements, b.elements).allSatisfy { $0 == $1 }
+        }
+
+        /// The channel_configuration that describes this layout exactly,
+        /// or 0 when no entry of Table 1.19 does.
+        ///
+        /// A channel_configuration is not just a channel count: it implies
+        /// the raw_data_block's element types, their order AND their
+        /// instance tags (ISO/IEC 14496-3 Table 1.19). Claiming one for a
+        /// layout whose elements differ makes every frame undecodable, and
+        /// that is measured, not theoretical: ffmpeg's "5.1(side)" PCE
+        /// declares CPE(0), SCE(0), SCE(1), CPE(1) with no LFE element at
+        /// all, and those frames presented as channel_configuration 6
+        /// (which implies SCE(0), CPE(0), CPE(1), LFE(0)) are rejected
+        /// frame for frame by the Google TV Streamer's C2SoftAacDec
+        /// ("aacDecoder_DecodeFrame decoderErr = 0x0005 / Invalid AAC
+        /// stream", 4360 times in one session) and by both of ffmpeg's own
+        /// decoders ("channel element 1.0 is not allocated", 189 of 189
+        /// frames, aac and aac_fixed alike).
+        ///
+        /// ffmpeg only reaches for a PCE when the layout is absent from
+        /// Table 1.19 ("Using a PCE to encode channel layout"), so in
+        /// practice this is 0 for everything ffmpeg emits a PCE for. It is
+        /// still checked rather than assumed: other encoders write a PCE
+        /// that merely restates a standard layout, and those strip safely.
+        var impliedChannelConfig: Int {
+            for (config, implied) in AACPCEInfo.table119 {
+                if elements.count == implied.count,
+                   zip(elements, implied).allSatisfy({ $0 == $1 }) {
+                    return config
+                }
+            }
+            return 0
+        }
+
+        /// ISO/IEC 14496-3 Table 1.19: the element list each
+        /// channel_configuration implies, in raw_data_block order, with
+        /// the instance tags the table fixes. 0 SCE, 1 CPE, 3 LFE.
+        static let table119: [(Int, [(Int, Int)])] = [
+            (1, [(0, 0)]),
+            (2, [(1, 0)]),
+            (3, [(0, 0), (1, 0)]),
+            (4, [(0, 0), (1, 0), (0, 1)]),
+            (5, [(0, 0), (1, 0), (1, 1)]),
+            (6, [(0, 0), (1, 0), (1, 1), (3, 0)]),
+            (7, [(0, 0), (1, 0), (1, 1), (1, 2), (3, 0)]),
+        ]
+    }
+
+    /// Parse the program_config_element at `offset`, or return nil when
+    /// the raw_data_block does not start with one.
+    ///
+    /// Dispatcharr's "Web Player (AAC Audio)" output profile (ffmpeg
+    /// `-c:a aac -ac 2`) emits ADTS frames whose channel_configuration is
+    /// 0 with the real layout carried in a PCE at the start of the
+    /// raw_data_block. An AudioSpecificConfig cannot carry config 0
+    /// (Chromium's SkipGASpecificConfig does RCHECK(channel_config_ != 0))
+    /// and the Google TV Streamer's C2SoftAacDec rejects every frame that
+    /// still contains the PCE. Parsing the element gives the remuxer both
+    /// halves of the lossless fix: the real channel count for the ASC,
+    /// and the exact byte length to drop off the front of each frame.
+    ///
+    /// Field order is ISO/IEC 14496-3 4.4.1.1.
+    static func parseAACPCE(_ data: [UInt8], offset: Int, end: Int) -> AACPCEInfo? {
+        guard offset < end, end <= data.count else { return nil }
+        var bit = 0 // bit position RELATIVE to the raw_data_block start
+        let limit = (end - offset) * 8
+        // -1 means "ran past the end of the block"; every caller that can
+        // act on that checks for it.
+        func read(_ n: Int) -> Int {
+            guard bit + n <= limit else { return -1 }
+            var v = 0
+            for _ in 0..<n {
+                let byte = Int(data[offset + (bit >> 3)])
+                v = (v << 1) | ((byte >> (7 - (bit & 7))) & 1)
+                bit += 1
+            }
+            return v
+        }
+        // id_syn_ele: PCE is 0x5. Anything else is a normal element and
+        // the frame passes through untouched.
+        guard read(3) == 5 else { return nil }
+        _ = read(4) // element_instance_tag
+        _ = read(2) // object_type
+        _ = read(4) // sampling_frequency_index
+        let numFront = read(4)
+        let numSide = read(4)
+        let numBack = read(4)
+        let numLFE = read(2)
+        let numAssoc = read(3)
+        let numCC = read(4)
+        guard numCC >= 0 else { return nil }
+        // Each mixdown flag is followed by its index only when present.
+        if read(1) == 1 { _ = read(4) } // mono_mixdown_element_number
+        if read(1) == 1 { _ = read(4) } // stereo_mixdown_element_number
+        if read(1) == 1 { _ = read(3) } // matrix_mixdown_idx + pseudo_surround
+        var channels = 0
+        var firstIsCPE = false
+        var firstSeen = false
+        var elements: [(Int, Int)] = []
+        // front, side and back elements each carry is_cpe + a 4-bit tag;
+        // a channel_pair_element is two channels, a single is one.
+        for count in [numFront, numSide, numBack] {
+            for _ in 0..<count {
+                let isCPE = read(1)
+                let tag = read(4) // element_instance_tag
+                guard isCPE >= 0, tag >= 0 else { return nil }
+                if !firstSeen {
+                    firstSeen = true
+                    firstIsCPE = isCPE == 1
+                }
+                elements.append((isCPE == 1 ? 1 : 0, tag))
+                channels += isCPE == 1 ? 2 : 1
+            }
+        }
+        for _ in 0..<numLFE {
+            let tag = read(4) // lfe_element_tag: one channel each
+            guard tag >= 0 else { return nil }
+            elements.append((3, tag))
+            channels += 1
+        }
+        for _ in 0..<numAssoc { _ = read(4) } // assoc_data: no channels
+        for _ in 0..<numCC {
+            _ = read(1) // cc_element_is_ind_sw
+            _ = read(4) // valid_cc_element_tag
+        }
+        guard bit <= limit else { return nil }
+        // byte_align() is relative to the raw_data_block start, which is
+        // exactly where `bit` is counted from.
+        if bit & 7 != 0 { _ = read(8 - (bit & 7)) }
+        let commentBytes = read(8)
+        guard commentBytes >= 0, bit + commentBytes * 8 <= limit else { return nil }
+        bit += commentBytes * 8
+        // Spec-guaranteed, asserted anyway: a PCE that did not end on a
+        // byte boundary could not be dropped with a byte-wise copy.
+        guard bit & 7 == 0, channels > 0 else { return nil }
+        return AACPCEInfo(
+            channels: channels, lengthBytes: bit >> 3, firstIsCPE: firstIsCPE,
+            elements: elements)
+    }
+
+    /// The inverse of `aacChannelCounts`: the channel_configuration that
+    /// declares `count` channels, or 0 when Table 1.19 has no entry for
+    /// that count (7 channels is the only gap, since config 7 is 7.1). 0
+    /// is then handed to the config sanitizer, which substitutes stereo.
+    static func aacChannelConfig(forCount count: Int) -> Int {
+        switch count {
+        case 1: return 1
+        case 2: return 2
+        case 3: return 3
+        case 4: return 4
+        case 5: return 5
+        case 6: return 6
+        case 8: return 7
+        default: return 0
+        }
+    }
+
+    /// Turn the three ADTS header config fields into an
+    /// AudioSpecificConfig the receiver will actually parse.
+    ///
+    /// The receiver is a Chromium page, and Chromium re-parses the ASC we
+    /// write (media/formats/mp4/aac.cc) while parsing `moov`. Three values
+    /// there are fatal to the WHOLE init segment, not just to the audio
+    /// track, so a verbatim copy of the ADTS header is not safe:
+    ///
+    ///  - `channelConfiguration` 0 means "the layout is in a program
+    ///    config element", which is what ffmpeg's AAC encoder emits for
+    ///    layouts outside Table 1.19 (2.1, 3.1, 6.1, 7.0 and friends), so
+    ///    a transcoding server hands it to us for real channels. Chromium
+    ///    hits `RCHECK(channel_config_ != 0)` in SkipGASpecificConfig and
+    ///    fails the append with "stream parsing failed". Nothing in the
+    ///    ADTS header recovers the real layout, so the track is declared
+    ///    stereo; the decoder still reads the PCE out of the raw frames.
+    ///  - `samplingFrequencyIndex` 13 and 14 are reserved and 15 is the
+    ///    24-bit explicit-rate escape, which a 2-byte ASC has no room
+    ///    for; all three fail Chromium's frequency table lookup. They fall
+    ///    back to 48 kHz (index 3), the rate the rest of the remux
+    ///    already assumed for an out-of-range index.
+    ///  - `audioObjectType` must land in 1...4. ADTS profile + 1 always
+    ///    does, but 5 (HE-AAC) and 29 (HE-AACv2) would need extension
+    ///    fields a 2-byte ASC cannot carry, so anything else becomes 2
+    ///    (AAC-LC).
+    static func sanitizedAACConfig(objectType: Int, freqIndex: Int, channelConfig: Int) -> AACTrackConfig {
+        let aot = (1...4).contains(objectType) ? objectType : 2
+        let index = adtsSampleRates.indices.contains(freqIndex) ? freqIndex : 3
+        let config = (1...7).contains(channelConfig) ? channelConfig : 2
+        let asc: [UInt8] = [UInt8((aot << 3) | (index >> 1)),
+                            UInt8(((index & 1) << 7) | (config << 3))]
+        return AACTrackConfig(objectType: aot, freqIndex: index, channelConfig: config,
+                              sampleRate: adtsSampleRates[index],
+                              channels: aacChannelCounts[config], asc: asc)
+    }
+
+    private static let adtsSampleRates = [
+        96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050,
+        16_000, 12_000, 11_025, 8_000, 7_350,
+    ]
+
+    // MARK: segmenter
+
+    /// Audio config gate: the first syncframe's bitstream config on the
+    /// AC-3 passthrough path, the encoder's AudioSpecificConfig on the
+    /// transcode path (which means the first audio already went through
+    /// both codecs), the ADTS header otherwise.
+    private var audioConfigReady: Bool {
+        if audioPID < 0 { return true }
+        if audioPassthrough != nil { return passthroughConfig != nil }
+        if audioSource != nil { return transcodeASC != nil }
+        return aacFreqIndex >= 0
+    }
+
+    /// Audio may queue once video anchored the timeline. Passthrough video
+    /// anchors only after the init is out; transcoded video anchors on the
+    /// source IDR while the encoder is still warming up, and the audio
+    /// demuxed meanwhile belongs to the first segment.
+    private var audioQueueOpen: Bool {
+        timelineBasePTS >= 0 && (initSent || videoMode == .transcode)
+    }
+
+    private func maybeEmitInit() {
+        guard !initSent, pmtSeen else { return }
+        if isAudioOnly {
+            // No video rendition: the audio moov alone, as soon as the
+            // audio config is known. No video plan, no transcoder.
+            guard audioPID >= 0, audioConfigReady else { return }
+            onDemuxedInitSegments?(nil, buildInitSegment(.audioOnly))
+            initSent = true
+            return
+        }
+        switch videoMode {
+        case .undecided: return
+        case .passthrough:
+            guard sps != nil, pps != nil, videoCodec == .h264 || passthroughHVCC != nil else { return }
+        case .transcode: guard transcodedFormat != nil else { return }
+        }
+        guard audioConfigReady else { return }
+        // A receiver that refuses a muxed ac-3 codec string is handed the
+        // audio in its own SourceBuffer.
+        onDemuxedInitSegments?(buildInitSegment(.videoOnly),
+                               audioPID >= 0 ? buildInitSegment(.audioOnly) : nil)
+        initSent = true
+    }
+
+    private func finalizeSegment(cutDTS: Int64) {
+        guard !videoQueue.isEmpty else { return }
+        let segStart = videoQueue[0].dts
+        // Video sample durations come from successor DTS deltas; the last
+        // sample's successor is the keyframe that triggered the cut.
+        var durations = [Int64](repeating: 0, count: videoQueue.count)
+        for i in videoQueue.indices {
+            let next = i + 1 < videoQueue.count ? videoQueue[i + 1].dts : cutDTS
+            var d = next - videoQueue[i].dts
+            if d <= 0 { d = lastVideoDuration }
+            durations[i] = d
+            lastVideoDuration = d
+        }
+        // Audio that belongs to this video span; the rest stays queued.
+        var segAudio: [AudioSample] = []
+        var keepAudio: [AudioSample] = []
+        for a in audioQueue {
+            if a.pts < cutDTS { segAudio.append(a) } else { keepAudio.append(a) }
+        }
+        // One sequence number per emitted CUT, shared by both renditions
+        // of it: the demuxed playlists must number identically.
+        sequenceNumber += 1
+        let videoSegment = buildMediaSegment(video: videoQueue, videoDurations: durations,
+                                             audio: segAudio, rendition: .videoOnly)
+        let audioSegment = audioPID >= 0
+            ? buildMediaSegment(video: videoQueue, videoDurations: durations,
+                                audio: segAudio, rendition: .audioOnly)
+            : nil
+        let durationTicks = cutDTS - segStart
+        // The audio rendition's EXTINF is what its frames actually cover; a
+        // segment with no audio frame borrows the video span so the two
+        // playlists stay aligned entry for entry.
+        let audioDurationTicks = segAudio.isEmpty
+            ? durationTicks
+            : Int64(segAudio.count) * max(1, audioFrameTicks)
+        // Timeline snapshot for the composition callback, taken BEFORE
+        // the queues are cleared. These are the same values the tfdt
+        // boxes carry (see `buildMoof`), expressed in seconds relative to
+        // `timelineBase`, plus this segment's position on the playlist
+        // timeline; the sender log needs both to tell whether Shaka's
+        // chosen playhead can possibly be inside the buffered range.
+        let videoSamples = videoQueue.count
+        let audioSamples = segAudio.count
+        let firstVideoDTSSeconds = Double(videoQueue[0].dts - timelineBase) / Double(Self.ticksPerSecond)
+        let firstVideoPTSSeconds = Double(videoQueue[0].pts - timelineBase) / Double(Self.ticksPerSecond)
+        // -1.0 is the "no audio in this segment" sentinel; a real value
+        // is never negative because samples below `timelineBasePTS` are
+        // dropped at queue time and `timelineBasePTS >= timelineBase`.
+        let firstAudioPTSSeconds = segAudio.first
+            .map { Double($0.pts - timelineBase) / Double(Self.ticksPerSecond) } ?? -1.0
+        // Audio census for the device log (2026-09-13): aexp is how many
+        // frames this segment's own duration calls for, so a shortfall is
+        // visible in the log without arithmetic. Logged only when the
+        // segment misses by more than two frames: one is the unavoidable
+        // boundary quantization and the generation's first segment also
+        // drops the audio below the first video presentation time.
+        if audioFrameTicks > 0, audioPID >= 0 {
+            let expected = Double(durationTicks) / Double(audioFrameTicks)
+            if abs(expected - Double(audioSamples)) > 2.0 {
+                log(String(format: "audio census: audio=%d aexp=%.1f shortfall=%.1f frames",
+                           audioSamples, expected, expected - Double(audioSamples)))
+            }
+        }
+        let segmentStartSeconds = Double(emittedMediaTicks) / Double(Self.ticksPerSecond)
+        emittedMediaTicks += durationTicks
+        videoQueue.removeAll(keepingCapacity: true)
+        audioQueue = keepAudio
+        // Fired BEFORE onDemuxedMediaSegments so the per-segment timeline
+        // line is logged ahead of anything the store/session does with the
+        // bytes.
+        onSegmentComposition?(videoSamples, audioSamples,
+                              firstVideoDTSSeconds, firstVideoPTSSeconds,
+                              firstAudioPTSSeconds, segmentStartSeconds)
+        onDemuxedMediaSegments?(videoSegment, audioSegment, durationTicks, audioDurationTicks)
+    }
+
+    // MARK: fMP4 writing
+
+    private func buildInitSegment(_ rendition: Rendition) -> Data {
+        let hasVideo = rendition != .audioOnly
+        let hasAudio = audioPID >= 0 && rendition != .videoOnly
+        var out = Data(capacity: 1024)
+        out.append(Self.box("ftyp", Self.bytes("iso5"), Self.u32(0), Self.bytes("iso5"), Self.bytes("iso6"), Self.bytes("mp41")))
+        var traks: [Data] = []
+        if hasVideo {
+            if let format = transcodedFormat {
+                traks.append(videoTrak(width: format.width, height: format.height,
+                                       entryType: format.codec == .hevc ? "hvc1" : "avc1",
+                                       configType: format.codec == .hevc ? "hvcC" : "avcC",
+                                       config: Data(format.config)))
+            } else if let hvcC = passthroughHVCC, let info = sourceVideoInfo {
+                traks.append(videoTrak(width: info.width, height: info.height, entryType: "hvc1",
+                                       configType: "hvcC", config: Data(hvcC)))
+            } else {
+                let dims = (try? Self.parseSPSDimensions(sps!)) ?? (width: 1280, height: 720)
+                traks.append(videoTrak(width: dims.width, height: dims.height, entryType: "avc1",
+                                       configType: "avcC",
+                                       config: CastVideoCodecConfig.avcCPayload(sps: sps!, pps: pps!)))
+            }
+        }
+        if hasAudio { traks.append(audioTrak()) }
+        var trexes: [Data] = []
+        if hasVideo { trexes.append(Self.trex(Self.videoTrackID)) }
+        if hasAudio { trexes.append(Self.trex(Self.audioTrackID)) }
+        // Track IDs never change between renditions, so an audio-only moov
+        // still declares track 2 and nextTrackID 3; the tfhd in every
+        // rendition's traf then names the track it always did.
+        let moov = Self.box("moov",
+                            Self.mvhd(nextTrackID: hasAudio ? 3 : 2),
+                            Self.concat(traks),
+                            Self.box("mvex", Self.mehd(), Self.concat(trexes)))
+        out.append(moov)
+        log("\(Self.logPrefix(rendition))init: mehd 24h, liveness recorded")
+        return out
+    }
+
+    /// Rendition prefix for the per-init and per-segment log lines, so a
+    /// demuxed cast can be read back from one log.
+    private static func logPrefix(_ rendition: Rendition) -> String {
+        switch rendition {
+        case .videoOnly: return "video "
+        case .audioOnly: return "audio "
+        }
+    }
+
+    private func buildMediaSegment(video: [VideoSample], videoDurations: [Int64],
+                                   audio: [AudioSample], rendition: Rendition) -> Data {
+        let wantVideo = rendition != .audioOnly
+        let wantAudio = rendition != .videoOnly
+        let videoBytes = wantVideo ? video.reduce(0) { $0 + $1.data.count } : 0
+        let audioBytes = wantAudio ? audio.reduce(0) { $0 + $1.data.count } : 0
+
+        // trun data_offset is from moof start; build the moof once with
+        // placeholder offsets to learn its size, then rebuild with real
+        // ones (sizes are offset-independent). The sequence number is
+        // claimed once per cut by `finalizeSegment`, not per build pass and
+        // not per rendition, so both renditions of one cut agree.
+        var moof = buildMoof(video: video, videoDurations: videoDurations, audio: audio,
+                             rendition: rendition, videoDataOffset: 0, audioDataOffset: 0)
+        let moofSize = moof.count
+        moof = buildMoof(video: video, videoDurations: videoDurations, audio: audio,
+                         rendition: rendition,
+                         videoDataOffset: moofSize + 8,
+                         audioDataOffset: moofSize + 8 + videoBytes)
+        var out = Data(capacity: moof.count + 8 + videoBytes + audioBytes)
+        out.append(moof)
+        out.append(Self.u32(8 + videoBytes + audioBytes))
+        out.append(Self.bytes("mdat"))
+        if wantVideo { for s in video { out.append(contentsOf: s.data) } }
+        if wantAudio { for a in audio { out.append(contentsOf: a.data) } }
+        return out
+    }
+
+    private func buildMoof(video: [VideoSample], videoDurations: [Int64], audio: [AudioSample],
+                           rendition: Rendition,
+                           videoDataOffset: Int, audioDataOffset: Int) -> Data {
+        let mfhd = Self.fullBox("mfhd", 0, 0, Self.u32(sequenceNumber))
+        var trafs: [Data] = []
+        if rendition != .audioOnly {
+            trafs.append(Self.box(
+                "traf",
+                // default-base-is-moof so data_offset is moof-relative (CMAF).
+                Self.fullBox("tfhd", 0, 0x020000, Self.u32(Self.videoTrackID)),
+                Self.fullBox("tfdt", 1, 0, Self.u64(UInt64(video[0].dts - timelineBase))),
+                videoTrun(video, videoDurations, dataOffset: videoDataOffset)))
+        }
+        // The audio traf is emitted for the audio-only rendition even when
+        // the cut span carried no frame (a zero-sample trun), so the audio
+        // playlist has an entry at every sequence number the video one has.
+        if rendition != .videoOnly, !audio.isEmpty || rendition == .audioOnly {
+            trafs.append(Self.box(
+                "traf",
+                // flags 0x020000 default-base-is-moof, 0x000020
+                // default-sample-flags. The audio trun carries no
+                // per-sample flags, so without the tfhd default the
+                // receiver's parser does not treat our AAC frames as
+                // random access points and logs, once per frame (Google TV
+                // Streamer, 2026-09-12 14:22:20.237):
+                //
+                //   Bytestream with audio frame PTS 22666us and DTS
+                //   22666us indicated the frame is not a random access
+                //   point (key frame). All audio frames are expected to be
+                //   key frames for the current audio codec.
+                //
+                // The first packet after the load's seek is then a non-key
+                // packet, which is the "Failed to send audio packet for
+                // decoding" that costs every load a FFmpegAudioDecoder ->
+                // MediaCodecAudioDecoder swap and a reseek. 0x02000000 is
+                // sample_depends_on = 2 ("does not depend on others") with
+                // sample_is_non_sync_sample clear, which is the truth for
+                // every AAC and AC-3 frame.
+                Self.fullBox("tfhd", 0, 0x020020,
+                             Self.u32(Self.audioTrackID), Self.u32(0x0200_0000)),
+                // No clamp: samples earlier than `timelineBasePTS` are
+                // dropped at queue time, and `timelineBasePTS` is never
+                // below `timelineBase`, so this is always >= 0 and always
+                // the truth. Clamping to 0 declared a segment as starting
+                // earlier than it does and overlapped the NEXT segment's
+                // audio by the same amount, which is a backwards append
+                // one segment into the cast.
+                // Falls back to the segment's video start when there is no
+                // audio frame to take it from, which is the only honest
+                // timestamp for an empty audio fragment.
+                Self.fullBox("tfdt", 1, 0,
+                             Self.u64(UInt64(max(0, (audio.first?.pts ?? video.first?.dts ?? timelineBase) - timelineBase)))),
+                audioTrun(audio, dataOffset: audioDataOffset)))
+        }
+        return Self.box("moof", mfhd, Self.concat(trafs))
+    }
+
+    private func videoTrun(_ video: [VideoSample], _ durations: [Int64], dataOffset: Int) -> Data {
+        // flags: data-offset | sample-duration | sample-size | sample-flags |
+        // sample-composition-time-offset; version 1 for signed cts.
+        var body = Data(capacity: 16 + video.count * 16)
+        body.append(Self.u32(video.count))
+        body.append(Self.u32(dataOffset))
+        for i in video.indices {
+            let s = video[i]
+            body.append(Self.u32(Int(durations[i])))
+            body.append(Self.u32(s.data.count))
+            body.append(Self.u32(s.keyframe ? 0x02000000 : 0x01010000))
+            body.append(Self.u32(Int(s.pts - s.dts)))
+        }
+        return Self.fullBox("trun", 1, 0x000F01, body)
+    }
+
+    private func audioTrun(_ audio: [AudioSample], dataOffset: Int) -> Data {
+        // Fixed per-frame duration; flags: data-offset | duration | size.
+        var body = Data(capacity: 16 + audio.count * 8)
+        body.append(Self.u32(audio.count))
+        body.append(Self.u32(dataOffset))
+        for a in audio {
+            body.append(Self.u32(Int(audioFrameTicks)))
+            body.append(Self.u32(a.data.count))
+        }
+        return Self.fullBox("trun", 0, 0x000301, body)
+    }
+
+    // MARK: moov internals
+
+    /// A declared duration (here and in mehd) is what keeps Chromium out of
+    /// low-delay rendering: media/formats/mp4/mp4_stream_parser.cc reads
+    /// liveness as kRecorded when mvex/mehd fragment_duration > 0, or when
+    /// mvhd duration is neither 0 nor the all-ones "unknown" sentinel, and
+    /// kLive otherwise. kLive makes video_renderer_impl.cc pin
+    /// min_buffered_frames_ to 1 with no underflow growth, which presented
+    /// only ~46 of 60 frames on the Google TV Streamer. Version 1 so the
+    /// 24 hour duration fits: 86400 * 90000 ticks overflows 32 bits.
+    private static let declaredDurationTicks: UInt64 = 86_400 * UInt64(ticksPerSecond)
+
+    private static func mvhd(nextTrackID: Int) -> Data {
+        fullBox("mvhd", 1, 0,
+                u64(0), u64(0), // creation, modification
+                u32(Int(ticksPerSecond)), u64(declaredDurationTicks), // timescale, duration
+                u32(0x00010000), u16(0x0100), u16(0), u32(0), u32(0), // rate, volume, reserved
+                matrix(),
+                Data(count: 24), // pre_defined
+                u32(nextTrackID))
+    }
+
+    private static func mehd() -> Data {
+        fullBox("mehd", 1, 0, u64(declaredDurationTicks))
+    }
+
+    private static func matrix() -> Data {
+        var out = Data(capacity: 36)
+        for v in [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000] { out.append(u32(v)) }
+        return out
+    }
+
+    /// Video trak with an avc1 + avcC (passthrough, or re-encoded H.264)
+    /// or hvc1 + hvcC (HEVC passthrough or transcode) sample entry. hvc1,
+    /// not hev1: the encoder keeps its parameter sets out of the samples
+    /// and the HEVC passthrough strips them, so the record in the sample
+    /// entry is the only copy, which is what hvc1 means.
+    private func videoTrak(width: Int, height: Int, entryType: String, configType: String,
+                           config: Data) -> Data {
+        let configBox = Self.box(configType, config)
+        var entryBody = Data(capacity: 96 + configBox.count)
+        entryBody.append(Data(count: 6)); entryBody.append(Self.u16(1)) // reserved, data_reference_index
+        entryBody.append(Data(count: 16)) // pre_defined/reserved
+        entryBody.append(Self.u16(width)); entryBody.append(Self.u16(height))
+        entryBody.append(Self.u32(0x00480000)); entryBody.append(Self.u32(0x00480000)) // 72 dpi
+        entryBody.append(Self.u32(0)); entryBody.append(Self.u16(1)) // reserved, frame_count
+        entryBody.append(Data(count: 32)) // compressorname
+        entryBody.append(Self.u16(0x0018)); entryBody.append(Self.u16(0xFFFF)) // depth, pre_defined
+        entryBody.append(configBox)
+        let avc1 = Self.box(entryType, entryBody)
+
+        return Self.trak(trackID: Self.videoTrackID, width: width, height: height, volume: 0,
+                         handler: "vide", handlerName: "VideoHandler",
+                         mediaHeader: Self.fullBox("vmhd", 0, 1, Self.u16(0), Self.u16(0), Self.u16(0), Self.u16(0)),
+                         sampleEntry: avc1)
+    }
+
+    private func audioTrak() -> Data {
+        // Passthrough path: an ac-3 / ec-3 sample entry carrying the
+        // source bitstream's own config, so nothing is re-encoded.
+        if let config = passthroughConfig {
+            return Self.trak(trackID: Self.audioTrackID, width: 0, height: 0, volume: 0x0100,
+                             handler: "soun", handlerName: "SoundHandler",
+                             mediaHeader: Self.fullBox("smhd", 0, 0, Self.u16(0), Self.u16(0)),
+                             sampleEntry: Self.ac3SampleEntry(config))
+        }
+        // Transcode path: the encoder's own AudioSpecificConfig is the
+        // asc, and the track is what the encoder emits (AAC-LC stereo),
+        // not what the source mux carried.
+        let sampleRate: Int
+        let channels: Int
+        let asc: [UInt8]
+        if let transASC = transcodeASC {
+            // AudioToolbox hands back a real AudioSpecificConfig for the
+            // stereo AAC-LC it was configured to produce; that one is
+            // authoritative and is not second-guessed here.
+            asc = transASC
+            sampleRate = transcodeSampleRate
+            channels = 2
+        } else {
+            // AAC passthrough: the ADTS header's three config fields
+            // cannot go into the ASC verbatim (see `sanitizedAACConfig`).
+            let cfg = Self.sanitizedAACConfig(objectType: aacObjectType,
+                                              freqIndex: aacFreqIndex,
+                                              channelConfig: aacChannelConfig)
+            asc = cfg.asc
+            sampleRate = cfg.sampleRate
+            channels = cfg.channels
+        }
+        // ES_Descriptor(3) > DecoderConfig(4) > DecoderSpecificInfo(5) + SLConfig(6).
+        var dsi: [UInt8] = [0x05, UInt8(asc.count)]
+        dsi.append(contentsOf: asc)
+        var dcd = Data(capacity: 32)
+        dcd.append(0x04)
+        dcd.append(UInt8(13 + dsi.count))
+        dcd.append(0x40) // objectTypeIndication: MPEG-4 AAC
+        dcd.append(0x15) // streamType audio, upStream 0, reserved 1
+        dcd.append(Data(count: 3)) // bufferSizeDB
+        dcd.append(Self.u32(0)); dcd.append(Self.u32(0)) // maxBitrate, avgBitrate (unknown)
+        dcd.append(contentsOf: dsi)
+        let slc = Data([0x06, 0x01, 0x02])
+        var es = Data(capacity: 48)
+        es.append(0x03)
+        es.append(UInt8(3 + dcd.count + slc.count))
+        es.append(Self.u16(Self.audioTrackID)) // ES_ID
+        es.append(0) // flags
+        es.append(dcd)
+        es.append(slc)
+        let esds = Self.fullBox("esds", 0, 0, es)
+
+        var mp4aBody = Data(capacity: 64 + esds.count)
+        mp4aBody.append(Data(count: 6)); mp4aBody.append(Self.u16(1)) // reserved, data_reference_index
+        mp4aBody.append(Data(count: 8)) // reserved
+        mp4aBody.append(Self.u16(channels)); mp4aBody.append(Self.u16(16)) // channels, samplesize
+        mp4aBody.append(Self.u32(0)) // pre_defined/reserved
+        mp4aBody.append(Self.fixed16_16(sampleRate)) // 16.16 sample rate
+        mp4aBody.append(esds)
+        let mp4a = Self.box("mp4a", mp4aBody)
+
+        return Self.trak(trackID: Self.audioTrackID, width: 0, height: 0, volume: 0x0100,
+                         handler: "soun", handlerName: "SoundHandler",
+                         mediaHeader: Self.fullBox("smhd", 0, 0, Self.u16(0), Self.u16(0)),
+                         sampleEntry: mp4a)
+    }
+
+    /// `ac-3` (dac3) or `ec-3` (dec3) sample entry for the passthrough
+    /// path. dac3 is ETSI TS 102 366 Annex F.4:
+    /// fscod(2) bsid(5) bsmod(3) acmod(3) lfeon(1) bit_rate_code(5)
+    /// reserved(5). dec3 is F.6 with a single independent substream:
+    /// data_rate(13) num_ind_sub(3) then fscod(2) bsid(5) reserved(1)
+    /// asvc(1) bsmod(3) acmod(3) lfeon(1) reserved(3) num_dep_sub(4)
+    /// reserved(1).
+    private static func ac3SampleEntry(_ c: CastAC3SampleEntryConfig) -> Data {
+        var specific = Data()
+        if c.codec == .eac3 {
+            let rate = max(0, min(0x1FFF, c.dataRateKbps))
+            specific.append(UInt8((rate >> 5) & 0xFF))
+            specific.append(UInt8(((rate & 0x1F) << 3) | 0)) // num_ind_sub = 0 (one substream)
+            specific.append(UInt8((c.fscod << 6) | (c.bsid << 1))) // reserved(1) = 0
+            specific.append(UInt8((0 << 7) | (c.bsmod << 4) | (c.acmod << 1) | c.lfeon)) // asvc = 0
+            specific.append(0) // reserved(3), num_dep_sub(4) = 0, reserved(1)
+        } else {
+            specific.append(UInt8((c.fscod << 6) | (c.bsid << 1) | (c.bsmod >> 2)))
+            // Sendable/type check workaround: compute each of the two
+            // low bytes as a named sub-expression instead of one long
+            // bitwise chain folded inside the append call.
+            let dac3Bits6to0 = ((c.bsmod & 0x03) << 6) | (c.acmod << 3)
+                | (c.lfeon << 2) | ((c.bitRateCode >> 3) & 0x03)
+            specific.append(UInt8(dac3Bits6to0))
+            specific.append(UInt8((c.bitRateCode & 0x07) << 5))
+        }
+        let configBox = box(c.codec == .eac3 ? "dec3" : "dac3", specific)
+        var body = Data(capacity: 64 + configBox.count)
+        body.append(Data(count: 6)); body.append(u16(1)) // reserved, data_reference_index
+        body.append(Data(count: 8)) // reserved
+        body.append(u16(max(1, c.channels))); body.append(u16(16)) // channels, samplesize
+        body.append(u32(0)) // pre_defined/reserved
+        body.append(fixed16_16(c.sampleRate)) // 16.16 sample rate
+        body.append(configBox)
+        return box(c.codec == .eac3 ? "ec-3" : "ac-3", body)
+    }
+
+    private static func trak(trackID: Int, width: Int, height: Int, volume: Int,
+                             handler: String, handlerName: String,
+                             mediaHeader: Data, sampleEntry: Data) -> Data {
+        let tkhd = fullBox(
+            "tkhd", 0, 7, // enabled | in movie | in preview
+            u32(0), u32(0), u32(trackID), u32(0), u32(0), // times, id, reserved, duration
+            u32(0), u32(0), // reserved
+            u16(0), u16(0), u16(volume), u16(0), // layer, alt group, volume, reserved
+            matrix(),
+            u32(width << 16), u32(height << 16))
+        let mdhd = fullBox(
+            "mdhd", 0, 0,
+            u32(0), u32(0), u32(Int(ticksPerSecond)), u32(0),
+            u16(0x55C4), u16(0)) // language "und"
+        let hdlr = fullBox(
+            "hdlr", 0, 0,
+            u32(0), bytes(handler), Data(count: 12),
+            Data(handlerName.utf8), Data(count: 1))
+        let dinf = box("dinf", fullBox("dref", 0, 0, u32(1), fullBox("url ", 0, 1)))
+        let stbl = box(
+            "stbl",
+            fullBox("stsd", 0, 0, u32(1), sampleEntry),
+            fullBox("stts", 0, 0, u32(0)),
+            fullBox("stsc", 0, 0, u32(0)),
+            fullBox("stsz", 0, 0, u32(0), u32(0)),
+            fullBox("stco", 0, 0, u32(0)))
+        let minf = box("minf", mediaHeader, dinf, stbl)
+        let mdia = box("mdia", mdhd, hdlr, minf)
+        return box("trak", tkhd, mdia)
+    }
+
+    private static func trex(_ trackID: Int) -> Data {
+        fullBox("trex", 0, 0, u32(trackID), u32(1), u32(0), u32(0), u32(0x00010000))
+    }
+
+    // MARK: box plumbing
+
+    private static func concat(_ parts: [Data]) -> Data {
+        var out = Data(capacity: parts.reduce(0) { $0 + $1.count })
+        for p in parts { out.append(p) }
+        return out
+    }
+
+    private static func box(_ type: String, _ payload: Data...) -> Data {
+        let size = 8 + payload.reduce(0) { $0 + $1.count }
+        var out = Data(capacity: size)
+        out.append(u32(size))
+        out.append(bytes(type))
+        for p in payload { out.append(p) }
+        return out
+    }
+
+    private static func fullBox(_ type: String, _ version: Int, _ flags: Int, _ payload: Data...) -> Data {
+        var body = Data([UInt8(version),
+                         UInt8((flags >> 16) & 0xFF), UInt8((flags >> 8) & 0xFF), UInt8(flags & 0xFF)])
+        for p in payload { body.append(p) }
+        return box(type, body)
+    }
+
+    private static func bytes(_ s: String) -> Data { Data(s.utf8) }
+
+    private static func u16(_ v: Int) -> Data {
+        Data([UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)])
+    }
+
+    private static func u32(_ v: Int) -> Data {
+        let u = UInt32(truncatingIfNeeded: v)
+        return Data([UInt8((u >> 24) & 0xFF), UInt8((u >> 16) & 0xFF), UInt8((u >> 8) & 0xFF), UInt8(u & 0xFF)])
+    }
+
+    /// 16.16 fixed point. `u32(rate << 16)` silently truncates once the
+    /// rate passes 65535 (96 kHz AAC shifted left by 16 overflows 32
+    /// bits and lands on 30464 Hz), so the integer part is clamped.
+    private static func fixed16_16(_ v: Int) -> Data {
+        u16(max(0, min(0xFFFF, v))) + u16(0)
+    }
+
+    private static func u64(_ v: UInt64) -> Data {
+        u32(Int(truncatingIfNeeded: Int64(bitPattern: v >> 32))) + u32(Int(truncatingIfNeeded: Int64(bitPattern: v & 0xFFFF_FFFF)))
+    }
+
+    private static func findSync(_ buf: [UInt8]) -> Int? {
+        var i = 0
+        let limit = buf.count - 2 * tsPacket - 1
+        while i <= limit {
+            if buf[i] == 0x47, buf[i + tsPacket] == 0x47, buf[i + 2 * tsPacket] == 0x47 {
+                return i
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    // MARK: SPS parsing (dimensions for tkhd/avc1 sizing; level, frame
+    // rate and colour for the video plan and the transcoder)
+
+    struct SPSParseError: Error {}
+
+    static func parseSPSDimensions(_ spsNAL: [UInt8]) throws -> (width: Int, height: Int) {
+        let info = try parseSPSInfo(spsNAL)
+        return (info.width, info.height)
+    }
+
+    /// Strip emulation prevention bytes (00 00 03) from `nal` starting at
+    /// `from` (past the NAL header).
+    static func unescapeRBSP(_ nal: [UInt8], from: Int) -> [UInt8] {
+        var rbsp = [UInt8]()
+        rbsp.reserveCapacity(nal.count)
+        var i = from
+        while i < nal.count {
+            if i + 2 < nal.count, nal[i] == 0, nal[i + 1] == 0, nal[i + 2] == 3 {
+                rbsp.append(0); rbsp.append(0)
+                i += 3
+            } else {
+                rbsp.append(nal[i])
+                i += 1
+            }
+        }
+        return rbsp
+    }
+
+    /// H.264 SPS to the stream facts the video plan needs. The VUI is read
+    /// best effort: a truncated or exotic VUI leaves fps / colour nil
+    /// instead of failing the dimensions.
+    static func parseSPSInfo(_ spsNAL: [UInt8]) throws -> CastVideoStreamInfo {
+        guard spsNAL.count >= 4 else { throw SPSParseError() }
+        var r = BitReader(unescapeRBSP(spsNAL, from: 1))
+        let profileIDC = try r.bits(8)
+        let constraints = try r.bits(8)
+        let levelIDC = try r.bits(8)
+        _ = try r.ue() // seq_parameter_set_id
+        var chromaFormat = 1
+        if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134].contains(profileIDC) {
+            chromaFormat = try r.ue()
+            if chromaFormat == 3 { _ = try r.bits(1) }
+            _ = try r.ue(); _ = try r.ue(); _ = try r.bits(1) // bit depths, qpprime
+            if try r.bits(1) == 1 { // seq_scaling_matrix_present
+                let lists = chromaFormat == 3 ? 12 : 8
+                for l in 0..<lists where try r.bits(1) == 1 {
+                    try skipScalingList(&r, l < 6 ? 16 : 64)
+                }
+            }
+        }
+        _ = try r.ue() // log2_max_frame_num_minus4
+        switch try r.ue() { // pic_order_cnt_type
+        case 0:
+            _ = try r.ue()
+        case 1:
+            _ = try r.bits(1); _ = try r.se(); _ = try r.se()
+            let n = try r.ue()
+            for _ in 0..<n { _ = try r.se() }
+        default:
+            break
+        }
+        _ = try r.ue(); _ = try r.bits(1) // max_num_ref_frames, gaps_allowed
+        let widthMBs = try r.ue() + 1
+        let heightMapUnits = try r.ue() + 1
+        let frameMBsOnly = try r.bits(1)
+        if frameMBsOnly == 0 { _ = try r.bits(1) }
+        _ = try r.bits(1) // direct_8x8
+        var cropL = 0, cropR = 0, cropT = 0, cropB = 0
+        if try r.bits(1) == 1 {
+            cropL = try r.ue(); cropR = try r.ue(); cropT = try r.ue(); cropB = try r.ue()
+        }
+        let cropUnitX = chromaFormat == 0 ? 1 : 2
+        let cropUnitY = (chromaFormat <= 1 ? 2 : 1) * (2 - frameMBsOnly)
+        let width = widthMBs * 16 - (cropL + cropR) * cropUnitX
+        let height = heightMapUnits * 16 * (2 - frameMBsOnly) - (cropT + cropB) * cropUnitY
+        guard width > 0, height > 0, width <= 8192, height <= 8192 else { throw SPSParseError() }
+        var info = CastVideoStreamInfo(width: width, height: height, profileIDC: profileIDC,
+                                      constraintFlags: constraints, levelIDC: levelIDC,
+                                      progressive: frameMBsOnly == 1)
+        try? parseVUI(&r, into: &info)
+        return info
+    }
+
+    private static func parseVUI(_ r: inout BitReader, into info: inout CastVideoStreamInfo) throws {
+        guard try r.bits(1) == 1 else { return } // vui_parameters_present_flag
+        if try r.bits(1) == 1 { // aspect_ratio_info_present_flag
+            if try r.bits(8) == 255 { _ = try r.bits(16); _ = try r.bits(16) } // Extended_SAR
+        }
+        if try r.bits(1) == 1 { _ = try r.bits(1) } // overscan
+        if try r.bits(1) == 1 { // video_signal_type_present_flag
+            _ = try r.bits(3) // video_format
+            info.fullRange = try r.bits(1) == 1
+            if try r.bits(1) == 1 { // colour_description_present_flag
+                info.colourPrimaries = try r.bits(8)
+                info.transferCharacteristics = try r.bits(8)
+                info.matrixCoefficients = try r.bits(8)
+            }
+        }
+        if try r.bits(1) == 1 { _ = try r.ue(); _ = try r.ue() } // chroma_loc_info
+        if try r.bits(1) == 1 { // timing_info_present_flag
+            let unitsInTick = try r.bits(32)
+            let timeScale = try r.bits(32)
+            _ = try r.bits(1) // fixed_frame_rate_flag
+            if unitsInTick > 0, timeScale > 0 {
+                // One frame is two ticks (field-based timing, E.2.1).
+                let fps = Double(timeScale) / Double(2 * unitsInTick)
+                if fps >= 1, fps <= 300 { info.fps = fps }
+            }
+        }
+        let nalHRD = try r.bits(1) == 1
+        if nalHRD { try skipHRD(&r) }
+        let vclHRD = try r.bits(1) == 1
+        if vclHRD { try skipHRD(&r) }
+        if nalHRD || vclHRD { _ = try r.bits(1) } // low_delay_hrd_flag
+        _ = try r.bits(1) // pic_struct_present_flag
+        if try r.bits(1) == 1 { // bitstream_restriction_flag
+            _ = try r.bits(1) // motion_vectors_over_pic_boundaries
+            _ = try r.ue(); _ = try r.ue(); _ = try r.ue(); _ = try r.ue()
+            info.maxNumReorderFrames = try r.ue()
+            _ = try r.ue() // max_dec_frame_buffering
+        }
+    }
+
+    private static func skipHRD(_ r: inout BitReader) throws {
+        let count = try r.ue() + 1 // cpb_cnt_minus1
+        _ = try r.bits(8) // bit_rate_scale, cpb_size_scale
+        for _ in 0..<min(count, 32) {
+            _ = try r.ue(); _ = try r.ue(); _ = try r.bits(1)
+        }
+        _ = try r.bits(20) // four 5-bit length fields
+    }
+
+    private static func skipScalingList(_ r: inout BitReader, _ size: Int) throws {
+        var lastScale = 8
+        var nextScale = 8
+        for _ in 0..<size {
+            if nextScale != 0 { nextScale = (lastScale + (try r.se()) + 256) % 256 }
+            if nextScale != 0 { lastScale = nextScale }
+        }
+    }
+
+    struct BitReader {
+        private let data: [UInt8]
+        private var pos = 0
+
+        init(_ data: [UInt8]) { self.data = data }
+
+        mutating func bits(_ n: Int) throws -> Int {
+            var v = 0
+            for _ in 0..<n {
+                let byteIndex = pos >> 3
+                guard byteIndex < data.count else { throw SPSParseError() }
+                v = (v << 1) | ((Int(data[byteIndex]) >> (7 - (pos & 7))) & 1)
+                pos += 1
+            }
+            return v
+        }
+
+        mutating func ue() throws -> Int {
+            var zeros = 0
+            while try bits(1) == 0, zeros < 32 { zeros += 1 }
+            return (1 << zeros) - 1 + (zeros > 0 ? try bits(zeros) : 0)
+        }
+
+        mutating func se() throws -> Int {
+            let k = try ue()
+            return k % 2 == 0 ? -(k / 2) : (k + 1) / 2
+        }
+    }
+}

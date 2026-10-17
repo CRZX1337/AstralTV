@@ -1,0 +1,216 @@
+import Foundation
+import Combine
+
+/// tvOS group-selection surface for the live guide. Mutually exclusive with the
+/// top group-pills row: sidebar mode hides the pills and arms short-Left on the
+/// now-airing cell to open the docked group sidebar.
+enum GroupSelectorMode: String {
+    case pills
+    case sidebar
+}
+
+/// How the guide's group sidebar sits beside the grid (Sidebar Menu mode only).
+/// `overlay` (default) covers the channel column under a scrim; `shift` moves
+/// the guide grid right by the pane's width so nothing is covered.
+enum GuideSidebarLayout: String, CaseIterable {
+    case overlay
+    case shift
+
+    var label: String {
+        switch self {
+        case .overlay: return "Overlay"
+        case .shift:   return "Shift guide"
+        }
+    }
+}
+
+/// Owns the TV remote-control mapping + the two companion TV guide prefs
+/// (group-selection surface, tune-in destination). Singleton `ObservableObject`
+/// so SwiftUI views observe the effective map and re-derive hints live.
+///
+/// Persistence: four per-device-type keys synced across the user's Apple TVs
+/// (registered in `SyncManager` sync lists):
+///   - `remoteControlMap.tv`  (Data, JSON)      -> `syncDataKeys`
+///   - `guideGroupSelector.tv` (String)         -> `syncStringKeys`
+///   - `guideSidebarLayout.tv` (String)         -> `syncStringKeys`
+///   - `guideTuneInMini.tv`   (Bool)            -> `syncBoolKeys`
+/// Writing to `UserDefaults.standard` triggers `SyncManager`'s debounced push
+/// automatically; a remote merge posts `.syncManagerDidApplyPreferences`, which
+/// this store observes to reload.
+@MainActor
+final class RemoteControlStore: ObservableObject {
+    static let shared = RemoteControlStore()
+
+    // nonisolated so SyncManager (and any non-main-actor context) can read the
+    // key names when building its sync-key lists.
+    nonisolated static let mapKey = "remoteControlMap.tv"
+    nonisolated static let groupSelectorKey = "guideGroupSelector.tv"
+    nonisolated static let sidebarLayoutKey = "guideSidebarLayout.tv"
+    nonisolated static let tuneInMiniKey = "guideTuneInMini.tv"
+    /// GH #94: Player > Skip Without Controls (tvOS, default Off). With the
+    /// chrome hidden, short Left/Right run the Skip Back / Skip Forward
+    /// intervals instead of opening the timeline. A custom remote map that
+    /// assigns those slots still wins.
+    nonisolated static let skipWithoutControlsKey = "player.skipWithoutControls"
+
+    /// One-time seed of the tvOS group selector (Logan 2026-09-18): NEW
+    /// installs default to Sidebar Menu, everyone who already had the app
+    /// stays on pills.
+    ///
+    /// `guideGroupSelector.tv` used to be a soft default: unset fell back to
+    /// `.pills` at every read, so flipping that fallback would have moved
+    /// existing users. Instead this writes the key ONCE, at launch, and the
+    /// fallback never decides anything again.
+    ///
+    /// Fresh install is the conjunction of four signals, all of which an
+    /// upgrade would fail:
+    ///   1. `guideGroupSelector.tv` is unset (the user never chose, and no
+    ///      iCloud pull has landed a choice yet);
+    ///   2. `whatsNew.lastSeenVersion` is unset - the same marker
+    ///      `WhatsNewStore` uses to know a previous version ran here;
+    ///   3. `hasCompletedOnboarding` is false;
+    ///   4. SwiftData holds no playlists at all (the caller counts both
+    ///      `ServerConnection` and `M3UPlaylist`).
+    ///
+    /// The write goes straight to `UserDefaults`, never through the
+    /// `@Published` setters, so the seed never pushes to iCloud. A value that
+    /// arrives from iCloud later simply wins through the normal merge, and a
+    /// pull that already landed makes signal 1 false, so the seed is skipped
+    /// entirely.
+    ///
+    /// Must run BEFORE anything touches `RemoteControlStore.shared`; the app
+    /// calls it from `AstralApp.init`.
+
+    /// The effective remote-control map (resolved through DEFAULT for any
+    /// unset slot).
+    @Published private(set) var map: RemoteControlMap
+
+    /// `true` = docked group sidebar (short-Left), `false` = top group pills.
+    @Published var useGroupSidebar: Bool {
+        didSet {
+            guard oldValue != useGroupSidebar else { return }
+            UserDefaults.standard.set((useGroupSidebar ? GroupSelectorMode.sidebar : .pills).rawValue,
+                                      forKey: Self.groupSelectorKey)
+            // Push at once (as FavoritesStore does): a synced key written only
+            // locally could be handed back its old value by the next pull, so
+            // the first change looked like it never applied (Logan 2026-09-05).
+            SyncManager.shared.pushPreferencesImmediate()
+        }
+    }
+
+    /// Sidebar layout for the guide's group sidebar (Manage Groups, Logan
+    /// 2026-09-14). Only meaningful while `useGroupSidebar` is on.
+    @Published var guideSidebarLayout: GuideSidebarLayout {
+        didSet {
+            guard oldValue != guideSidebarLayout else { return }
+            UserDefaults.standard.set(guideSidebarLayout.rawValue, forKey: Self.sidebarLayoutKey)
+            SyncManager.shared.pushPreferencesImmediate()
+        }
+    }
+
+    /// `true` = tune live channels into the corner mini player first;
+    /// `false` (default) = straight to fullscreen.
+    @Published var tuneInMini: Bool {
+        didSet {
+            guard oldValue != tuneInMini else { return }
+            UserDefaults.standard.set(tuneInMini, forKey: Self.tuneInMiniKey)
+            SyncManager.shared.pushPreferencesImmediate()
+        }
+    }
+
+    private var cancellable: AnyCancellable?
+
+    private init() {
+        let ud = UserDefaults.standard
+        map = RemoteControlMap.fromData(ud.data(forKey: Self.mapKey))
+        let selector = GroupSelectorMode(rawValue: ud.string(forKey: Self.groupSelectorKey) ?? "") ?? .pills
+        useGroupSidebar = (selector == .sidebar)
+        guideSidebarLayout = GuideSidebarLayout(rawValue: ud.string(forKey: Self.sidebarLayoutKey) ?? "") ?? .overlay
+        tuneInMini = ud.bool(forKey: Self.tuneInMiniKey)
+
+        // Reload after a remote sync merge writes fresh values into UserDefaults.
+        cancellable = NotificationCenter.default.publisher(for: .syncManagerDidApplyPreferences)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.reloadFromDefaults() }
+            }
+    }
+
+    private func reloadFromDefaults() {
+        let ud = UserDefaults.standard
+        let newMap = RemoteControlMap.fromData(ud.data(forKey: Self.mapKey))
+        if newMap != map {
+            debugLog("[PRESS] remote map replaced by iCloud sync: guide channelDown=\(newMap.guideAction(.channelDown).wire) (was \(map.guideAction(.channelDown).wire))")
+            map = newMap
+        }
+        let selector = GroupSelectorMode(rawValue: ud.string(forKey: Self.groupSelectorKey) ?? "") ?? .pills
+        let sidebar = (selector == .sidebar)
+        if sidebar != useGroupSidebar { useGroupSidebar = sidebar }
+        let layout = GuideSidebarLayout(rawValue: ud.string(forKey: Self.sidebarLayoutKey) ?? "") ?? .overlay
+        if layout != guideSidebarLayout { guideSidebarLayout = layout }
+        let mini = ud.bool(forKey: Self.tuneInMiniKey)
+        if mini != tuneInMini { tuneInMini = mini }
+    }
+
+    // MARK: Resolvers
+
+    func playerAction(_ slot: RemoteSlot) -> PlayerRemoteAction { map.playerAction(slot) }
+    func guideAction(_ slot: RemoteSlot) -> GuideRemoteAction { map.guideAction(slot) }
+    /// The guide action a press runs right now (Group Selection aware). The
+    /// press paths, the settings rows and the hint strip all read this.
+    func effectiveGuideAction(_ slot: RemoteSlot) -> GuideRemoteAction {
+        map.effectiveGuideAction(slot, useGroupSidebar: useGroupSidebar)
+    }
+
+    // MARK: Editing (pins preset = custom)
+
+    /// Materialize every slot DEFAULT defines, resolved through the current map,
+    /// so a CUSTOM blob is fully explicit (no accidental fallbacks after later
+    /// scheme changes).
+    private func materializedPlayer() -> [RemoteSlot: PlayerRemoteAction] {
+        var out: [RemoteSlot: PlayerRemoteAction] = [:]
+        for slot in RemoteControlMap.default.player.keys { out[slot] = map.playerAction(slot) }
+        return out
+    }
+
+    private func materializedGuide() -> [RemoteSlot: GuideRemoteAction] {
+        var out: [RemoteSlot: GuideRemoteAction] = [:]
+        for slot in RemoteControlMap.default.guide.keys { out[slot] = map.guideAction(slot) }
+        return out
+    }
+
+    func setPlayerAction(_ slot: RemoteSlot, _ action: PlayerRemoteAction) {
+        // Back is mappable in the GUIDE only; the player's Back stays fixed.
+        guard slot != .backShort else { return }
+        var player = materializedPlayer()
+        player[slot] = action
+        commit(RemoteControlMap(preset: .custom, player: player, guide: materializedGuide()))
+    }
+
+    func setGuideAction(_ slot: RemoteSlot, _ action: GuideRemoteAction) {
+        // The ladder is Back's own built-in behavior; no other press runs it.
+        if action == .backLadder, slot != .backShort { return }
+        // One press, one action: the dictionary write REPLACES whatever this
+        // press held, so a press can never carry two actions.
+        var guide = materializedGuide()
+        guide[slot] = action
+        commit(RemoteControlMap(preset: .custom, player: materializedPlayer(), guide: guide))
+    }
+
+    func resetToDefault() {
+        commit(.default)
+    }
+
+    private func commit(_ newMap: RemoteControlMap) {
+        map = newMap
+        // preset=default persists as an empty-slot marker so a fresh install /
+        // older client resolves to the shipped scheme; CUSTOM persists the full
+        // materialized blob.
+        UserDefaults.standard.set(newMap.toData(), forKey: Self.mapKey)
+        debugLog("[PRESS] remote map saved: preset=\(newMap.preset.wire) guide channelUp=\(newMap.guideAction(.channelUp).wire) channelDown=\(newMap.guideAction(.channelDown).wire)")
+        // Push at once, like the other synced keys here: written only
+        // locally, the next iCloud pull can hand back the old map before
+        // the debounced push runs, and the edit looks like it never applied.
+        SyncManager.shared.pushPreferencesImmediate()
+    }
+}

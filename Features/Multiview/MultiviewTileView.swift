@@ -1,0 +1,1970 @@
+import SwiftUI
+import Combine
+#if canImport(UIKit)
+import UIKit
+import UniformTypeIdentifiers
+#endif
+
+/// One tile in the multiview grid.
+///
+/// Responsibilities:
+/// - Host an `MPVPlayerViewRepresentable` parameterised with the
+///   tile's identity, audio-focus state, and pause state.
+/// - Draw the focus ring + audio-active badge + channel label.
+/// - Handle tap-to-take-audio.
+/// - Handle long-press → `.confirmationDialog` with per-tile actions
+///   (Remove / Make Audio / Full-Screen / Audio Track / Subtitle
+///   Track / Move Tile, tvOS only).
+/// - Surface decode errors via a red overlay with a Remove button.
+/// - Act as a drag source + drop target on iPadOS for rearrange.
+/// - Announce state to VoiceOver via `.accessibilityLabel`.
+///
+/// Non-responsibilities (container's job):
+/// - Layout / positioning (handled by `MultiviewLayoutView`).
+/// - tvOS relocate-mode D-pad remap (handled by
+///   `MultiviewContainerView.onMoveCommand`).
+/// - Add-sheet + exit wiring (handled by `MultiviewTransportBar`).
+struct MultiviewTileView: View {
+    let tile: MultiviewTile
+    @ObservedObject var store: MultiviewStore
+
+    /// `true` when this tile is the only one on-screen (N=1 case).
+    /// At N=1 the tile is effectively "the player view" so per-tile
+    /// corner chrome (audio badge, bottom label strip, close `×`)
+    /// is redundant, the container-level `PlaybackChromeOverlay`
+    /// renders title + Close at the top bar instead. Gating the
+    /// three chrome pieces on `!isSoleTile` keeps the N=1 experience
+    /// clean and matches the ported PlayerView chrome layout.
+    ///
+    /// Default `false` preserves existing behaviour when this view
+    /// is constructed without the parameter (the current
+    /// `MultiviewContainerView` call sites that don't yet pass it).
+    var isSoleTile: Bool = false
+
+    /// Drives the 5-second auto-fade of tile chrome (audio badge +
+    /// label strip). Owned by `MultiviewContainerView`; injected
+    /// here so the tile's per-platform bodies can read `isVisible`
+    /// and call `reportInteraction()` on Button taps / Select
+    /// presses to keep the chrome alive while the user is active.
+    @EnvironmentObject private var chromeState: MultiviewChromeState
+
+    /// Observed so the tvOS tile can drop its focusability when the
+    /// single-stream player has been minimized to the corner. A
+    /// SwiftUI `Button` is always focusable by default on tvOS,
+    /// even with `.allowsHitTesting(false)` on an ancestor, the
+    /// focus engine still considers the Button as a target, which
+    /// would trap focus inside the 400×225 corner instead of letting
+    /// it flow to the guide behind. Reading `nowPlaying.isMinimized`
+    /// here lets the Button flip to `.focusable(false)` (see
+    /// `tvOSBody`) so the focus engine naturally reassigns to
+    /// something in the guide.
+
+    /// A per-tile progress store. `@StateObject` so SwiftUI keeps it
+    /// alive across tile re-renders and a new one is built for each
+    /// new tile identity. Holds the tile's audio/subtitle track
+    /// list, current mpv progress, and the `togglePauseAction`
+    /// callback. Non-audio tiles still decode, so this store keeps
+    /// tracking even while muted.
+    /// Ownership only. `PlayerTileStores` publishes NOTHING, so
+    /// `@StateObject` here keeps the per-tile stores alive across
+    /// re-renders (and builds a fresh pair per tile identity) WITHOUT
+    /// subscribing this view to their change streams.
+    ///
+    /// This indirection is the fix for the runaway tvOS context menu
+    /// (field trace 2026-09-13): observing `PlayerProgressStore`
+    /// directly re-evaluated the whole tile body twice a second (the
+    /// driver's 0.5s `currentMs` pump), and each re-evaluation rebuilt
+    /// the `.contextMenu` attachment. With the menu OPEN, UIKit tore
+    /// down and re-created the menu cells on that same half-second
+    /// beat: a focus update per rebuild and ~2 leaked layers per
+    /// second, until Menu dismissed it. The tile now re-renders only
+    /// when a value it actually draws changes (see the mirrors below).
+    @StateObject private var stores = PlayerTileStores()
+
+    private var progressStore: PlayerProgressStore { stores.progress }
+
+    /// Per-tile attempt log, mpv events, failover attempts. Purely
+    /// diagnostic; nothing user-visible.
+    private var logStore: AttemptLogStore { stores.log }
+
+    // MARK: - Selective mirrors of `progressStore`
+    //
+    // The tile does NOT observe `progressStore` (its 0.5s `currentMs`
+    // pump would rebuild the open context menu twice a second). The few
+    // low-frequency values the BODY draws are mirrored on `stores`,
+    // whose Combine subscriptions are wired ONCE in its init.
+    //
+    // These mirrors must never be `@State` fed by publishers built in
+    // `body`: `store.$x.removeDuplicates()` is a fresh, non-comparable
+    // publisher value on every body evaluation, so SwiftUI resubscribes
+    // on every update and `@Published` replays its current value into
+    // the handler. With the handler writing state the body reads, that
+    // is an unbounded update cycle - the tvOS Multiview lockup on the
+    // second tile (field trace 2026-09-13 17:14:30, main thread pinned
+    // in `GraphHost.flushTransactions` until force quit; it needed two
+    // tiles only because `menuRevision` was read exclusively inside
+    // `if !isSoleTile`, so at N=1 nothing depended on it).
+
+    /// Mirrors `progressStore.reachedEOF` (VOD "Finished" overlay).
+    private var eofReached: Bool { stores.eofReached }
+    /// Mirrors `progressStore.liveResumeNotice` (GH #70 top notice).
+    private var liveResumeNotice: String? { stores.liveResumeNotice }
+
+    /// iPadOS: focus state driven by `TVPressOverlay`'s UIKit focus
+    /// callback. Unused on tvOS after the Button/ButtonStyle rewrite
+    /// there, focus is driven by `@Environment(\.isFocused)`
+    /// inside `MultiviewTileButtonStyle`.
+    @State private var isFocused: Bool = false
+
+    /// Whether the confirmation dialog (per-tile action menu) is
+    /// currently showing. iPadOS only, tvOS uses `.contextMenu`
+    /// (native long-press menu) which manages its own presentation.
+    @State private var showMenu: Bool = false
+
+    /// Non-nil when the underlying mpv coordinator reported a fatal
+    /// decode error. Drives the playback-error overlay. Its Remove
+    /// button calls `store.remove(id:)`, which takes the tile out of
+    /// the grid entirely.
+    @State private var decodeErrorMessage: String? = nil
+    /// "Recording Ending" prompt (.dvr tiles only): raised when the
+    /// scheduled end is imminent AND the viewer is at the live edge (a
+    /// viewer 20 minutes behind keeps watching undisturbed - the
+    /// finalize migration serves them silently). One-shot per tile.
+    @State private var dvrEndPromptVisible = false
+    @State private var dvrEndPromptDismissed = false
+    /// Auto-reconnect state for the playback-error overlay. Each fatal
+    /// error schedules a retry through the coordinator's
+    /// `progressStore.retryAction` on an escalating delay (5s doubling
+    /// to a 30s cap); `onRecovered` clears everything the moment a
+    /// retry reaches steady playback.
+    @State private var reconnectAttempt = 0
+    @State private var reconnectCountdown = 0
+    @State private var isReconnecting = false
+    @State private var autoReconnectTask: Task<Void, Never>? = nil
+    /// True while THIS tile's error card was raised by the pre-terminal
+    /// stall signal (`progressStore.streamStalled`) rather than a real
+    /// terminal `onFatalError`. Tracked so that when frames resume
+    /// (streamStalled -> false) we only tear down a soft card, never a
+    /// live terminal-error reconnect loop, which owns its own teardown via
+    /// `onRecovered`. Cleared the moment a real fatal error upgrades it.
+    @State private var softStall = false
+    /// Backstop for a soft stall that neither recovers nor produces a terminal
+    /// error (a silent frame-stop with healthy network, e.g. Auto-Recover off).
+    /// After a grace period it actively drives `retryAction` so "Reconnecting…"
+    /// is truthful: the stream either re-primes (frames resume -> soft card
+    /// clears) or the re-tune surfaces a real error (-> onFatalError upgrades to
+    /// the terminal card). Either way the soft card can never lie forever.
+    @State private var softStallEscalationTask: Task<Void, Never>? = nil
+
+
+    /// Stacked confirmation-dialog flags for the per-tile track
+    /// sub-menus. SwiftUI doesn't support nested `.confirmationDialog`
+    /// directly; the pattern is to tap a button in the main menu that
+    /// dismisses it + sets one of these, which triggers a fresh
+    /// dialog on the next render.
+    @State private var showAudioTrackMenu: Bool = false
+    @State private var showSubtitleTrackMenu: Bool = false
+    /// Task #184: Audio Sync stepper dialog (confirmationDialog is the
+    /// codebase's reliable tvOS shape; a tap dismisses, and reopening
+    /// shows the updated offset in the title).
+    @State private var showAudioSyncMenu: Bool = false
+    /// iPhone / iPad: the tile menu's "Layout..." opens this dialog (the
+    /// chrome's Add and Layout buttons were removed; the tile menu is
+    /// their one home, Android parity 2026-10-11).
+    @State private var showLayoutMenu: Bool = false
+    // Issue #48: the global multiview layout mode, shared with the container's
+    // binding through the same @AppStorage key. Surfaced as a "Layout" submenu
+    // in the per-tile long-press menu (the reachable multiview surface, the
+    // single-player Options panel that also hosts it never appears here).
+    @AppStorage(MultiviewLayoutMode.storageKey) private var layoutMode: MultiviewLayoutMode = .auto
+
+    // MARK: - User-configurable multiview appearance (Settings → Multiview)
+    //
+    // v1.6.8: three @AppStorage-backed prefs control the tile's
+    // visual treatment. Defaults preserve pre-v1.6.8 behaviour
+    // (centerIcon focus indicator, no padding, square corners).
+
+    /// Audio-focus indicator style, center icon (default), gray
+    /// persistent stroke, or accent fading stroke.
+    @AppStorage(MultiviewAudioFocusStyle.storageKey)
+    private var audioFocusStyleRaw: String = MultiviewAudioFocusStyle.centerIcon.rawValue
+
+    /// `true` when the user wants 12pt rounded tile corners.
+    @AppStorage(multiviewTileCornersRoundedKey)
+    private var cornersRounded: Bool = false
+
+    /// Resolved focus style (with fallback to `.centerIcon` for any
+    /// future-or-corrupted raw values).
+    private var audioFocusStyle: MultiviewAudioFocusStyle {
+        MultiviewAudioFocusStyle(rawValue: audioFocusStyleRaw) ?? .centerIcon
+    }
+
+    /// Tile corner radius driven by the user's preference. 0pt
+    /// (square) is the legacy default; 12pt (rounded) softens the
+    /// edges so the grid reads as a stack of cards rather than a
+    /// continuous mosaic.
+    private var tileCornerRadius: CGFloat { cornersRounded ? 12 : 0 }
+
+    /// Tile shape, recomputed per render off the user's preference
+    /// rather than a `static let` constant so toggling "Rounded
+    /// Tiles" in Settings updates a live multiview session without
+    /// requiring a re-mount.
+    private var tileShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: tileCornerRadius, style: .continuous)
+    }
+
+    var isAudioActive: Bool { store.audioTileID == tile.id }
+
+    /// Engine for this tile = the SESSION's locked engine (resolved once
+    /// at multiview entry), never a per-tile decision. So every tile in a
+    /// session uses the same engine; a session can never silently go
+    /// half-mpv. VOD/DVR carve-out stays (proxy redirects, MKV, resume).
+    /// Toggle-off sessions lock to .mpv, so this is always false then.
+    private var usesAVPlayerEngine: Bool {
+        // Live, VOD, and in-progress DVR ride the AVPlayer engine when
+        // the session locked to it (DVR-window driver mode, 2026-08-27);
+        // catchup stays mpv until its port lands. This guard MUST match
+        // the kinds beginVOD/enterMultiview can lock AVPlayer for - the
+        // first DVR field test mounted mpv here despite the lock, with
+        // no from-start hint at all (the sentinel header is stripped on
+        // the container path), so playback landed at the live edge.
+        // Catch-up included since 2026-08-28: seedCatchup locks the
+        // AVPlayer engine only in the no-mpv regime, so this reduces to
+        // "whatever the session locked".
+        return store.sessionEngine.isAVPlayer
+    }
+
+    /// Precise engine label for the dev-only chrome badge, so a tester can
+    /// tell WHICH pipeline is actually playing: native direct HLS vs the
+    /// on-device TS->HLS remux vs mpv. Reads the session-locked engine, which
+    /// a mid-session HEVC fallback downgrades to .mpv, so it reflects reality.
+    private var engineBadgeLabel: String {
+        // Same guard as usesAVPlayerEngine - a VOD tile riding AVPlayer
+        // must not report "mpv" (field find: Speak No Evil badge).
+
+        switch store.sessionEngine {
+        case .avPlayerDirectHLS: return "AVPlayer · Direct HLS"
+        case .avPlayerRemuxTS:   return "AVPlayer · Remux TS"
+        default:                 return "mpv"
+        }
+    }
+
+    /// The URL the AVPlayer tile plays. The seed tile uses the locked
+    /// upgraded URL (server-side TS->HLS); added tiles already carry their
+    /// upgraded URL on tile.streamURL (MultiviewStore.add does the upgrade
+    /// at add-time under a direct-HLS lock), so this falls through.
+    private var avPlayerTileURL: URL {
+        // By tile id, not grid position: Move Tile must not re-tune.
+        if let routeURL = store.routeURL(for: tile) {
+            return routeURL
+        }
+        // A composite session relocked from direct HLS to the remux path
+        // (PlayerSession.playMultiviewComposite): tiles staged under the
+        // direct-HLS lock carry the HLS upgrade, the remux arm wants TS.
+        if store.sessionEngine == .avPlayerRemuxTS, tile.kind == .live,
+           URLComponents(url: tile.streamURL, resolvingAgainstBaseURL: false)?
+               .queryItems?.contains(where: { $0.name == "output_format" && $0.value == "hls" }) == true {
+            return removingHLSOutputFormat(tile.streamURL)
+        }
+        return tile.streamURL
+    }
+
+    /// Headers for the AVPlayer tile. The Dispatcharr HLS endpoint needs
+    /// the `Authorization: ApiKey` header that a server's lean authHeaders
+    /// (X-API-Key only) omits, so AVPlayer tiles use the resolveEngine
+    /// headers carried on the session lock. Falls back to tile.headers if
+    /// the lock somehow carries none.
+    private var avPlayerTileHeaders: [String: String] {
+        store.sessionHeaders.isEmpty ? tile.headers : store.sessionHeaders
+    }
+
+    /// Computed: a tile should freeze its mpv decode when:
+    /// - PiP is currently active AND this is NOT the audio tile
+    ///   (PiP-source tile keeps decoding; others pause for
+    ///   CPU/GPU/network savings).
+    /// - OR the channel-picker sheet is open (`isPickerPresented`)
+    ///   AND this is NOT the audio tile. The user wants to keep
+    ///   watching and hearing the focused stream while adding another,
+    ///   so the audio tile keeps decoding; the non-audio tiles still
+    ///   pause so the picker's channel-list image loads keep their
+    ///   videotoolbox / IOSurface headroom on Apple TV 4K (the
+    ///   original pause-all was added after jetsam kills at ~1.8 GB RSS
+    ///   with the picker open over a playing tile). On tvOS the picker
+    ///   is a fullScreenCover, so the paused non-audio tiles are hidden
+    ///   behind it anyway; only the audio tile's sound is perceptible.
+    private var shouldPause: Bool {
+        if store.isPickerPresented { return !isAudioActive }
+        // Fullscreen-within-grid mode: the promoted tile keeps
+        // decoding; every OTHER tile freezes. This is the
+        // double-click-Select UX (tvOS), user zooms into one
+        // stream, the rest pause until Menu is pressed. Saves
+        // GPU decode + network cost for 1-3 background tiles
+        // while the user is focused on one.
+        if let fullID = store.fullscreenTileID, fullID != tile.id {
+            return true
+        }
+        return store.isPiPActive && !isAudioActive
+    }
+
+    /// For VOD / DVR tiles, seed the per-tile progress store with the
+    /// VOD identity so the shared player coordinator resumes from the
+    /// saved position and saves WatchProgress every 10s, mirroring
+    /// `PlayerView.startPlayback`. No-op for live tiles. Called from
+    /// onAppear and `.task(id:)`, which both run before the file's first
+    /// MPV_EVENT_PLAYBACK_RESTART (when the coordinator reads the resume
+    /// position), so the values are in place in time.
+    private func applyVODIdentityToProgressStore() {
+        guard tile.kind != .live else { return }
+        progressStore.vodID = tile.vodID
+        progressStore.vodTitle = tile.item.name
+        progressStore.vodPosterURL = tile.item.logoURL?.absoluteString
+        progressStore.vodStreamURL = tile.streamURL.absoluteString
+        progressStore.vodServerID = tile.vodServerID
+        progressStore.vodType = tile.vodType
+        progressStore.explicitResumeMs = tile.resumePositionMs
+        progressStore.isDVRWindow = (tile.kind == .dvr)
+    }
+
+    /// Phase 2: when a VOD tile reaches the end of its file it stops
+    /// producing audio. If it happened to be the audio tile, move audio
+    /// to another tile so sound continues elsewhere, mirroring the
+    /// auto-promote logic in `MultiviewStore.remove(id:)` ("newest
+    /// remaining gets audio"). No-op if this isn't the audio tile or if
+    /// there's no other tile to hand off to (then audio stays put). Runs
+    /// the moment EOF is detected, before the user taps Replay/Remove.
+    private func reassignAudioIfFinishedTileWasAudio() {
+        guard store.audioTileID == tile.id else { return }
+        // Newest remaining tile that isn't this one (last in the list),
+        // matching `remove(id:)`'s "last-added gets audio" rule.
+        guard let next = store.tiles.last(where: { $0.id != tile.id }) else {
+            // No other tile, leave audio as-is.
+            return
+        }
+        store.setAudio(to: next.id)
+        DebugLogger.shared.log(
+            "[MV-Focus] audio auto-promoted on VOD finish: newAudio=\(next.id) finished=\(tile.id)",
+            category: "Playback", level: .info
+        )
+    }
+
+    var body: some View {
+        iPadOSBody
+    }
+
+    // MARK: - tvOS body (Button + ButtonStyle + contextMenu)
+
+    /// GH Android#125: per-tile Switch Stream shows only for a Dispatcharr
+    /// channel on an admin account (`dispatcharrCanSwitchStream`, which
+    /// fails closed while the level is unknown). Hidden otherwise.
+    private var canSwitchTileStream: Bool {
+        guard tile.item.dispatcharrChannelID != nil,
+              let uuid = tile.item.uuid, !uuid.isEmpty else { return false }
+        return ChannelStore.shared.activeServer?.dispatcharrCanSwitchStream ?? false
+    }
+
+
+    // MARK: - iPadOS body (unchanged behavior)
+
+    @ViewBuilder
+    private var iPadOSBody: some View {
+        tileContent
+            .contentShape(Rectangle())
+            // Video Scale: pinch out for Fill, pinch in for Fit. The
+            // modifier itself no-ops while this tile shares the screen
+            // with others (Fill is solo only).
+            .videoScalePinch(progressStore)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(a11yLabel)
+            .confirmationDialog(
+                Text(verbatim: tile.item.name),
+                isPresented: $showMenu,
+                titleVisibility: .visible
+            ) {
+                menuButtons
+            }
+            .confirmationDialog(
+                "Audio Track",
+                isPresented: $showAudioTrackMenu,
+                titleVisibility: .visible
+            ) {
+                audioTrackButtons
+            }
+            .confirmationDialog(
+                "Subtitle Track",
+                isPresented: $showSubtitleTrackMenu,
+                titleVisibility: .visible
+            ) {
+                subtitleTrackButtons
+            }
+            .confirmationDialog(
+                "Layout",
+                isPresented: $showLayoutMenu,
+                titleVisibility: .visible
+            ) {
+                layoutButtons_iOS
+            }
+            .confirmationDialog(
+                audioSyncDialogTitle,
+                isPresented: $showAudioSyncMenu,
+                titleVisibility: .visible
+            ) {
+                audioSyncButtons
+            }
+            // Phase 2: VOD "Finished" overlay layered OUTSIDE
+            // `tappableRegion` (so its Replay / Remove buttons receive
+            // taps instead of being swallowed by the tile's
+            // `.onTapGesture`). Gated to `.vod` so live / DVR tiles
+            // never show it.
+            .overlay {
+                if tile.kind == .vod, eofReached {
+                    finishedOverlay
+                }
+            }
+
+            // .dvr: proactive "Recording Ending" choice as a SYSTEM dialog.
+            // The custom sibling-overlay card rendered fine but its buttons
+            // could never take Siri-remote focus - the solo player's focus
+            // model owns the remote (screen recording, 2026-08-27), the same
+            // trap that stripped the error card's tvOS buttons. The system
+            // confirmationDialog brings its own focus handling, like every
+            // recordings menu already does.
+            .confirmationDialog(
+                "Recording Ending",
+                isPresented: $dvrEndPromptVisible,
+                titleVisibility: .visible
+            ) {
+                Button {
+                    dvrEndPromptDismissed = true
+                    dvrEndContinueOnLive()
+                } label: {
+                    Label("Continue on Live TV", systemImage: "play.tv")
+                }
+                Button {
+                    dvrEndPromptDismissed = true
+                    DebugLogger.shared.log(
+                        "[MV-Cmd] DVR ending dialog: back to DVR tile=\(tile.id)",
+                        category: "Playback", level: .info)
+                    store.saveVODProgressNow()
+                    PlayerSession.shared.exit()
+                } label: {
+                    Label("Back to DVR", systemImage: "arrow.backward.circle")
+                }
+                Button("Keep Watching", role: .cancel) {
+                    dvrEndPromptDismissed = true
+                }
+            } message: {
+                Text("This recording is about to reach its scheduled end.")
+            }
+            // Clock source: the driver's 0.5s currentMs pump (a per-init
+            // Timer.publish never fires here - the 0.5s re-render replaces
+            // it before its first tick; field find 2026-08-27).
+            .onReceive(progressStore.$currentMs) { _ in checkDVREndApproaching() }
+            // Playback-error overlay, also OUTSIDE `tappableRegion` so
+            // its Retry / Remove buttons receive taps directly.
+            .overlay {
+                if let decodeErrorMessage {
+                    playbackErrorOverlay(decodeErrorMessage)
+                }
+            }
+            // Connection-limit / stream-ended notice: static, Retry only.
+            .overlay {
+                if let notice = stores.liveStopNotice {
+                    liveStopNoticeOverlay(notice)
+                }
+            }
+            .onChange(of: stores.liveStopNotice) { _, notice in
+                handleLiveStopNoticeChange(notice)
+            }
+            // Hand audio off the instant a VOD tile finishes (mirrors
+            // the tvOS body). No-op unless this was the audio tile.
+            .onChange(of: stores.eofReached) { _, nowEOF in
+                if nowEOF, tile.kind == .vod {
+                    reassignAudioIfFinishedTileWasAudio()
+                }
+            }
+            // Pre-terminal stall -> soft "Reconnecting…" card (mirrors the
+            // tvOS body); here the card's own Retry button is the affordance.
+            .onChange(of: stores.streamStalled) { _, nowStalled in
+                handleStreamStall(nowStalled)
+            }
+    }
+
+    // MARK: - iPadOS content
+
+    /// iPadOS tile layout. The corner close `×` was removed per
+    /// user feedback, the button was visually noisy and the same
+    /// Remove action lives in the long-press context menu (see
+    /// `menuButtons` → "Remove stream"). Closing a tile is
+    /// intentional enough to warrant the long-press gesture; a
+    /// one-tap X made it too easy to accidentally dismiss streams
+    /// during audio-focus taps.
+    @ViewBuilder
+    private var tileContent: some View {
+        if isSoleTile {
+            // N=1 short-circuit. The sole tile IS the player view,
+            // clipShape / scaleEffect / hoverEffect / per-tile
+            // animations exist only to distinguish tiles in a
+            // multiview grid, and wrapping the auto-PiP source
+            // `AVSampleBufferDisplayLayer` in a clipped + animated
+            // transform stack was making iOS's PiP restore
+            // animation read a stale / animated target rect and
+            // fall back to its default "zoom + PiP-icon placeholder"
+            // transition. Legacy `PlayerView` mounts the same
+            // representable directly inside a plain ZStack (no
+            // clip, no scale, no animation) and iOS's restore
+            // animation lands cleanly there, we match that.
+            //
+            // The black background underlay is kept so letterboxed
+            // streams don't render over whatever's behind them.
+            ZStack {
+                tappableRegion
+            }
+            .background(Color.black)
+        } else {
+            ZStack {
+                tappableRegion
+            }
+            .overlay(
+                // Relocate-amber ring and audio stroke trace the fitted
+                // video rect, not the slot (letterboxed panes).
+                MultiviewVideoRect(tileID: tile.id) {
+                    ZStack {
+                        tileShape
+                            .stroke(ring.color, lineWidth: ring.width)
+                        audioFocusStrokeOverlay
+                    }
+                }
+            )
+            .clipShape(tileShape)
+            // Black underlay so letterbox bars aren't transparent.
+            .background(tileShape.fill(Color.black))
+            // tvOS focus lift: scale + outer shadow combine with the
+            // white ring above to create the full "card lifts on focus"
+            // feedback. iPad uses hoverEffect below (no-op on touch).
+            .scaleEffect(focusScale)
+            .shadow(
+                color: focusShadow.color,
+                radius: focusShadow.radius,
+                y: focusShadow.y
+            )
+            .animation(.easeInOut(duration: 0.18), value: isFocused)
+            .animation(.easeInOut(duration: 0.15), value: store.relocatingTileID)
+            .hoverEffect(.highlight)
+        }
+    }
+
+    /// Gesture-receiving inner ZStack. Everything that should respond
+    /// to tap-to-take-audio, long-press-to-open-menu, and drag-to-
+    /// rearrange lives in here, the close button does NOT, so its
+    /// `Button` action isn't stolen by these parent gestures.
+    private var tappableRegion: some View {
+        ZStack {
+            // v1.7.x: black backdrop directly behind the representable
+            // so the AstralTV navy theme background can't leak through
+            // during the ~1.5s window before the first decoded frame
+            // lands. Mirror of the same fix in PlayerView.swift.
+            Color.black
+            // The video view. Engine is the session lock (Step: iOS
+            // body now supports AVPlayer tiles, was mpv-only). Same
+            // branch the tvOS body uses; the surrounding gestures /
+            // chrome / focus are engine-agnostic.
+            Group {
+                if !store.tiles.contains(where: { $0.id == tile.id }) {
+                    // ZOMBIE GUARD (field find 2026-08-27, "Continue on
+                    // Live TV" hand-off): exit() empties the tile list
+                    // and resets the engine lock to .mpv in one beat,
+                    // but this view can re-render 1s+ later while the
+                    // tab transition unwinds - and the .mpv default then
+                    // mounted a FRESH mpv instance playing the dead DVR
+                    // URL over the incoming live session. A tile no
+                    // longer in the store mounts NO engine, ever.
+                    Color.black
+                } else if usesAVPlayerEngine {
+                    AVPlayerMultiviewTile(
+                        tileID: tile.id,
+                        streamURL: avPlayerTileURL,
+                        headers: avPlayerTileHeaders,
+                        shouldPause: shouldPause,
+                        channelName: tile.item.name,
+                        channelID: tile.item.id,
+                        // Dispatcharr identity for the no-first-byte
+                        // stream failover walk (s7_86.txt:353-395).
+                        dispatcharrChannelPK: tile.item.dispatcharrChannelID,
+                        dispatcharrChannelUUID: tile.item.uuid,
+                        channelLogoURL: tile.item.logoURL,
+                        isVOD: tile.kind == .vod,
+                        isDVR: tile.kind == .dvr,
+                        resumePositionMs: tile.resumePositionMs,
+                        catchup: tile.catchup,
+                        progressStore: progressStore,
+                        pipEnabled: isSoleTile,
+                        onEngineFallback: { _ in store.downgradeToMPV() }
+                    )
+                } else {
+                    MPVPlayerViewRepresentable(
+                        urls: [tile.streamURL],
+                        headers: tile.headers,
+                        isLive: tile.kind == .live,
+                        isDVR: tile.kind == .dvr,
+                        catchup: tile.catchup,
+                        nowPlayingTitle: tile.item.name,
+                        nowPlayingSubtitle: tile.item.currentProgram,
+                        nowPlayingArtworkURL: tile.item.logoURL,
+                        progressStore: progressStore,
+                        logStore: logStore,
+                        onFatalError: { message in
+                            // Surface on the tile instead of killing the
+                            // whole app. The overlay exposes Retry + Remove.
+                            decodeErrorMessage = message
+                            isReconnecting = false
+                            // A real terminal error owns the card now: drop the
+                            // soft-stall flag (and its escalation backstop) so a
+                            // later streamStalled->false (frames resuming into the
+                            // reconnect loop) can't tear this real card down.
+                            // onRecovered handles the terminal teardown.
+                            softStall = false
+                            softStallEscalationTask?.cancel()
+                            softStallEscalationTask = nil
+                            scheduleAutoReconnect()
+                            // Log the sanitized message. The raw message can
+                            // echo server-controlled bytes (HLS errors, HTTP
+                            // response bodies), so `sanitizedErrorMessage`
+                            // strips control/bidi chars and caps length.
+                            DebugLogger.shared.log(
+                                "[MV-Tile] decode error: channel=\(tile.item.name) msg=\(Self.sanitizedErrorMessage(message))",
+                                category: "Playback", level: .warning
+                            )
+                        },
+                        onRecovered: { clearPlaybackError() },
+                        tileID: tile.id,
+                        isAudioActive: isAudioActive,
+                        shouldPause: shouldPause,
+                        // Snapshot tile count for setupMPV's pre-init audio
+                        // strategy (mute-only ≤6, decoder-off ≥7). See the
+                        // !initialIsAudioActive branch in setupMPV.
+                        initialTileCount: store.tiles.count
+                    )
+                }
+            }
+            // SwiftUI identity is the TILE id, not the item.id, so
+            // rearrange (which shuffles `tiles` but keeps ids) doesn't
+            // recreate the coordinator. Seed-from-single has
+            // `tile.id == item.id` so that case also preserves
+            // identity with the single-mode view.
+            .id(tile.id)
+            .onAppear {
+                debugLog("[MV-Tile] onAppear id=\(tile.id) name=\(tile.item.name)")
+                // Register our per-tile progress store so the unified
+                // chrome overlay (PlaybackChromeOverlay + Options
+                // panel) can bind scrubber / track pickers / speed to
+                // the audio tile's store regardless of which tile it
+                // happens to be.
+                store.registerProgressStore(progressStore, for: tile.id)
+                applyVODIdentityToProgressStore()
+            }
+            .onDisappear {
+                debugLog("[MV-Tile] onDisappear id=\(tile.id)")
+                store.unregisterProgressStore(for: tile.id)
+            }
+            // v1.6.15.x: same belt + suspenders as the tvOS body,
+            // see the matching `.task(id: tile.id)` block in
+            // `tvOSBody` for the freeze-after-channel-flip rationale.
+            .task(id: "\(tile.id)|\(tile.streamURL.absoluteString)|\(store.progressStoreRegistrationEpoch)") {
+                // iPad 2026-10-13 23:32:33: a session reset bumps the epoch
+                // while this (stale) tile is still in the update that
+                // removes it; a tile no longer in the store has nothing
+                // to register.
+                guard store.tiles.contains(where: { $0.id == tile.id }) else {
+                    debugLog("[MV-Tile] task(id) skipped id=\(tile.id): tile no longer in the store")
+                    return
+                }
+                let t0 = CACurrentMediaTime()
+                debugLog("[MV-Tile] task(id) fired id=\(tile.id) name=\(tile.item.name)")
+                store.registerProgressStore(progressStore, for: tile.id)
+                store.registerEngine(engineBadgeLabel, for: tile.id)
+                applyVODIdentityToProgressStore()
+                RadioStopTrace.log("tile task(id)", since: t0)
+            }
+            // Same stale-badge fix as the tvOS body: re-register on engine
+            // change so a downgradeToMPV updates the chrome badge.
+            .onChange(of: store.sessionEngine) { _, _ in
+                store.registerEngine(engineBadgeLabel, for: tile.id)
+            }
+
+            // Per-tile corner chrome suppressed at N=1 (container
+            // chrome renders title + Close at the top bar instead).
+            //
+            // For N>1: mutually-exclusive audio badge (centered, with
+            // channel name pill) OR bottom label strip, never both.
+            // The audio tile gets the centered badge as its identity
+            // marker; other tiles get the bottom name pill. Rendering
+            // both on the audio tile produced a duplicate channel
+            // name (user flagged: "the channel name is also appearing
+            // at the very bottom of the display which shouldn't be
+            // there since it's already listed inside the tile itself").
+            if !isSoleTile {
+                // Settings > Multiview > Show Channel Logos. The audio
+                // tile shows the centered badge instead of the bottom
+                // name strip, so only non-audio tiles need the lift.
+                MultiviewTileLogoOverlay(tileID: tile.id,
+                                         logoURL: tile.item.logoURL,
+                                         nameStripVisible: chromeState.isVisible && !isAudioActive)
+                // On the fitted video rect, not the slot (letterbox).
+                MultiviewVideoRect(tileID: tile.id) {
+                    ZStack {
+                        if isAudioActive {
+                            audioBadge
+                        } else {
+                            labelStrip
+                        }
+                    }
+                }
+            }
+
+            // Playback-error overlay now attaches as a sibling overlay
+            // on the tile content (see the `.overlay` next to the VOD
+            // Finished overlay) so its Retry / Remove buttons receive
+            // taps directly.
+        }
+        // Explicit hit shape so taps on the letterbox black (where
+        // there's no video) still count.
+        .contentShape(Rectangle())
+        .onTapGesture {
+            chromeState.reportInteraction()
+            // Error state: the overlay's own Retry / Remove buttons
+            // are the primary targets; a tap that lands outside them
+            // (letterbox black) still removes.
+            if decodeErrorMessage != nil {
+                DebugLogger.shared.log(
+                    "[MV-Cmd] iPad tile remove via error-overlay (tap) tile=\(tile.id)",
+                    category: "Playback", level: .info
+                )
+                store.remove(id: tile.id); PlayerSession.shared.collapseToStandardSingleIfOneTile(reason: "tile Remove")
+                return
+            }
+            // Move Mode, if a tile is currently pending relocation
+            // (user chose "Move Tile" from its long-press menu), the
+            // next tile tap commits the swap, or tapping the moving
+            // tile itself cancels. See `menuButtons` → "Move Tile"
+            // for the entry point, and `relocateBanner` in
+            // `MultiviewContainerView` for the on-screen prompt.
+            // Audio assignment is intentionally skipped while move
+            // mode is active so the user doesn't accidentally
+            // reshuffle audio while rearranging layout.
+            if let movingID = store.relocatingTileID {
+                if movingID == tile.id {
+                    store.relocatingTileID = nil
+                    DebugLogger.shared.log(
+                        "[MV-Cmd] iPad relocate cancel (tap source) tile=\(tile.id)",
+                        category: "Playback", level: .info
+                    )
+                } else {
+                    store.swap(movingID, tile.id)
+                    store.relocatingTileID = nil
+                    DebugLogger.shared.log(
+                        "[MV-Cmd] iPad relocate commit (tap target) source=\(movingID) target=\(tile.id)",
+                        category: "Playback", level: .info
+                    )
+                }
+                return
+            }
+            store.setAudio(to: tile.id)
+        }
+        // NOTE: `.onDrag`/`.onDrop` were removed in favour of a
+        // reliable long-press menu. UIKit's `UIDragInteraction`
+        // (installed by `.onDrag`) sets up `requireToFail`
+        // relationships that reliably starve *any* sibling SwiftUI
+        // long-press gesture on the same view, `.onLongPressGesture`,
+        // `.simultaneousGesture(LongPressGesture…)`, and
+        // `.highPriorityGesture(LongPressGesture…)` all fail to fire
+        // so long as `.onDrag` is declared alongside them. Since the
+        // per-tile long-press menu is how iPad users Remove / go
+        // Full-Screen / pick Audio Track / pick Subtitle Track /
+        // take audio, i.e. every non-trivial per-tile action, we
+        // prioritise it over drag-to-rearrange. Rearrangement is
+        // preserved via the "Move Tile" action in `menuButtons`,
+        // which enters relocate mode (`store.relocatingTileID`);
+        // the on-grid tap handler above commits the swap when the
+        // user taps another tile, matching tvOS semantics but
+        // swapping "D-pad arrow" for "tap target".
+        .onLongPressGesture(minimumDuration: 0.35) {
+            chromeState.reportInteraction()
+            showMenu = true
+            DebugLogger.shared.log(
+                "[MV-Cmd] tile menu opened id=\(tile.id)",
+                category: "Playback", level: .info
+            )
+        }
+    }
+
+    // MARK: - Shape
+
+    /// Audio-active tile stroke overlay. v1.6.8, drives the user's
+    /// chosen `MultiviewAudioFocusStyle`:
+    ///
+    ///   • `.centerIcon`, returns nothing; the existing
+    ///     `TVCenterAudioFocusIcon` middle-of-tile speaker
+    ///     indicator stays the only signal (legacy behaviour).
+    ///   • `.grayPersistent`, a 3pt muted-gray border on the
+    ///     audio tile, always visible. Persistent "this tile owns
+    ///     audio" cue.
+    ///   • `.themeFading`, a 3pt accent stroke that piggybacks
+    ///     on `MultiviewChromeState.focusIndicatorVisible` so it
+    ///     fades in / out with the rest of the tile chrome on
+    ///     the existing 5-second auto-hide timer. Visible while
+    ///     the user is interacting with the grid; hidden when
+    ///     they're just watching.
+    ///
+    /// Non-audio tiles always render `EmptyView`; only the
+    /// `audioTileID` tile gets the overlay.
+    @ViewBuilder
+    private var audioFocusStrokeOverlay: some View {
+        if isAudioActive {
+            switch audioFocusStyle {
+            case .centerIcon:
+                EmptyView()
+            case .grayPersistent:
+                tileShape
+                    .stroke(Color(white: 0.55), lineWidth: 3)
+                    .allowsHitTesting(false)
+            case .themeFading:
+                tileShape
+                    .stroke(ThemeManager.shared.accent, lineWidth: 3)
+                    .opacity(chromeState.focusIndicatorVisible ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.25),
+                               value: chromeState.focusIndicatorVisible)
+                    .allowsHitTesting(false)
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    // MARK: - iPadOS focus-ring helpers
+
+    /// Precedence: relocating > focused (iPadOS hover) > none.
+    /// Focus ring on tvOS is handled by `MultiviewTileButtonStyle`
+    /// (see below), not this helper.
+    private var ring: (color: Color, width: CGFloat) {
+        if store.relocatingTileID == tile.id {
+            return (.orange, 4)
+        }
+        return (.clear, 0)
+    }
+
+    private var focusScale: CGFloat { 1.0 }
+
+    private var focusShadow: (color: Color, radius: CGFloat, y: CGFloat) {
+        (.clear, 0, 0)
+    }
+
+    // MARK: - iPadOS close button
+
+    // NOTE: per-tile close `×` (iPad) was intentionally removed.
+    // The same Remove action lives in the long-press context menu
+    // (`menuButtons` → "Remove"). The inline X was too easy to
+    // tap accidentally during audio-focus taps, and users found it
+    // visually noisy. Closing a tile is significant enough to
+    // warrant the deliberate long-press gesture.
+
+    /// Audio-tile indicator, centered on the tile, visually matching
+    /// tvOS's `CenterAudioIconView` (accent speaker capsule above a
+    /// dark channel-name pill). Users on iOS complained the previous
+    /// corner placement "hung off" the tile and looked out of place;
+    /// centering puts it in the same language as Apple TV.
+    ///
+    /// INTENTIONALLY state-less: no local `@State`, no `Task`,
+    /// no `withAnimation`. Visibility is a pure read of the existing
+    /// `chromeState.isVisible`, which also drives every other piece
+    /// of tile chrome, so the indicator fades in/out with the rest
+    /// of the overlay on user-idle timing. A previous attempt to
+    /// add per-tile state + a 2.5 s fade-out `Task` correlated with
+    /// a cascading freeze during single-stream → multiview
+    /// transitions, because the state mutation fired
+    /// `MPVPlayerViewRepresentable.updateUIViewController` at the
+    /// same moment mpv was doing a `loadfile ... replace` for the
+    /// "snap to live edge" cascade. Keeping this pure-read avoids
+    /// that entire class of issue.
+    private var audioBadge: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "speaker.wave.2.fill")
+                .scaledFont(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Capsule().fill(Color.accentPrimary))
+                .shadow(color: .black.opacity(0.45), radius: 6, y: 2)
+
+            Text(tile.item.name)
+                .scaledFont(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(0.65))
+                        .overlay(
+                            Capsule().strokeBorder(
+                                Color.white.opacity(0.22),
+                                lineWidth: 0.5
+                            )
+                        )
+                )
+                .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+        }
+        // Constrain width so long channel names truncate instead of
+        // pushing the indicator past small-tile edges.
+        .frame(maxWidth: 220)
+        .allowsHitTesting(false)
+        .opacity(chromeState.isVisible ? 1 : 0)
+    }
+
+
+    // MARK: - Label strip
+
+    private var labelStrip: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Text(tile.item.name)
+                    .scaledFont(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.55))
+                    )
+                Spacer()
+            }
+            .padding(8)
+        }
+        .allowsHitTesting(false)
+        .opacity(chromeState.isVisible ? 1 : 0)
+    }
+
+    // MARK: - Playback-error overlay
+
+    /// Error card shown when the tile's mpv coordinator reports a
+    /// fatal decode/load failure. Attached as a SIBLING overlay of
+    /// the tile's tap target (same pattern as `finishedOverlay`) so
+    /// its Retry / Remove buttons are real focus/tap targets.
+    ///
+    /// The card is deliberately calmer than the old red one: the
+    /// actual error message is the star (users asked for it), the
+    /// status line shows the auto-reconnect countdown, and the error
+    /// state is no longer terminal, `scheduleAutoReconnect` keeps
+    /// retrying on an escalating delay and `onRecovered` dismisses
+    /// the card the moment a retry reaches steady playback.
+    private func playbackErrorOverlay(_ message: String) -> some View {
+        ZStack {
+            // Soft stall is a "we're on it" state, not a failure: lighter
+            // scrim than the terminal error card.
+            Color.black.opacity(softStall ? 0.72 : 0.85)
+            VStack(spacing: 12) {
+                if softStall {
+                    // Pre-terminal: a spinner + "Reconnecting…", NOT the orange
+                    // alarm. If the stream is truly dead this upgrades to the
+                    // terminal card below (softStall flips false); if it
+                    // recovers, it dismisses itself. No server-echoed message
+                    // line (there's no error yet) and no status footnote (the
+                    // headline already says "Reconnecting…").
+                    ProgressView()
+                        .tint(.white)
+                    Text("Reconnecting…")
+                        .scaledFont(.headline)
+                        .foregroundStyle(.white)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .scaledFont(.largeTitle)
+                        .foregroundStyle(.orange)
+                    // Sole tile = the regular full-screen player: title it like
+                    // one (Android "Channel Unavailable" parity). The multiview
+                    // grid keeps the per-tile "Playback Problem" wording.
+                    Text(isSoleTile ? PlaybackFailureCopy.title : "Playback Problem")
+                        .scaledFont(.headline)
+                        .foregroundStyle(.white)
+                    // SECURITY: mpv error strings can echo server-controlled
+                    // bytes (HTTP error bodies, HLS parse errors, remote URL
+                    // fragments). `verbatim:` disables Markdown interpretation;
+                    // `sanitizedErrorMessage` strips control/bidi chars +
+                    // caps length.
+                    Text(verbatim: Self.sanitizedErrorMessage(message))
+                        .scaledFont(.caption)
+                        .foregroundStyle(.white.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                        .padding(.horizontal, 10)
+                    Text(reconnectStatusText)
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                HStack(spacing: 12) {
+                    // tvOS: the card is INFORMATIONAL, on every tile. A card
+                    // button cannot reliably take Siri-remote focus over the
+                    // playback surface - the sole-tile case learned this first,
+                    // and grid tiles have it worse: the container's D-pad model
+                    // owns navigation between tiles, so these buttons rendered
+                    // active but could never be reached (Logan, 2026-08-16;
+                    // auto-reconnect recovered around them). Retry stays
+                    // covered by the auto-reconnect loop and Remove by the
+                    // tile's long-OK menu. iOS keeps both as tap targets.
+                    let showCardRetry = true
+                    if showCardRetry {
+                        Button {
+                            retryNow()
+                        } label: {
+                            Label("Retry", systemImage: "arrow.clockwise")
+                                .scaledFont(.footnote.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Capsule().fill(Color.accentPrimary))
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Remove is multiview idiom: on the sole full-screen
+                    // channel it read as the wrong player's controls AND
+                    // removing the only tile exits playback outright (ATV
+                    // field report 2026-07-12). iOS grid tiles keep it; on
+                    // tvOS it is unreachable for the same reason as Retry
+                    // above, and the tile menu's Remove covers it.
+                    let showCardRemove = !isSoleTile
+                    if showCardRemove {
+                        Button(role: .destructive) {
+                            DebugLogger.shared.log(
+                                "[MV-Cmd] error overlay Remove tile=\(tile.id)",
+                                category: "Playback", level: .info
+                            )
+                            autoReconnectTask?.cancel()
+                            store.remove(id: tile.id); PlayerSession.shared.collapseToStandardSingleIfOneTile(reason: "tile Remove")
+                        } label: {
+                            Label("Remove", systemImage: "xmark.circle")
+                                .scaledFont(.footnote.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Capsule().fill(Color.white.opacity(0.22)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(12)
+        }
+        .onDisappear {
+            autoReconnectTask?.cancel()
+            autoReconnectTask = nil
+            softStallEscalationTask?.cancel()
+            softStallEscalationTask = nil
+            // The connection-issue chrome pin is normally released by the
+            // recovery notification, which a torn-down tile can never post.
+            // Without this, exiting or switching channels mid-outage latched
+            // the pin and chrome stayed permanently visible (ATV log
+            // 2026-08-13 10:15: pinned 14 min until session teardown).
+            if progressStore.connectionIssueActive {
+                progressStore.connectionIssueActive = false
+                NotificationCenter.default.post(name: .connectionIssueChanged, object: false)
+            }
+        }
+    }
+
+    /// Card for `LiveStopNotice` (Dispatcharr connection limit, or a stream
+    /// the server ended again right after the automatic reconnect). Same
+    /// look as the error card but deliberately static: no countdown, no
+    /// auto-retry, no Reconnecting line. iOS taps Retry on the card; tvOS
+    /// reaches Retry through the chrome's connection-issue cell, which is
+    /// focused when this card goes up (a card button cannot take Siri
+    /// remote focus over the playback surface, see playbackErrorOverlay).
+    private func liveStopNoticeOverlay(_ notice: LiveStopNotice) -> some View {
+        let compact = !isSoleTile
+        return ZStack {
+            Color.black.opacity(compact ? 0.82 : 0.72)
+            VStack(spacing: compact ? 6 : 12) {
+                Text(notice.title)
+                    .scaledFont(compact ? .headline : .title3.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                Text(notice.message)
+                    .scaledFont(compact ? .caption : .subheadline)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(compact ? 3 : nil)
+                    .padding(.horizontal, compact ? 8 : 24)
+                Button {
+                    retryLiveStopNotice()
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                        .scaledFont(.footnote.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.accentPrimary))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(compact ? 12 : 32)
+        }
+    }
+
+    /// The notice went up or came down: drive the chrome's connection-issue
+    /// Retry cell (tvOS focus target) exactly like the error card does.
+    private func handleLiveStopNoticeChange(_ notice: LiveStopNotice?) {
+        if notice != nil {
+            // The notice owns the tile; no reconnect loop may run under it.
+            autoReconnectTask?.cancel()
+            autoReconnectTask = nil
+            softStallEscalationTask?.cancel()
+            softStallEscalationTask = nil
+            softStall = false
+            decodeErrorMessage = nil
+            isReconnecting = false
+            reconnectCountdown = 0
+            progressStore.connectionIssueActive = true
+            NotificationCenter.default.post(name: .connectionIssueChanged, object: true)
+            DebugLogger.shared.log(
+                "[LIMIT] card shown kind=\(notice?.kind.rawValue ?? "") tile=\(tile.id) sole=\(isSoleTile)",
+                category: "Playback", level: .info)
+        } else if decodeErrorMessage == nil, progressStore.connectionIssueActive {
+            progressStore.connectionIssueActive = false
+            NotificationCenter.default.post(name: .connectionIssueChanged, object: false)
+        }
+    }
+
+    /// Retry on the notice card or the chrome cell: one fresh tune.
+    private func retryLiveStopNotice() {
+        DebugLogger.shared.log(
+            "[MV-Cmd] live stop notice Retry tile=\(tile.id)",
+            category: "Playback", level: .info)
+        progressStore.liveStopRetryAction?()
+    }
+
+    private var reconnectStatusText: String {
+        if isReconnecting { return "Reconnecting…" }
+        if reconnectCountdown > 0 { return PlaybackFailureCopy.retrying(reconnectCountdown) }
+        return " "
+    }
+
+    /// Pre-terminal stall handler, driven by `progressStore.streamStalled`
+    /// (raised by the coordinator's stale-frame watchdog once the picture has
+    /// been wedged ~15s and the forced reload has NOT recovered it). Puts up a
+    /// SOFT "Reconnecting…" card so a killed source shows feedback fast instead
+    /// of a frozen frame, the terminal buffer-relay + LAN/WAN failover +
+    /// direct-fallback ladder can take ~60s to surface its own error.
+    ///
+    /// For the first grace window it stays passive (the relay / watchdog /
+    /// failover keep working underneath; if they recover, frames resume,
+    /// `streamStalled` drops, and this dismisses itself). If it is STILL soft-
+    /// stalled after the grace, it actively drives `retryAction` so the card is
+    /// never "Reconnecting…" while nothing reconnects, the re-tune either
+    /// re-primes the stream or surfaces a real error that upgrades to the
+    /// terminal card. It never disturbs a real terminal-error card (that path
+    /// clears via `onRecovered`).
+    private func handleStreamStall(_ stalled: Bool) {
+        if stalled {
+            // Never paint over a real terminal-error card / reconnect loop
+            // that's already up; that owns the display until onRecovered.
+            guard decodeErrorMessage == nil else { return }
+            softStall = true
+            decodeErrorMessage = "Reconnecting…"   // non-nil => overlay shows
+            isReconnecting = true
+            reconnectCountdown = 0
+            // Light the chrome Retry + auto-summon controls (tvOS), identical
+            // to the terminal path, so a manual re-tune is one Select away.
+            progressStore.connectionIssueActive = true
+            NotificationCenter.default.post(name: .connectionIssueChanged, object: true)
+            DebugLogger.shared.log(
+                "[MV-Tile] soft stall -> reconnecting card channel=\(tile.item.name)",
+                category: "Playback", level: .info
+            )
+            // Escape hatch so the soft card can never lie forever. The grace
+            // (20s) sits past the common self-recovery window (the passive
+            // machinery usually recovers or errors first, cancelling this via
+            // handleStreamStall(false) / onFatalError). If we're still stalled
+            // after it, actively re-tune every 8s: a live source that's truly
+            // dead surfaces a real error -> onFatalError upgrades to the
+            // terminal auto-reconnect card; a recoverable one re-primes ->
+            // frames resume -> the soft card clears. Staying in softStall (we
+            // do NOT flip it here) keeps frame-resume teardown working.
+            softStallEscalationTask?.cancel()
+            softStallEscalationTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                while !Task.isCancelled, softStall {
+                    DebugLogger.shared.log(
+                        "[MV-Tile] soft stall escalation: active re-tune channel=\(tile.item.name)",
+                        category: "Playback", level: .info
+                    )
+                    progressStore.retryAction?()
+                    try? await Task.sleep(nanoseconds: 8_000_000_000)
+                }
+            }
+        } else {
+            // Frames resumed. Only tear down if THIS was the soft stall; a real
+            // terminal reconnect loop clears itself via onRecovered instead.
+            guard softStall else { return }
+            softStallEscalationTask?.cancel()
+            softStallEscalationTask = nil
+            softStall = false
+            decodeErrorMessage = nil
+            isReconnecting = false
+            reconnectCountdown = 0
+            progressStore.connectionIssueActive = false
+            NotificationCenter.default.post(name: .connectionIssueChanged, object: false)
+            DebugLogger.shared.log(
+                "[MV-Tile] soft stall cleared (frames resumed) channel=\(tile.item.name)",
+                category: "Playback", level: .info
+            )
+        }
+    }
+
+    /// Kick the coordinator's retry immediately (Retry button).
+    private func retryNow() {
+        DebugLogger.shared.log(
+            "[MV-Cmd] error overlay Retry tile=\(tile.id)",
+            category: "Playback", level: .info
+        )
+        autoReconnectTask?.cancel()
+        // Manual Retry takes over from the soft-stall backstop (if running) so
+        // the two don't fire re-tunes on top of each other.
+        softStallEscalationTask?.cancel()
+        softStallEscalationTask = nil
+        reconnectCountdown = 0
+        isReconnecting = true
+        progressStore.retryAction?()
+    }
+
+    /// Countdown-then-retry loop. Each fatal error re-arms this with an
+    /// escalating delay (5s doubling to a 30s cap): if the retry fails,
+    /// `onFatalError` fires again and re-schedules; if it succeeds,
+    /// `onRecovered` -> `clearPlaybackError` tears the loop down.
+    private func scheduleAutoReconnect() {
+        autoReconnectTask?.cancel()
+        reconnectAttempt += 1
+        // Connection-issue flag lives HERE - the same choke point that shows
+        // the error card - so the chrome's Retry cell can never desync from
+        // the card (an earlier coordinator-level latch missed the path that
+        // fired on the ATV field test). The container observes this via the
+        // notification to auto-summon + pin the controls with Retry focused.
+        progressStore.connectionIssueActive = true
+        NotificationCenter.default.post(name: .connectionIssueChanged, object: true)
+        // Flat 5s between every auto-retry (Archie, 2026-07-12; Android parity).
+        let delay = 5
+        autoReconnectTask = Task { @MainActor in
+            var remaining = delay
+            while remaining > 0 {
+                reconnectCountdown = remaining
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                remaining -= 1
+            }
+            reconnectCountdown = 0
+            isReconnecting = true
+            progressStore.retryAction?()
+        }
+    }
+
+    /// A Retry/auto-reconnect reached steady playback: dismiss the card
+    /// and reset the escalation so the NEXT incident starts at 5s again.
+    private func clearPlaybackError() {
+        autoReconnectTask?.cancel()
+        autoReconnectTask = nil
+        softStallEscalationTask?.cancel()
+        softStallEscalationTask = nil
+        decodeErrorMessage = nil
+        isReconnecting = false
+        reconnectCountdown = 0
+        reconnectAttempt = 0
+        softStall = false
+        progressStore.connectionIssueActive = false
+        NotificationCenter.default.post(name: .connectionIssueChanged, object: false)
+    }
+
+    // MARK: - VOD finished overlay (Phase 2)
+
+    /// Shown over a `.vod` tile that has played to its end
+    /// (`progressStore.reachedEOF`). Mirrors `playbackErrorOverlay`'s
+    /// visual language (full-tile scrim + centered VStack with a title)
+    /// but uses real `Button`s for Replay / Remove. Unlike the decode-
+    /// error card (which lives INSIDE the tile's tap target and so can't
+    /// host focusable inner buttons), this overlay is attached as a
+    /// SIBLING overlay on the tile container (see `tvOSBody` / iPad
+    /// `tileContent`), so its buttons receive focus on tvOS and taps on
+    /// iPad directly. Gated strictly to `.vod`: a `.dvr` tile at its live
+    /// edge isn't "finished" and a `.live` tile never finishes, so this
+    /// view is only ever mounted for VOD.
+    /// Raise the prompt when BOTH hold: the scheduled end is within 20s
+    /// (or past), and the playhead is within 30s of the recorded edge.
+    private func checkDVREndApproaching() {
+        guard tile.kind == .dvr, !dvrEndPromptVisible, !dvrEndPromptDismissed,
+              let end = tile.dvrScheduledEnd else { return }
+        guard Date() >= end.addingTimeInterval(-20) else { return }
+        let durMs = progressStore.durationMs
+        guard durMs > 0, durMs - progressStore.currentMs < 30_000 else { return }
+        DebugLogger.shared.log(
+            "[MV-Tile] DVR scheduled end imminent (edge viewer); raising prompt tile=\(tile.id)",
+            category: "Playback", level: .info)
+        dvrEndPromptVisible = true
+    }
+
+    /// Hand off to the live channel the recording captures: save + exit
+    /// the session, then ride the Top Shelf deep-link path
+    /// (astralOpenChannel -> Live TV tab switch + channel playback).
+    private func dvrEndContinueOnLive() {
+        DebugLogger.shared.log(
+            "[MV-Cmd] DVR ending overlay: continue on live channelID=\(tile.dvrChannelID ?? "-") tile=\(tile.id)",
+            category: "Playback", level: .info)
+        let channelID = tile.dvrChannelID
+        store.saveVODProgressNow()
+        PlayerSession.shared.exit()
+        if let channelID, !channelID.isEmpty {
+            NotificationCenter.default.post(
+                name: .astralOpenChannel, object: nil,
+                userInfo: ["channelID": channelID])
+        }
+    }
+
+    @ViewBuilder
+    private var finishedOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.82)
+            VStack(spacing: 14) {
+                Image(systemName: "checkmark.circle.fill")
+                    .scaledFont(.largeTitle)
+                    .foregroundStyle(.white)
+                Text("Finished")
+                    .scaledFont(.headline)
+                    .foregroundStyle(.white)
+                // `verbatim:` so a VOD title can't be interpreted as
+                // Markdown (titles are server-sourced metadata).
+                Text(verbatim: tile.item.name)
+                    .scaledFont(.caption)
+                    .foregroundStyle(.white.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .padding(.horizontal, 10)
+
+                HStack(spacing: 12) {
+                    Button {
+                        replayFromStart()
+                    } label: {
+                        Label("Replay", systemImage: "arrow.counterclockwise")
+                            .scaledFont(.footnote.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(Color.accentPrimary))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(role: .destructive) {
+                        DebugLogger.shared.log(
+                            "[MV-Cmd] VOD finished overlay Remove tile=\(tile.id)",
+                            category: "Playback", level: .info
+                        )
+                        store.remove(id: tile.id); PlayerSession.shared.collapseToStandardSingleIfOneTile(reason: "tile Remove")
+                    } label: {
+                        Label("Remove", systemImage: "xmark.circle")
+                            .scaledFont(.footnote.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(Color.white.opacity(0.22)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    /// Replay action for the finished overlay: clear the EOF flag and
+    /// drive the coordinator's `replayFromStartAction` (seek to 0 +
+    /// unpause; clears the `playbackEnded` latch that the normal seek
+    /// guard would otherwise block). If the coordinator hasn't wired the
+    /// action yet (shouldn't happen once playing), clearing `reachedEOF`
+    /// still dismisses the overlay.
+    private func replayFromStart() {
+        DebugLogger.shared.log(
+            "[MV-Cmd] VOD finished overlay Replay tile=\(tile.id)",
+            category: "Playback", level: .info
+        )
+        progressStore.reachedEOF = false
+        progressStore.replayFromStartAction?()
+    }
+
+    /// Strip control chars, bidi overrides, and truncate to a display-
+    /// safe length. The remaining text is still technically attacker-
+    /// influenced (mpv faithfully relays server errors), but it can't
+    /// spoof structure or hide bytes.
+    private static func sanitizedErrorMessage(_ raw: String) -> String {
+        // Unicode categories we never want to see in the overlay:
+        // C0/C1 controls, bidi overrides/embeddings, zero-width
+        // space/joiner, LTR/RTL marks.
+        let blockedScalars: Set<Unicode.Scalar> = [
+            "\u{202A}", "\u{202B}", "\u{202C}", "\u{202D}", "\u{202E}",
+            "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}",
+            "\u{200B}", "\u{200C}", "\u{200D}", "\u{200E}", "\u{200F}",
+            "\u{FEFF}"
+        ]
+        var cleaned = ""
+        cleaned.reserveCapacity(raw.count)
+        for scalar in raw.unicodeScalars {
+            if blockedScalars.contains(scalar) { continue }
+            if scalar.value < 0x20 && scalar != "\n" && scalar != "\t" { continue }
+            if (0x7F...0x9F).contains(scalar.value) { continue }
+            cleaned.unicodeScalars.append(scalar)
+            if cleaned.count >= 200 { break }
+        }
+        return cleaned
+    }
+
+    // MARK: - iPadOS confirmationDialog buttons
+
+    @ViewBuilder
+    private var menuButtons: some View {
+
+        // Swap Stream: re-point THIS tile at another channel through the same
+        // picker as Add Stream. The tvOS menu carries the twin of this item;
+        // they are separate lists, so an action added to one is NOT on the
+        // other (that is exactly how iOS shipped without this at first).
+        Button("Change Channel") {
+            store.pendingSwapTileID = tile.id
+        }
+
+        if canSwitchTileStream {
+            Button("Switch Stream") {
+                store.pendingStreamSwitchTileID = tile.id
+            }
+        }
+
+        // Add Channel and Layout live here only: the chrome's "+" and
+        // layout buttons were removed (Android parity 2026-10-11).
+        if !store.isAtMax {
+            Button("Add Channel") {
+                store.addSheetRequested = true
+            }
+        }
+
+        if MultiviewLayoutMode.available(forTileCount: store.tiles.count).count > 1 {
+            Button("Layout: \(layoutMode.displayName)\u{2026}") {
+                Task { @MainActor in showLayoutMenu = true }
+            }
+        }
+
+        let isFullscreen = store.fullscreenTileID == tile.id
+        Button(isFullscreen ? "Exit Full-Screen" : "Full-Screen in Grid") {
+            store.fullscreenTileID = isFullscreen ? nil : tile.id
+        }
+
+        // Issue #27: spotlight this tile (big + others stacked small).
+        let isSpotlit = store.spotlightTileID == tile.id
+        Button(isSpotlit ? "Remove Spotlight" : "Spotlight") {
+            store.spotlightTileID = isSpotlit ? nil : tile.id
+            if !isSpotlit { store.fullscreenTileID = nil }
+        }
+
+        if progressStore.audioTracks.count > 1 {
+            Button("Audio Track…") {
+                Task { @MainActor in showAudioTrackMenu = true }
+            }
+        }
+        // Task #184: mpv-engine tiles only (setAudioSyncAction nil on AVPlayer).
+        if progressStore.setAudioSyncAction != nil {
+            Button(progressStore.audioSyncMs == 0
+                    ? "Audio Sync…"
+                    : "Audio Sync (\(String(format: "%+d", progressStore.audioSyncMs)) ms)…") {
+                Task { @MainActor in showAudioSyncMenu = true }
+            }
+        }
+        if !progressStore.subtitleTracks.isEmpty {
+            Button("Subtitle Track…") {
+                Task { @MainActor in showSubtitleTrackMenu = true }
+            }
+        }
+
+        // Move Mode, iPad replacement for drag-to-rearrange (which
+        // we had to remove because UIKit's `UIDragInteraction`
+        // starved the long-press gesture that opens this very
+        // menu). Three UX states:
+        //   1. No active move, tiles.count > 1 → "Move Tile"
+        //      (sets `relocatingTileID = tile.id`, shows banner +
+        //      orange ring via `ring` helper).
+        //   2. This tile is the moving tile → "Cancel Move"
+        //      (clears relocate; tapping the source tile on-grid
+        //      also cancels, see `tappableRegion.onTapGesture`).
+        //   3. *Another* tile is being moved → "Swap to Here"
+        //      (commits the swap from the menu rather than
+        //      requiring the user to dismiss then tap this tile).
+        // Both commit paths (menu "Swap to Here" + on-grid tap)
+        // call `store.swap(movingID, tile.id)` + clear relocate,
+        // so the final state is identical regardless of which one
+        // the user reached for.
+        if store.tiles.count > 1 {
+            if let movingID = store.relocatingTileID {
+                if movingID == tile.id {
+                    Button("Cancel Move") {
+                        store.relocatingTileID = nil
+                        DebugLogger.shared.log(
+                            "[MV-Cmd] iPad relocate cancel (menu) tile=\(tile.id)",
+                            category: "Playback", level: .info
+                        )
+                    }
+                } else {
+                    Button("Swap to Here") {
+                        store.swap(movingID, tile.id)
+                        store.relocatingTileID = nil
+                        DebugLogger.shared.log(
+                            "[MV-Cmd] iPad relocate commit (menu) source=\(movingID) target=\(tile.id)",
+                            category: "Playback", level: .info
+                        )
+                    }
+                }
+            } else {
+                Button("Move Tile") {
+                    store.relocatingTileID = tile.id
+                    DebugLogger.shared.log(
+                        "[MV-Cmd] iPad relocate enter tile=\(tile.id)",
+                        category: "Playback", level: .info
+                    )
+                }
+            }
+        }
+
+        Button("Remove", role: .destructive) {
+            store.remove(id: tile.id); PlayerSession.shared.collapseToStandardSingleIfOneTile(reason: "tile Remove")
+        }
+
+        Button("Cancel", role: .cancel) {}
+    }
+
+    @ViewBuilder
+    private var layoutButtons_iOS: some View {
+        ForEach(MultiviewLayoutMode.available(forTileCount: store.tiles.count)) { mode in
+            Button(layoutMode == mode ? "\(mode.displayName) (Current)" : mode.displayName) {
+                debugLog("[MV-LAYOUT] select mode=\(mode.rawValue) was=\(layoutMode.rawValue) tile=\(tile.id) tiles=\(store.tiles.count) (iOS menu)")
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    layoutMode = mode
+                    if mode != .spotlight { store.spotlightTileID = nil }
+                }
+            }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+
+    @ViewBuilder
+    private var audioTrackButtons: some View {
+        // SECURITY: `track.displayName` is mpv-sourced and therefore
+        // attacker-influenced via stream metadata (title tag, track
+        // lang). SwiftUI's `Button(_: String)` and `Button(_: LocalizedStringKey)`
+        // both apply Markdown to the label, so a title like
+        // `[Click](evil://)` would render a tappable link inside the
+        // action sheet. Use the closure-based `Button { } label:`
+        // form with `Text(verbatim:)` to disable interpretation.
+        ForEach(progressStore.audioTracks) { track in
+            let active = track.id == progressStore.currentAudioTrackID
+            Button {
+                progressStore.setAudioTrackAction?(track.id)
+            } label: {
+                Text(verbatim: active ? "✓ \(track.displayName)" : track.displayName)
+            }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+
+    /// Task #184: dialog title carries the live offset so each reopen
+    /// shows where you are ("Audio Sync: +200 ms").
+    private var audioSyncDialogTitle: String {
+        progressStore.audioSyncMs == 0
+            ? "Audio Sync"
+            : "Audio Sync: \(String(format: "%+d", progressStore.audioSyncMs)) ms"
+    }
+
+    /// Task #184: 100ms steppers (positive = audio later). A dialog tap
+    /// dismisses by design; the menu row + title show the current value.
+    @ViewBuilder
+    private var audioSyncButtons: some View {
+        Button("Audio later +100 ms") {
+            progressStore.setAudioSyncAction?(progressStore.audioSyncMs + 100)
+        }
+        Button("Audio earlier -100 ms") {
+            progressStore.setAudioSyncAction?(progressStore.audioSyncMs - 100)
+        }
+        if progressStore.audioSyncMs != 0 {
+            Button("Reset to 0") {
+                progressStore.setAudioSyncAction?(0)
+            }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+
+    @ViewBuilder
+    private var subtitleTrackButtons: some View {
+        Button(progressStore.currentSubtitleTrackID == 0 ? "✓ Off" : "Off") {
+            progressStore.setSubtitleTrackAction?(0)
+        }
+        ForEach(progressStore.subtitleTracks) { track in
+            let active = track.id == progressStore.currentSubtitleTrackID
+            Button {
+                progressStore.setSubtitleTrackAction?(track.id)
+            } label: {
+                Text(verbatim: active ? "✓ \(track.displayName)" : track.displayName)
+            }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+
+    // MARK: - A11y
+
+    private var a11yLabel: String {
+        let audioState = isAudioActive ? "audio on" : "muted"
+        let name = tile.item.name
+        let err = decodeErrorMessage != nil ? ", decode error" : ""
+        return "\(name), \(audioState)\(err)"
+    }
+}
+
+// MARK: - iPadOS drop delegate
+
+// NOTE: `MultiviewTileDropDelegate` was deleted alongside the
+// iPad `.onDrag`/`.onDrop` pair, see the gesture block in
+// `tappableRegion` for why we removed drag-to-rearrange on iPad
+// (UIKit's `UIDragInteraction` starves the long-press menu, which
+// is the primary interaction). `MultiviewStore.swap(_:_:)` is
+// still there and tvOS relocate mode still uses it, so resurrecting
+// iPad drag is a one-liner if/when we add a proper "move mode"
+// affordance that doesn't conflict with the long-press menu.
+
+// MARK: - tvOS center audio-focus icon
+
+
+// MARK: - tvOS tile button style
+
+
+/// Lays `content` out on the tile's FITTED video rect: the aspect-fit
+/// of the player's reported presentation size (AVPlayer KVO, via
+/// `MultiviewStore.tileVideoAspects`), else 16:9, centered in the slot.
+/// Used for per-tile chrome (focus ring, name badge, audio glyph) so it
+/// hugs the picture rather than the letterboxed slot (Android
+/// MultiviewScreen `Tile` parity).
+struct MultiviewVideoRect<Content: View>: View {
+    let tileID: String
+    @ViewBuilder let content: () -> Content
+    @ObservedObject private var store = MultiviewStore.shared
+
+    var body: some View {
+        GeometryReader { geo in
+            let fitted = MultiviewTileLogoOverlay.fittedSize(
+                aspect: store.tileVideoAspects[tileID] ?? (16.0 / 9.0),
+                in: geo.size)
+            content()
+                .frame(width: fitted.width, height: fitted.height)
+                .position(x: geo.size.width / 2, y: geo.size.height / 2)
+        }
+    }
+}
+
+// NOTE: `iOSCenterAudioIndicator` (an iOS center-of-tile audio-
+// routing badge ported from tvOS's `CenterAudioIconView`) was
+// prototyped here and reverted after user testing on
+// iPhone 17 Pro Max / iOS 26 showed the Add-to-Multiview `Done`
+// tap producing a cascading freeze every time.
+//
+// Root signal from the log:
+//   unpause → reload live stream (snap to live edge) on all tiles
+//   → end-file STOP on tile 1 → watchdog silent → app frozen
+//
+// The "unpause → reload" cascade is pre-existing behaviour (tiles
+// pause while the add-sheet is up, unpause on dismiss, and live
+// streams snap back to live via `loadfile ... replace`). What
+// changed: the indicator introduced @State + withAnimation
+// + a Task.sleep tied to the audio-tile identity at the exact
+// moment SwiftUI was already re-invalidating
+// `MPVPlayerViewRepresentable` due to the pause/unpause
+// transition. The combination correlated with the freeze.
+//
+// The top-left `audioBadge` remains as the only audio-focus
+// affordance. Re-introducing the center indicator safely would
+// likely mean putting it on a sibling overlay view at
+// `MultiviewContainerView` level that observes `store.audioTileID`
+// directly, so per-tile re-renders don't bubble into
+// `MPVPlayerViewRepresentable.updateUIViewController` during
+// multi-tile transitions. Feature is on the backlog.
+
+// MARK: - Per-tile store ownership
+
+/// Holder for a tile's `PlayerProgressStore` + `AttemptLogStore`, plus
+/// the handful of LOW-FREQUENCY mirrors the tile body and its context
+/// menu need.
+///
+/// The tile owns this object with `@StateObject` and therefore observes
+/// it - but it never observes `PlayerProgressStore` itself, so the
+/// driver's 0.5s `currentMs` pump can't re-evaluate the tile body (that
+/// rebuilt the open tvOS `.contextMenu` twice a second: a focus update
+/// per rebuild and ~2 leaked layers per second; field trace
+/// 2026-09-13).
+///
+/// Every subscription below is created ONCE, here, and kept in `bag`.
+/// That is deliberate and load-bearing: publishers built inside a view
+/// `body` (`$x.removeDuplicates()`, `$x.map(...)`) are new,
+/// non-comparable values on each evaluation, so SwiftUI resubscribes on
+/// every update and `@Published` immediately replays its current value.
+/// A handler that then writes state the body reads spins the update
+/// cycle forever - the Multiview lockup when a second tile was added
+/// (2026-09-13). Subscribing off the view graph cannot do that.
+final class PlayerTileStores: ObservableObject {
+    let progress = PlayerProgressStore()
+    let log = AttemptLogStore()
+
+    /// `progress.reachedEOF` (VOD "Finished" overlay).
+    @Published private(set) var eofReached: Bool = false
+    /// `progress.liveResumeNotice` (GH #70 top notice).
+    @Published private(set) var liveResumeNotice: String? = nil
+    /// `progress.streamStalled` (soft "Reconnecting…" card).
+    @Published private(set) var streamStalled: Bool = false
+    /// `progress.liveStopNotice` (connection-limit / stream-ended card).
+    @Published private(set) var liveStopNotice: LiveStopNotice? = nil
+    /// Bumped when a value the CONTEXT MENU / track dialogs read
+    /// changes (pause state, audio sync, selected track, track-list
+    /// counts) and once on the first position tick, when the engine has
+    /// wired its command closures (`setAudioSyncAction` and friends are
+    /// plain stored closures, not `@Published`, so nothing else would
+    /// ever pull them into the menu). Publishing it re-renders the tile,
+    /// which is what keeps the menu from going stale.
+    @Published private(set) var menuRevision: Int = 0
+
+    private var bag = Set<AnyCancellable>()
+
+    init() {
+        progress.$reachedEOF
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] in self?.eofReached = $0 }
+            .store(in: &bag)
+        progress.$liveResumeNotice
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] in self?.liveResumeNotice = $0 }
+            .store(in: &bag)
+        progress.$streamStalled
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] in self?.streamStalled = $0 }
+            .store(in: &bag)
+        progress.$liveStopNotice
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] in self?.liveStopNotice = $0 }
+            .store(in: &bag)
+
+        // Menu-relevant values. Track LISTS are compared by count: the
+        // menu only gates on `count > 1` / `isEmpty`, and the dialogs
+        // re-read the live arrays when they open. `currentMs` is
+        // deliberately absent.
+        let menuTriggers: [AnyPublisher<Void, Never>] = [
+            progress.$isPaused.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            progress.$audioSyncMs.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            progress.$currentAudioTrackID.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            progress.$currentSubtitleTrackID.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            progress.$audioTracks.map(\.count).removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            progress.$subtitleTracks.map(\.count).removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            // One-shot: the first real position tick, i.e. the engine
+            // has wired its command closures.
+            progress.$currentMs.dropFirst().first().map { _ in () }.eraseToAnyPublisher()
+        ]
+        for trigger in menuTriggers {
+            trigger
+                .dropFirst(0)
+                .sink { [weak self] in self?.menuRevision &+= 1 }
+                .store(in: &bag)
+        }
+    }
+}
+
+
+// MARK: - Channel logo overlay (Settings > Multiview > Show Channel Logos)
+
+/// Per-tile channel logo in a user-chosen corner of the VIDEO rect (the
+/// aspect-fit picture inside the tile, so letterbox bars never hold the
+/// logo), sized as a percent of the video rect height, on a subtle dark rounded backdrop so it reads on
+/// bright video. Reads its three settings through @AppStorage so changes
+/// apply live while Multiview is open. Draws nothing when the setting is
+/// off, when the tile has no logo URL, or until the logo has loaded.
+/// Never hit-testable and holds no focusable content, so it neither
+/// takes tvOS focus nor changes the tile's layout. Uses the same
+/// LogoCache / LogoFetcher / AstralImageDecoding path as the guide cells.
+struct MultiviewTileLogoOverlay: View {
+    let tileID: String
+    let logoURL: URL?
+    /// True while the bottom-left channel name strip is showing. A
+    /// bottom-left logo lifts above it instead of covering it.
+    let nameStripVisible: Bool
+
+    @AppStorage(multiviewShowLogosKey) private var showLogos: Bool = false
+    @AppStorage(multiviewLogoPositionKey)
+    private var positionRaw: String = MultiviewLogoPosition.topLeft.rawValue
+    @AppStorage(multiviewLogoSizeKey) private var sizePercent: Int = multiviewLogoSizeDefault
+
+    @ObservedObject private var store = MultiviewStore.shared
+    @State private var image: UIImage?
+
+    private var position: MultiviewLogoPosition {
+        MultiviewLogoPosition(rawValue: positionRaw) ?? .topLeft
+    }
+
+    /// Inset from the video rect's corner.
+    private let inset: CGFloat = 8
+    private let pad: CGFloat = 4
+    private let nameStripLift: CGFloat = 32
+
+    var body: some View {
+        if showLogos, let logoURL {
+            GeometryReader { geo in
+                content(in: geo.size)
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .task(id: logoURL.absoluteString) { await load(logoURL) }
+        }
+    }
+
+    @ViewBuilder
+    private func content(in tile: CGSize) -> some View {
+        if let image, image.size.width > 0, image.size.height > 0, tile.height > 0 {
+            // Video rect: aspect fit of the tile's reported video aspect
+            // (AVPlayer presentationSize), else 16:9. Centered in the tile.
+            let videoAspect = store.tileVideoAspects[tileID] ?? (16.0 / 9.0)
+            let video = Self.fittedSize(aspect: videoAspect, in: tile)
+            let pct = CGFloat(min(max(sizePercent, 5), 25)) / 100
+            // Sized by the logo's OPAQUE box (image is pre-cropped to it):
+            // h = pct of the video rect height minus the backdrop padding;
+            // height = h * clamp(sqrt(3 / a), 1, 2), so 3:1 or wider stays h
+            // tall, square is about 1.73h, tall caps at 2h. Width follows the
+            // aspect, capped at 4h and half the video rect (Android parity).
+            let hBase = max(video.height * pct - pad * 2, 1)
+            let aspect = image.size.width / image.size.height
+            let maxW = min(4 * hBase, max(video.width * 0.5 - pad * 2, 1))
+            let h0 = hBase * min(max((3 / aspect).squareRoot(), 1), 2)
+            let w = min(h0 * aspect, maxW)
+            let h = w / aspect
+            let lift: CGFloat = (position == .bottomLeft && nameStripVisible) ? nameStripLift : 0
+            Image(uiImage: image)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: w, height: h)
+                .padding(pad)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.black.opacity(0.55))
+                )
+                .padding(position.isTop ? .top : .bottom, inset + lift)
+                .padding(position.isLeading ? .leading : .trailing, inset)
+                .frame(width: video.width, height: video.height,
+                       alignment: alignment)
+                .position(x: tile.width / 2, y: tile.height / 2)
+                .animation(.easeInOut(duration: 0.2), value: lift)
+        }
+    }
+
+    /// Aspect-fit size of `aspect` inside `bounds` (same math as the
+    /// focus border's video-rect trace).
+    static func fittedSize(aspect: CGFloat, in bounds: CGSize) -> CGSize {
+        guard bounds.width > 0, bounds.height > 0, aspect > 0 else { return bounds }
+        if bounds.width / bounds.height > aspect {
+            return CGSize(width: bounds.height * aspect, height: bounds.height)
+        }
+        return CGSize(width: bounds.width, height: bounds.width / aspect)
+    }
+
+    private var alignment: Alignment {
+        switch position {
+        case .topLeft: return .topLeading
+        case .topRight: return .topTrailing
+        case .bottomLeft: return .bottomLeading
+        case .bottomRight: return .bottomTrailing
+        }
+    }
+
+    private func load(_ url: URL) async {
+        let key = url.absoluteString
+        if let cropped = Self.opaqueCache.object(forKey: key as NSString) {
+            image = cropped
+            return
+        }
+        if LogoCache.shared.image(for: key) == nil { image = nil }
+        guard let cropped = await Self.croppedLogo(url) else { return }
+        image = cropped
+    }
+
+    /// The logo this overlay draws for `url` (fetched, decoded and cropped
+    /// to its opaque box, cached). Shared with the phone-side Multiview
+    /// composite so the cast grid draws the same logo.
+    static func croppedLogo(_ url: URL) async -> UIImage? {
+        let key = url.absoluteString
+        if let cropped = opaqueCache.object(forKey: key as NSString) { return cropped }
+        var source = LogoCache.shared.image(for: key)
+        if source == nil {
+            guard let data = try? await LogoFetcher.fetch(url) else { return nil }
+            source = await Task.detached(priority: .utility) {
+                AstralImageDecoding.decode(data)
+            }.value
+            guard let img = source else { return nil }
+            LogoCache.shared.store(img, for: key)
+        }
+        guard let src = source else { return nil }
+        let cropped = await Task.detached(priority: .utility) {
+            croppedToOpaque(src)
+        }.value
+        opaqueCache.setObject(cropped, forKey: key as NSString)
+        return cropped
+    }
+
+    /// Logos cropped to their opaque bounding box, keyed by URL (computed
+    /// once per decoded image; the guide's LogoCache entry stays uncropped).
+    private static let opaqueCache = NSCache<NSString, UIImage>()
+
+    /// Crops transparent padding: scans alpha on a downscaled copy (at most
+    /// 256 px on the long side, so a stride over the original) and crops
+    /// the original to the matching rect. Returns the input when it has
+    /// no transparent margin or no opaque pixels.
+    nonisolated static func croppedToOpaque(_ img: UIImage) -> UIImage {
+        guard let cg = img.cgImage else { return img }
+        let W = cg.width, H = cg.height
+        guard W > 0, H > 0 else { return img }
+        let scale = min(1, 256 / CGFloat(max(W, H)))
+        let sw = max(1, Int(CGFloat(W) * scale)), sh = max(1, Int(CGFloat(H) * scale))
+        var buf = [UInt8](repeating: 0, count: sw * sh)
+        let drew: Bool = buf.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: sw, height: sh,
+                                      bitsPerComponent: 8, bytesPerRow: sw,
+                                      space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+            return true
+        }
+        guard drew else { return img }
+        var minX = sw, minY = sh, maxX = -1, maxY = -1
+        for y in 0..<sh {
+            let row = y * sw
+            for x in 0..<sw where buf[row + x] > 12 {
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+            }
+        }
+        guard maxX >= minX, maxY >= minY else { return img }
+        // Buffer rows run top-down (CGContext memory order), same as cg.
+        let fx = CGFloat(W) / CGFloat(sw), fy = CGFloat(H) / CGFloat(sh)
+        let rect = CGRect(x: floor(CGFloat(minX) * fx), y: floor(CGFloat(minY) * fy),
+                          width: ceil(CGFloat(maxX - minX + 1) * fx),
+                          height: ceil(CGFloat(maxY - minY + 1) * fy))
+            .intersection(CGRect(x: 0, y: 0, width: W, height: H))
+        if rect.width >= CGFloat(W) - 1, rect.height >= CGFloat(H) - 1 { return img }
+        guard let out = cg.cropping(to: rect) else { return img }
+        return UIImage(cgImage: out, scale: img.scale, orientation: img.imageOrientation)
+    }
+}

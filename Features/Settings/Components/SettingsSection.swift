@@ -1,0 +1,61 @@
+//
+//  SettingsSection.swift
+//  Astral
+//
+//  Settings redesign Phase 1 (SettingsUIRedesign.md A4): the ONE section
+//  container replacing the eight per-file `tvSection` helpers.
+//
+//  The audit called the eight helpers duplicates; re-verification during
+//  extraction found they are actually FOUR distinct visual styles that
+//  shipped over time:
+//
+//    .plain       uppercased 22pt tertiary eyebrow, bare content column
+//                 (Developer, Multiview, DVR, Network)
+//    .card        28pt semibold primary header, content in a padded
+//                 cardBackground rounded-18 card
+//                 (App Behaviors, Remote Control)
+//    .compactCard title3 secondary header, zero-spacing content clipped
+//                 into a rounded-14 card (Sync Categories)
+//    .eyebrowCard uppercased eyebrow over a 24pt-padded rounded-16 card
+//                 (Edit Playlist page)
+//
+//  Phase 1 is contractually "no visual change", so each style renders
+//  byte-identically to the body it replaces and every call site keeps the
+//  style it had. Unifying the four looks is a deliberate Phase 5 polish
+//  decision, not a side effect of deduplication.
+//
+//  On iOS the container renders a plain `Section`, for the Phase 3/4 panes
+//  that will host shared bodies. No iOS call sites exist yet in Phase 1.
+//
+
+import SwiftUI
+
+struct SettingsSection<Content: View>: View {
+    enum Style {
+        /// Uppercased eyebrow header, bare content column.
+        case plain
+        /// Bold header with the content wrapped in a rounded card.
+        case card
+        /// Compact header with zero-spacing content clipped into a card.
+        case compactCard
+        /// Uppercased eyebrow header (no leading pad) with the content in a
+        /// 24pt-padded rounded-16 card. The Edit Playlist page's look.
+        case eyebrowCard
+    }
+
+    let title: String
+    let style: Style
+    @ViewBuilder let content: Content
+
+    init(_ title: String, style: Style, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.style = style
+        self.content = content()
+    }
+
+    var body: some View {
+        Section(title) {
+            content
+        }
+    }
+}

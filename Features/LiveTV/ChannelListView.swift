@@ -1,0 +1,5203 @@
+import SwiftUI
+import SwiftData
+
+// MARK: - EPG Cache
+// Actor-isolated in-memory cache. Keyed by a server+channel string so different
+// servers never collide. TTL = 5 minutes; invalidated on pull-to-refresh.
+actor EPGCache {
+    static let shared = EPGCache()
+    private struct Entry { let programs: [EPGEntry]; let fetchedAt: Date }
+    private var cache: [String: Entry] = [:]
+    private let ttl: TimeInterval = 1800  // 30 minutes, EPG loaded upfront on launch
+
+    func get(_ key: String) -> [EPGEntry]? {
+        guard let e = cache[key], Date().timeIntervalSince(e.fetchedAt) < ttl else { return nil }
+        return e.programs
+    }
+    func set(_ programs: [EPGEntry], for key: String) {
+        cache[key] = Entry(programs: programs, fetchedAt: Date())
+    }
+    func invalidateAll() { cache.removeAll() }
+}
+
+// MARK: - Default Live TV group
+//
+// The group Live TV opens on. Set and cleared by LONG PRESS on the group
+// itself (Logan 2026-09-17), on every Apple platform: the tvOS group sidebar
+// rows and the iOS / iPadOS group pills. There is no menu and no Settings
+// picker; the thumbtack drawn beside the group is the only indicator.
+//
+// Empty = no default, so Live TV opens on the last used group. "All" stores
+// as empty, which is why the pin rule everywhere is
+// `token == stored || (token == "All" && stored.isEmpty)`.
+@MainActor
+enum DefaultChannelGroupStore {
+    static let key = "defaultChannelGroup"
+    /// Sentinel for the leading "All Channels" group, stored as "".
+    static let allToken = "All"
+    private static let hiddenGroupsKey = "hiddenChannelGroups"
+
+    static var current: String { UserDefaults.standard.string(forKey: key) ?? "" }
+
+    static func isDefault(_ token: String) -> Bool {
+        let stored = current
+        return token == stored || (token == allToken && stored.isEmpty)
+    }
+
+    /// The one place the long-press toggle lives: an unpinned group becomes
+    /// the default, the pinned one clears the default. Returns the new value.
+    @discardableResult
+    static func toggle(_ token: String) -> String {
+        let wanted = (token == allToken) ? "" : token
+        let next = isDefault(token) ? "" : wanted
+        UserDefaults.standard.set(next, forKey: key)
+        // Opening on a group the user cannot see makes no sense: making
+        // Recently Watched the default un-hides it (Logan 2026-09-14).
+        if next == ManageGroupsSheet.recentGroupToken {
+            var hidden = HiddenGroupsStore.load(forKey: hiddenGroupsKey)
+            if hidden.remove(next) != nil {
+                HiddenGroupsStore.save(hidden, forKey: hiddenGroupsKey)
+            }
+        }
+        SyncManager.shared.pushPreferencesImmediate()
+        debugLog("[GROUPS] default group -> \(next.isEmpty ? "(none)" : next)")
+        return next
+    }
+}
+
+// MARK: - Channel List View
+// Reads pre-loaded channel data from the shared ChannelStore (owned by MainTabView).
+// The store begins fetching as soon as any server is configured, so this view is
+// typically ready instantly when the user switches to the Live TV tab.
+struct ChannelListView: View {
+    @EnvironmentObject private var nowPlaying: NowPlayingManager
+    @EnvironmentObject private var favoritesStore: FavoritesStore
+    @ObservedObject private var recentsStore = RecentChannelsStore.shared
+    @EnvironmentObject private var channelStore: ChannelStore
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    // #45: collection filter pills live in the group-pill row; observe the
+    // store so the row updates when collections are created / deleted.
+    @ObservedObject private var collectionsStore = ChannelCollectionsStore.shared
+    @Query private var servers: [ServerConnection]
+
+    @State private var filteredChannels: [ChannelDisplayItem] = []
+    @State private var searchText: String = ""
+    @State private var selectedGroup: String = "All"
+    @State private var prefetchTask: Task<Void, Never>? = nil
+    @State private var hiddenGroups: Set<String> = []
+    @State private var showManageGroups = false
+    // "" = Automatic (form-factor default: List on iPhone, Guide on
+    // iPad and Apple TV); "list" / "guide" are explicit overrides set
+    // ONLY by Settings → App Behaviors → Default Live TV View. The
+    // in-screen List / Guide toggle is session-only (showGuideView) and
+    // never writes this key, so an explicit choice on one device no
+    // longer clobbers another form factor's default.
+    @AppStorage("defaultLiveTVView") private var defaultLiveTVView = ""
+    @AppStorage("channelSortMode") private var sortModeRaw = "number"
+    /// Apple TV: the List view is removed from the UI (Logan 2026-09-16,
+    /// unusable with a remote), so the Guide is the only presentation and
+    /// this seeds to `true` -- there is no first-render List flash before
+    /// `.onAppear`. See `TVListView` in Design/Typography.swift.
+    static let guideOnlyPlatform: Bool = {
+        return false
+    }()
+
+    @State private var showGuideView = ChannelListView.guideOnlyPlatform
+
+    /// Session-scoped List/Guide choice. The in-screen toggle is deliberately
+    /// session-only (never writes defaultLiveTVView), but it lived in plain
+    /// @State: leaving the tab (e.g. into Settings) recreates this view and
+    /// the choice silently reverted to the width-adaptive default (Logan,
+    /// iPhone pass 2026-08-19). A static survives view recreation and dies
+    /// with the process - exactly the promised "lasts for the current
+    /// session" semantics.
+    @MainActor
+    enum LiveTVViewSession {
+        static var showGuideView: Bool?
+    }
+    /// True once the user flips the in-screen List / Guide toggle this
+    /// session. Width-based re-seeds (fold / unfold, Split View resize,
+    /// Plus / Max rotation, servers arriving) skip while this is set so a
+    /// manual choice is not stomped. Reset when the Settings default changes.
+    @State private var userDidToggleView = false
+    /// Collapses the iPhone-only chrome (filter pills) when the user
+    /// scrolls down in the channel list. Hysteresis (80 / 20) on the
+    /// scroll-y trigger prevents jitter near the edges.
+    ///
+    /// Both scroll-driven chrome flags live in an `@Observable` box rather
+    /// than in `@State` on this view (Logan 2026-09-16, iPhone flick
+    /// hiccup). They used to be read straight from `body` - the
+    /// `safeAreaInset` and `.scrollAwayTabBar` lines below - so every flip
+    /// during a flick invalidated ChannelListView and rebuilt all eleven
+    /// rows: the device log showed ChannelListView=5 bodies/s and
+    /// ChannelRow=58/s for eleven channels. Only the two leaf views that
+    /// actually read the flags re-render now, and this view's body does not
+    /// touch them, so a scroll produces no ChannelListView body at all.
+    /// This is the same standing rule the rest of this file follows: no
+    /// state writes ON THE TAB during a scroll.
+    @State private var chrome = ListScrollChrome()
+    // Tab bar scroll-away (2026-07-12): its own flag, separate from the
+    // chrome collapse. The pills stay position-based (only shown near
+    // the top, like Android's chip row); the BAR is direction-based via
+    // TabBarScrollTracker so any upward scroll brings it back mid-list.
+    @State private var tabBarTracker = TabBarScrollTracker()
+    /// GH #55 interactive group swipe: live horizontal offset the list
+    /// renders at while a group drag is in flight, and the per-gesture
+    /// dominance latch (nil until the first onChanged decides).
+    @State private var groupDragOffset: CGFloat = 0
+    @State private var groupDragIsHorizontal: Bool? = nil
+    /// Experimental "compact chrome" layout flag, owned by Developer
+    /// Settings. When on (iPhone only), the Manage Groups button moves
+    /// to the nav-bar trailing edge and the filter/search bars become
+    /// hideable via two companion toggles below. Default OFF so the
+    /// main user base is unaffected.
+    @AppStorage("ui.iphone.compactChrome") private var compactChromeiPhone = false
+    /// Hide the group-pill row entirely. Only honored when compact chrome
+    /// is ON, otherwise ignored so the classic layout stays untouched.
+    @AppStorage("ui.iphone.hideFilterBar") private var hideFilterBarCompact = false
+    /// Collapse the always-visible nav-bar search drawer into an
+    /// on-demand pull-down. Only honored when compact chrome is ON.
+    @AppStorage("ui.iphone.hideSearchBar") private var hideSearchBarCompact = false
+    /// v1.6.13.x: Drives whether the iPad nav-bar search drawer is
+    /// shown. Default `false` (hidden), a magnifier toolbar button
+    /// reveals it on demand. iPhone keeps the always-visible classic
+    /// drawer and ignores this flag (its `.searchable` modifier
+    /// doesn't bind to it). Reclaims ~50pt of vertical space, which
+    /// matters now that the corner mini-player on iPad pushes the
+    /// channel-group filter row down.
+    @State private var iPadSearchPresented: Bool = false
+    /// True only on actual iPhones AND when the Developer flag is on.
+    /// iPad / Mac Catalyst always get the classic layout.
+    private var isCompactChrome: Bool {
+        compactChromeiPhone && UIDevice.current.userInterfaceIdiom == .phone
+    }
+
+    /// v1.6.13.x: Captured absolute (`.global`-coordinate-space) top
+    /// edge of the chip-row container, used by
+    /// `miniPlayerTopInset(naturalTopAbsolute:)` to position the
+    /// chip row dynamically below the corner mini regardless of
+    /// device chrome (iPad Mini vs iPad Pro vs Mac Catalyst all
+    /// expose different status-bar / nav-bar / TabView heights).
+    ///
+    /// We use `proxy.frame(in: .global).minY` rather than
+    /// `safeAreaInsets.top` because a view inside a NavigationStack
+    /// content area sees `safeAreaInsets.top == 0` (the chrome was
+    /// already consumed by the nav bar / tab bar above it), that
+    /// returns the wrong value and the padding push overshoots by
+    /// the chrome height. The frame's absolute Y is the true
+    /// position we need to compare against the mini-player's
+    /// absolute bottom edge.
+    ///
+    /// Populated via a `GeometryReader`-backed `.background` +
+    /// `PreferenceKey` so the read doesn't disturb layout. Lives
+    /// OUTSIDE the iOS-only `#if` because the tvOS Guide branch
+    /// also references it for the same dynamic-push behavior.
+    @State private var capturedNaturalTop: CGFloat = 0
+
+    /// Cross-platform accessor used by the shared body content. Always
+    /// returns `false` on tvOS (compact chrome is iPhone-only) so the
+    /// tvOS build still compiles without referencing iOS-only storage.
+    private var compactChromeHidesFilterBar: Bool {
+        return isCompactChrome && hideFilterBarCompact
+    }
+
+    /// v1.6.13: When the corner mini-player is active, the channel-
+    /// group filter row otherwise sits behind the mini's top-right
+    /// corner and gets visually clipped. Push the filter row (and
+    /// everything below it in the VStack) down so the pills are
+    /// fully reachable.
+    ///
+    /// **Dynamic geometry (v1.6.13.x):** The mini player is
+    /// positioned inside HomeView's outer GeometryReader which
+    /// `.ignoresSafeArea()`, so its bottom edge in absolute (screen)
+    /// coords is a fixed `(top-padding + height)` regardless of any
+    /// chrome above (status bar, top-tab bar, nav bar). The chip
+    /// row's natural top in screen coords, however, IS that chrome
+    /// height, and varies by device (iPad Mini, iPad Pro, Mac
+    /// Catalyst, etc). We read the chip row's natural top via a
+    /// `GeometryReader` reading `proxy.frame(in: .global).minY` and
+    /// compute push as `(mini_bottom_abs + gap) - natural_top_abs`,
+    /// so the chip row always lands ~12pt below the mini regardless
+    /// of device size.
+    ///
+    /// Returns 0 on iPhone (uses bottom MiniPlayerBar instead) or
+    /// when no measurement has been published yet, both of those
+    /// cases mean "no push, leave chip row at its natural top".
+    ///
+    /// v1.6.13.x: now driven by the ACTUAL mini-player bottom edge
+    /// captured in HomeView's `iOSMultiviewWrapper` /
+    /// `iOSLegacyPlayerWrapper` and republished via
+    /// `NowPlayingManager.miniPlayerBottomAbs`. Earlier attempts
+    /// computed mini bottom from constants (`24 + 225`) and the
+    /// math was off on iPad iOS 18, the TabView's top tab bar
+    /// shifts the mini's effective frame down by an unknown
+    /// amount that `.ignoresSafeArea()` doesn't penetrate. Using
+    /// the geometry-observer reading guarantees the chip row
+    /// lands exactly `gap` points below whatever the rendered
+    /// mini's bottom edge actually is, on any device + size class.
+    private func miniPlayerTopInset(naturalTopAbsolute: CGFloat) -> CGFloat {
+        guard nowPlaying.isActive, nowPlaying.isMinimized else { return 0 }
+        guard naturalTopAbsolute > 0 else { return 0 }
+        // iPad (2026-10-04): the top tab bar is gone (floating bottom pill,
+        // b990935) and Live TV uses the phone header row (6a1bf19). Pushing
+        // the whole pane below the corner mini used to be hidden behind the
+        // top bar; without it the push left an empty band the mini's height.
+        // The header now stays at the top and only its trailing controls
+        // yield (`iPadMiniHeaderTrailingClearance`), so no top push here.
+        return 0
+    }
+
+    /// Radio Mode on/off re-evaluates the header clearance below.
+    @ObservedObject private var radioSession = RadioModeSession.shared
+
+    /// iPad corner mini: trailing room the phone header row keeps free so
+    /// search, sort and List / Guide sit left of the mini instead of under
+    /// it. Mirrors HomeView's iPad mini geometry (400 pt wide, 24 pt
+    /// trailing inset) plus a 12 pt gap. 0 when no mini is on screen
+    /// (`miniPlayerBottomAbs` is only published while minimized).
+    private var iPadMiniHeaderTrailingClearance: CGFloat {
+        guard UIDevice.current.userInterfaceIdiom == .pad,
+              nowPlaying.isActive, nowPlaying.isMinimized,
+              nowPlaying.miniPlayerBottomAbs > 0,
+              // Radio Mode (iPad 2026-10-13): the session sits minimized in
+              // the docked container but hidden (opacity 0), so there is no
+              // mini on screen to clear; its card shows in the cast slot.
+              !radioSession.isActive else { return 0 }
+        return 400 + 24 + 12
+    }
+
+
+    /// Resolves the width-adaptive List / Guide default for the current
+    /// horizontal size class. Single source of truth so every dispatch site
+    /// (onAppear, servers-arrived, and fold / unfold) agrees.
+    ///
+    /// Compact (iPhone portrait, folded foldable): default List; only an
+    /// explicit "guide" opts in. Regular (iPad, unfolded foldable, Plus / Max
+    /// landscape): default Guide; only an explicit "list" opts out. A nil size
+    /// class is treated as regular. Guide always needs EPG data to render, so a
+    /// server without EPG stays on List regardless of the preference.
+    private func resolvedGuideDefault(hasEPG: Bool) -> Bool {
+        guard hasEPG else { return false }
+        if sizeClass == .compact { return defaultLiveTVView == "guide" }
+        return defaultLiveTVView != "list"
+    }
+
+    // #42 Part 1: true while a guide Left is held past threshold; pins focus on
+    // the "All" pill so the still-held press cannot overshoot the leading
+    // controls. Unconditional (ChannelListView member) because the shared
+    // group-filter-bar reads it to gate collection-pill focus; only the tvOS
+    // Left-hold detector sets it true.
+    @State private var leftHoldPinningAll = false
+
+    /// Remote hint strip (Logan 2026-09-11). Synced preference, default ON.
+    @AppStorage(showRemoteHintsKey) private var showRemoteHints = true
+
+
+    // Docked group sidebar (Remote Control "Group Selection: Sidebar Menu",
+    // default off). Declared UNCONDITIONALLY (the guide branch is shared with
+    // the iPad guide); the tvOS-only behavior is gated inside the members below.
+    @State private var guideSidebarOpen = false
+    /// Single-flight guard: see EPGGuideView.focusRestoreTask.
+    @State private var focusRestoreTask: Task<Void, Never>?
+    @State private var guideSidebarReturnProgramID: String?
+    /// #196 sidebar preview: the group active when the sidebar OPENED, so
+    /// Back can revert a live preview. Nil while the sidebar is closed.
+    @State private var guideSidebarOriginalGroup: String?
+    /// 90ms preview debounce (Android parity) so D-pad travel through the
+    /// rail doesn't re-filter the grid on every row.
+    @State private var guideSidebarPreviewTask: Task<Void, Never>?
+    @ObservedObject private var remoteStore = RemoteControlStore.shared
+
+    /// Sidebar-mode active (tvOS only): hides the pills row + arms short-Left
+    /// on the now-airing column. Mutually exclusive with the group pills.
+    private var guideSidebarSelectorActive: Bool {
+        // Phone (Logan 2026-09-05): its own Group Selection setting, sidebar
+        // by default (the pill row is crowded on a phone); the Apple TV
+        // keeps its own choice. iPad shares the phone's bottom-bar layout
+        // (Logan 2026-10-04), so it shares the setting and the drawer too.
+        return usesPhoneLiveTVLayout && phoneGroupSelector != "pills"
+    }
+
+    /// Whether the group pills themselves belong in the filter row. On tvOS the
+    /// row also carries controls that have nothing to do with group selection
+    /// (Guide/List, Search, Refresh) and therefore always renders, so this is
+    /// what decides the pills alone: gone in sidebar mode, where the sidebar IS
+    /// the group selector, and gone when the playlist has nothing to filter by.
+    /// Always true elsewhere -- iOS gates the whole row at its call sites.
+    /// tvOS: guide chrome (group pills, Channel Preview description, the
+    /// guide's corner clock) refuses focus while the guide reclaims it after
+    /// the player leaves fullscreen, so the refocus lands on the grid cell
+    /// without a detour. Same hold as the nav circles (eae211a).
+    private var guideChromeFocusHold: Bool {
+        return false
+    }
+
+    private var showsGroupPills: Bool {
+        return !guideSidebarSelectorActive
+    }
+
+    /// Close the docked group sidebar and restore focus to the guide grid. On
+    /// tvOS, `.guideGroupSidebarDismissed` runs EPGGuideView's retry-assert
+    /// focus loop so Right/Back land back on the origin cell (rebind:false) or
+    /// the newly-filtered now-cell (rebind:true = group changed).
+    private func closeGuideSidebar(rebind: Bool) {
+        withAnimation(.easeOut(duration: 0.28)) { guideSidebarOpen = false }
+    }
+
+
+    private let hiddenGroupsKey = "hiddenChannelGroups"
+    @AppStorage("liveTVLayout") private var liveTVLayout = "basic"
+    /// Favorites is a channel group now, always first (Logan 2026-09-05; the
+    /// Favorites tab is gone). Same sentinel shape as "collection:<id>".
+    static let favoritesToken = "favorites"
+    private var favoritesToken: String { Self.favoritesToken }
+    /// Synthetic "Recently Watched" group: the last 25 channels watched on
+    /// this playlist, most recent first (Logan 2026-09-14). Unchecked in
+    /// Manage Groups by default.
+    static let recentlyWatchedToken = ManageGroupsSheet.recentGroupToken
+    private var recentlyWatchedToken: String { Self.recentlyWatchedToken }
+    /// Group the guide opens on (Manage Groups > long press / Default Group).
+    /// Empty = All. Applied once per playlist load.
+    private let defaultChannelGroupKey = DefaultChannelGroupStore.key
+    @State private var defaultGroupApplied = false
+    /// Mirrors the stored default so the pinned pill / drawer row re-renders
+    /// the moment a long press changes it.
+    @State private var defaultGroupToken: String = DefaultChannelGroupStore.current
+    /// Brief "Live TV opens on X" confirmation after a tvOS pill hold.
+    @State private var defaultGroupToast: String? = nil
+    @AppStorage(phoneGroupSelectorKey) private var phoneGroupSelector = "sidebar"
+    @State private var phoneSearchPresented = false
+    /// Phone sidebar mode: the group drawer over the list / guide.
+    @State private var phoneDrawerOpen = false
+    /// User-defined Live TV group display order + sort mode (Manage Groups).
+    /// Order is a native [String] array (order-preserving iCloud path);
+    /// mode is "default" / "alphabetical" / "manual". Empty order + default
+    /// mode == server order.
+    private let channelGroupOrderKey = "channelGroupOrder"
+    private var channelGroupSortModeKey: String { channelGroupOrderKey + ".sortMode" }
+    @State private var groupOrder: [String] = []
+    @State private var groupSortMode: String = GroupSortMode.default.rawValue
+
+    var body: some View {
+        let _ = TabProbe.body("ChannelListView")
+        let _ = TabProbe.probePublishers(channelStore: channelStore, nowPlaying: nowPlaying,
+                                         favorites: favoritesStore, collections: collectionsStore,
+                                         guide: GuideStore.shared)
+        NavigationStack {
+            mainContent
+                // Mark as Radio Channel confirmations and errors (rows and
+                // guide cells post; the list owns the toast).
+                .modifier(ChannelListToastHost(toast: $defaultGroupToast))
+                // Frame / input probe also covers the Live TV list, which is
+                // where the iPhone scroll lag is reported (Logan 2026-09-12).
+                .onAppear { FrameProbe.start("channel list") }
+                .onDisappear { FrameProbe.stop() }
+                // No title: the tab bar already says where we are (Logan
+                // 2026-09-05). Phone: no bar at all, the header row above the
+                // list carries the controls; the bar shows only while the
+                // system search is up. iPad keeps its bar.
+                .navigationTitle("")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar(isPhoneIdiom && !(phoneSearchPresented || !searchText.isEmpty) ? .hidden : .visible,
+                         for: .navigationBar)
+                .toolbarBackground(Color.appBackground, for: .navigationBar)
+                .toolbar {
+                    // Sort menu (iOS + tvOS)
+                    ToolbarItem(placement: {
+                        .navigationBarTrailing
+                    }()) {
+                        Menu {
+                            Button {
+                                sortModeRaw = "number"
+                            } label: {
+                                if sortModeRaw == "number" { Label("By Number", systemImage: "checkmark") } else { Text("By Number") }
+                            }
+                            Button {
+                                sortModeRaw = "name"
+                            } label: {
+                                if sortModeRaw == "name" { Label("By Name", systemImage: "checkmark") } else { Text("By Name") }
+                            }
+                            Button {
+                                sortModeRaw = "favorites"
+                            } label: {
+                                if sortModeRaw == "favorites" { Label("Favorites First", systemImage: "checkmark") } else { Text("Favorites First") }
+                            }
+                        } label: {
+                            Image(systemName: "arrow.up.arrow.down")
+                                .foregroundColor(.accentPrimary)
+                        }
+                    }
+                    // iPad background-sync indicator (the phone header row
+                    // carries its own; the phone hides this bar entirely).
+                    if !isPhoneIdiom, channelStore.isLoading || channelStore.isEPGLoading {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            PhoneHeaderSyncSpinner(size: 14)
+                        }
+                    }
+                    // Guide view toggle: shown on all iOS width classes now
+                    // that iPhone (and the folded foldable) can open the Guide.
+                    // Session-only: toggling never writes defaultLiveTVView.
+                    // (iPad search button moved into the chip row, see
+                    // groupFilterBar's iPad branch.)
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            userDidToggleView = true
+                            withAnimation(.spring(response: 0.25)) { showGuideView.toggle() }
+                            LiveTVViewSession.showGuideView = showGuideView
+                        } label: {
+                            Image(systemName: showGuideView ? "list.bullet" : "calendar")
+                                .foregroundColor(.accentPrimary)
+                        }
+                    }
+                    // Compact-chrome mode: surface the Manage Groups button in
+                    // the nav bar since the inline pill-bar copy is hidden.
+                    // Badge mirrors the inline button's count so users keep
+                    // visibility into how many groups are hidden.
+                    if isCompactChrome {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button {
+                                showManageGroups = true
+                            } label: {
+                                ZStack(alignment: .topTrailing) {
+                                    Image(systemName: "line.3.horizontal.decrease.circle")
+                                        .foregroundColor(.accentPrimary)
+                                    if hiddenGroups.count > 0 {
+                                        Text("\(hiddenGroups.count)")
+                                            .scaledFont(.system(size: 9, weight: .bold))
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Color.statusWarning)
+                                            .clipShape(Capsule())
+                                            .offset(x: 8, y: -6)
+                                    }
+                                }
+                            }
+                            .accessibilityLabel("Manage Groups")
+                        }
+                    }
+                }
+                // v1.6.13.x: iPhone keeps the classic always-visible
+                // nav-bar drawer search field (collapsing under
+                // compact chrome). iPad now omits `.searchable`
+                // entirely, the search UX moved to a button +
+                // inline TextField inside the chip row (see
+                // `groupFilterBar`'s iPad branch). The earlier
+                // attempt to use `.searchable(isPresented:)` to
+                // hide the drawer didn't actually hide it on iOS 18
+                // (placement-driven visibility wins over the binding
+                // for `.navigationBarDrawer`), so we drop the modifier
+                // on iPad rather than fight the system.
+                .modifier(
+                    PerIdiomSearchableModifier(
+                        text: $searchText,
+                        presented: $phoneSearchPresented,
+                        iPhoneDisplayMode: .always
+                    )
+                )
+                // Leaving this tab, or entering the fullscreen player,
+                // cancels and closes search (Logan 2026-09-16).
+                .onDismissSearch {
+                    if phoneSearchPresented { phoneSearchPresented = false }
+                    if iPadSearchPresented { iPadSearchPresented = false }
+                    if !searchText.isEmpty { searchText = "" }
+                }
+                .onChange(of: searchText)       { _, _ in filterChannels() }
+                .onChange(of: selectedGroup)    { _, _ in filterChannels() }
+                .onChange(of: sortModeRaw)      { _, _ in filterChannels() }
+                // #45: re-filter when a collection's membership changes so a
+                // collection view updates live as channels are added/removed.
+                .onChange(of: collectionsStore.collections) { _, _ in filterChannels() }
+                // Re-sort when favorites change so the Favorites-First mode
+                // drops newly-unfavorited rows back into the number-sorted
+                // section below without waiting for the user to switch
+                // tabs or groups. `.count` is a cheap membership-change
+                // signal: add and remove both bump it, while drag-reorder
+                // inside the Favorites tab (which doesn't affect this
+                // view's sort) leaves it unchanged.
+                .onChange(of: favoritesStore.favoriteItems.count) { _, _ in
+                    favoritesDidChange()
+                }
+                // Recently Watched is a live group: a tune reorders it.
+                .onChange(of: recentsStore.recentIDs) { _, _ in
+                    if selectedGroup == recentlyWatchedToken { filterChannels() }
+                }
+
+                // Sync filtered list whenever the store delivers new data.
+                .onChange(of: channelStore.channels) { _, items in
+                    // A group selected under the previous playlist may not exist
+                    // in the one just activated; keeping it filters the list and
+                    // guide down to nothing with no visible reason. Only reset
+                    // once the new group list is non-empty: mid-refresh the store
+                    // clears to [] and a same-playlist reload must not clobber a
+                    // valid selection. Collection tokens are cross-playlist and
+                    // have their own deleted-collection cleanup.
+                    reconcileSelectedGroupWithPlaylist()
+                    filterChannels()
+                    favoritesStore.register(items: items)
+                }
+                // Warm-launch deep link: the app was already running, channels
+                // are already loaded, and an astralOpenChannel notification
+                // arrived (tvOS: Top Shelf click; both platforms: the DVR
+                // "Continue on Live TV" hand-off). Start playback immediately.
+                // Cross-platform since 2026-08-27 - only tvOS ever POSTS the
+                // Top Shelf flavor, so iOS behavior changes only for the new
+                // hand-off path.
+                .onReceive(NotificationCenter.default.publisher(for: .astralOpenChannel)) { notif in
+                    guard let channelID = notif.userInfo?["channelID"] as? String else { return }
+                    if let channel = channelStore.channels.first(where: { $0.id == channelID }),
+                       !channel.streamURLs.isEmpty {
+                        debugLog("🔗 ChannelListView: warm deep link → playing \(channel.name)")
+                        UserDefaults.standard.removeObject(forKey: "launchChannelID")
+                        // Also the Kept Live card's tune and Jump to Channel:
+                        // a pick, so it asks where during a remote session.
+                        pickChannel(channel)
+                    } else {
+                        // Channels not yet loaded, leave launchChannelID set so
+                        // the cold-path handler picks it up when they arrive.
+                        debugLog("🔗 ChannelListView: warm deep link received but channel not loaded yet")
+                    }
+                }
+                // EPG-search jump: force guide mode and clear any group
+                // filter so the target channel is visible. EPGGuideView
+                // consumes the pending target (UserDefaults) and scrolls.
+                .onReceive(NotificationCenter.default.publisher(for: .astralJumpToGuideProgram)) { _ in
+                    if selectedGroup != fallbackGroup {
+                        selectedGroup = fallbackGroup
+                        filterChannels()
+                    }
+                    showGuideView = true
+                }
+                .onAppear {
+                    handleChannelListAppear()
+                }
+                .onDisappear {
+                    prefetchTask?.cancel()
+                    prefetchTask = nil
+                }
+                .sheet(isPresented: $showManageGroups) {
+                    manageGroupsSheet
+                }
+                .onChange(of: servers.count) { _, _ in
+                    // Re-evaluate guide view default when servers arrive (e.g., fresh install + iCloud sync)
+                    let activeServer = servers.first(where: { $0.isActive }) ?? servers.first
+                    let hasEPG: Bool = {
+                        guard let s = activeServer else { return false }
+                        if s.type == .m3uPlaylist { return !s.effectiveEPGURL.isEmpty }
+                        return true
+                    }()
+                    // Upgrade-only: once EPG arrives, move to Guide if the
+                    // width-adaptive default wants it, but ONLY if the user has
+                    // not manually toggled the view this session. A manual List
+                    // choice must survive a server arriving.
+                    if !userDidToggleView && resolvedGuideDefault(hasEPG: hasEPG) && !showGuideView {
+                        showGuideView = true
+                    }
+                }
+                // Foldables flip the horizontal size class on fold / unfold
+                // (also iPad Split View resize and Plus / Max rotation). Re-seed
+                // the List / Guide default to the new width so a folded foldable
+                // lands on List and an unfolded one lands on Guide, mirroring
+                // Android re-seeding to the width default on a width-class
+                // change. Skipped while a guide-jump is pending (so this does
+                // not fight the EPG-search jump, which forces Guide and consumes
+                // its own pending target) and skipped once the user has manually
+                // toggled the view this session, so an explicit choice survives
+                // fold / unfold, Split View resize, and rotation.
+                .onChange(of: sizeClass) { _, _ in
+                    guard UserDefaults.standard.object(forKey: "guideJumpChannelID") == nil else { return }
+                    guard !userDidToggleView else { return }
+                    let activeServer = servers.first(where: { $0.isActive }) ?? servers.first
+                    let hasEPG: Bool = {
+                        guard let s = activeServer else { return false }
+                        if s.type == .m3uPlaylist { return !s.effectiveEPGURL.isEmpty }
+                        return true
+                    }()
+                    showGuideView = resolvedGuideDefault(hasEPG: hasEPG)
+                }
+                // Changing the Settings default is an explicit, deliberate
+                // choice, so it wins over a stale session toggle: clear the
+                // toggle flag and re-seed the view immediately from the new
+                // default.
+                .onChange(of: defaultLiveTVView) { _, _ in
+                    userDidToggleView = false
+                    let activeServer = servers.first(where: { $0.isActive }) ?? servers.first
+                    let hasEPG: Bool = {
+                        guard let s = activeServer else { return false }
+                        if s.type == .m3uPlaylist { return !s.effectiveEPGURL.isEmpty }
+                        return true
+                    }()
+                    showGuideView = resolvedGuideDefault(hasEPG: hasEPG)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .syncManagerDidApplyPreferences)) { _ in
+                    ManageGroupsSheet.seedRecentlyWatchedHidden(storageKey: hiddenGroupsKey)
+                    hiddenGroups = HiddenGroupsStore.load(forKey: hiddenGroupsKey)
+                    defaultGroupToken = DefaultChannelGroupStore.current
+                    groupOrder = GroupOrderStore.load(forKey: channelGroupOrderKey)
+                    groupSortMode = GroupOrderStore.loadMode(forKey: channelGroupSortModeKey)
+                    if !selectedGroup.hasPrefix("collection:") && !groupTokens.contains(selectedGroup) {
+                        selectedGroup = fallbackGroup
+                    }
+                    filterChannels()
+                }
+                // Cancel EPG prefetch the moment playback starts, network requests
+                // compete with the IPTV stream and cause buffering / stutter.
+                .onChange(of: nowPlaying.isActive) { _, active in
+                    if active {
+                        prefetchTask?.cancel()
+                        prefetchTask = nil
+                        debugLog("📺 EPG prefetch: cancelled, playback started")
+                    }
+                }
+        }
+    }
+
+    // MARK: - Main Content
+
+    @ViewBuilder
+    private var mainContent: some View {
+        ZStack {
+            Color.appBackground.ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                bodyContent
+            }
+            .overlay {
+                if phoneDrawerOpen {
+                    phoneGroupDrawer
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.22), value: phoneDrawerOpen)
+            // Catch-all: any transition with no matching [DRAWER] close line
+            // above it came from somewhere other than the three known writers
+            // (a view rebuild / @State reset), which is the next thing to look
+            // at if the drawer still closes on a hold release.
+            .onChange(of: phoneDrawerOpen) { _, open in
+                debugLog("[DRAWER] state -> \(open ? "open" : "closed")")
+            }
+            // GH #20 follow-up (user report 2026-07-12): this VStack consumed
+            // the bottom safe area BEFORE the List inside could reach it, so
+            // the scroll frame ended at the tab bar line - rows hard-clipped
+            // there (the ignoresSafeArea on the List only stretched its
+            // BACKGROUND, proven by the red-background debug build). Extend
+            // the CONTAINER so the scroll view owns the full height; the
+            // trailing spacer row provides the bottom content padding.
+            // iOS-only: tvOS has no bottom bar.
+            .ignoresSafeArea(.container, edges: .bottom)
+        }
+    }
+
+    /// Phone Live TV chrome (header row, group drawer, no navigation bar,
+    /// collapse on scroll). iPad runs the same bottom-bar layout since
+    /// 2026-10-04, so it takes this chrome too; physical-size choices
+    /// (row heights, grids, sheets vs popovers) still read the real idiom.
+    private var isPhoneIdiom: Bool { usesPhoneLiveTVLayout }
+    /// Header overflow (three-dot) state: see `phoneHeaderActions`.
+    @State private var phoneHeaderActionsExpanded = false
+
+    /// Phone header row (Logan 2026-09-05, mockup "Phone · Live TV"): the
+    /// groups control at the left, the pills (pills mode) or the active group
+    /// name and count (sidebar mode), then search, sort and the list / guide
+    /// toggle. No navigation bar above it.
+    private var phoneHeaderRow: some View {
+        HStack(spacing: 8) {
+            if guideSidebarSelectorActive {
+                Button {
+                    debugLog("[DRAWER] open: header button")
+                    phoneDrawerOpen = true
+                } label: { phoneCircle("sidebar.leading") }
+                    .accessibilityLabel("Channel Groups")
+                Text(Self.groupTitle(selectedGroup))
+                    .scaledFont(.labelMedium)
+                    .foregroundColor(.textPrimary)
+                    .lineLimit(1)
+                Text("\(filteredChannels.count)")
+                    .scaledFont(.labelSmall.subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                Spacer(minLength: 4)
+            } else {
+                Button { showManageGroups = true } label: {
+                    ZStack(alignment: .topTrailing) {
+                        phoneCircle("line.3.horizontal.decrease.circle")
+                        if hiddenGroups.count > 0 {
+                            Text("\(hiddenGroups.count)")
+                                .scaledFont(.system(size: 9, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 4).padding(.vertical, 1)
+                                .background(Color.statusWarning)
+                                .clipShape(Capsule())
+                                .offset(x: 4, y: -4)
+                        }
+                    }
+                }
+                .accessibilityLabel("Manage Groups")
+                if phoneGroupPillsShown {
+                    // Clipped: the strip must not run under the icons.
+                    groupFilterBar
+                        .clipped()
+                } else {
+                    Spacer(minLength: 4)
+                }
+            }
+            // Background sync indicator (not a button): pull-to-refresh
+            // stays the manual trigger, this only says a sync is running.
+            if channelStore.isLoading || channelStore.isEPGLoading {
+                PhoneHeaderSyncSpinner()
+            }
+            phoneHeaderActions
+        }
+        .padding(.horizontal, 16)
+        .padding(.trailing, iPadMiniHeaderTrailingClearance)
+        .animation(.spring(response: 0.35), value: iPadMiniHeaderTrailingClearance)
+        .padding(.vertical, 6)
+        // Tapping anywhere else in the header collapses the overflow.
+        .background(
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { collapsePhoneHeaderActions() }
+        )
+        .onChange(of: selectedGroup) { _, _ in collapsePhoneHeaderActions() }
+    }
+
+    /// Parity with the Android header (2026-09-14): with the group pills
+    /// on screen the trailing circles would run over the pill strip, so
+    /// they fold behind a three-dot button that EXPANDS IN PLACE (the
+    /// real circles appear inline, not a menu). Any of them, or a tap
+    /// elsewhere, collapses it again. Sidebar mode has no pill strip and
+    /// therefore never shows the three-dot button.
+    @ViewBuilder private var phoneHeaderActions: some View {
+        if phoneHeaderActionsCollapsible && !phoneHeaderActionsExpanded {
+            Button {
+                withAnimation(.spring(response: 0.25)) { phoneHeaderActionsExpanded = true }
+            } label: { phoneCircle("ellipsis") }
+            .accessibilityLabel("More")
+            .transition(.opacity)
+        } else {
+            Button {
+                collapsePhoneHeaderActions()
+                phoneSearchPresented = true
+            } label: { phoneCircle("magnifyingglass") }
+                .accessibilityLabel("Search")
+            Menu {
+                Button {
+                    sortModeRaw = "number"
+                    collapsePhoneHeaderActions()
+                } label: {
+                    if sortModeRaw == "number" { Label("By Number", systemImage: "checkmark") } else { Text("By Number") }
+                }
+                Button {
+                    sortModeRaw = "name"
+                    collapsePhoneHeaderActions()
+                } label: {
+                    if sortModeRaw == "name" { Label("By Name", systemImage: "checkmark") } else { Text("By Name") }
+                }
+                Button {
+                    sortModeRaw = "favorites"
+                    collapsePhoneHeaderActions()
+                } label: {
+                    if sortModeRaw == "favorites" { Label("Favorites First", systemImage: "checkmark") } else { Text("Favorites First") }
+                }
+            } label: { phoneCircle("arrow.up.arrow.down") }
+            .accessibilityLabel("Sort")
+            Button {
+                collapsePhoneHeaderActions()
+                userDidToggleView = true
+                withAnimation(.spring(response: 0.25)) { showGuideView.toggle() }
+                LiveTVViewSession.showGuideView = showGuideView
+            } label: { phoneCircle(showGuideView ? "list.bullet" : "calendar") }
+            .accessibilityLabel(showGuideView ? "Show List" : "Show Guide")
+        }
+    }
+
+    /// True while the pill strip owns the header's middle: sidebar mode
+    /// keeps all three circles, since nothing competes for the width.
+    private var phoneHeaderActionsCollapsible: Bool {
+        !guideSidebarSelectorActive && phoneGroupPillsShown
+    }
+
+    private var phoneGroupPillsShown: Bool {
+        (channelStore.orderedGroups.count > 1 || !hiddenGroups.isEmpty)
+            && !compactChromeHidesFilterBar
+    }
+
+    private func collapsePhoneHeaderActions() {
+        guard phoneHeaderActionsExpanded else { return }
+        withAnimation(.spring(response: 0.25)) { phoneHeaderActionsExpanded = false }
+    }
+
+    private func phoneCircle(_ systemImage: String) -> some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 17, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+            .foregroundColor(.textPrimary)
+            .frame(width: 38, height: 38)
+            .background(Circle().fill(Color.textPrimary.opacity(0.08)))
+    }
+
+    /// Sidebar mode's drawer: Favorites first, All, then the visible groups;
+    /// the default group is pinned; a long press lifts a row to reorder
+    /// (the new order is the pill order too); Manage Groups sits beside
+    /// the heading (Logan 2026-09-05).
+    private var phoneGroupDrawer: some View {
+        ZStack(alignment: .leading) {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    debugLog("[DRAWER] close: scrim tap")
+                    phoneDrawerOpen = false
+                }
+            PhoneGroupDrawer(
+                tokens: groupTokens,
+                selected: selectedGroup,
+                favoritesToken: favoritesToken,
+                defaultToken: defaultGroupToken,
+                onSelect: { token in
+                    debugLog("[DRAWER] close: row select \(token)")
+                    withAnimation(.spring(response: 0.25)) { selectedGroup = token }
+                    phoneDrawerOpen = false
+                },
+                onReorder: { order in
+                    groupSortMode = GroupSortMode.manual.rawValue
+                    groupOrder = order
+                    GroupOrderStore.save(order, forKey: channelGroupOrderKey)
+                    GroupOrderStore.saveMode(GroupSortMode.manual.rawValue, forKey: channelGroupSortModeKey)
+                    filterChannels()
+                },
+                onManage: {
+                    debugLog("[DRAWER] close: manage groups")
+                    phoneDrawerOpen = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { showManageGroups = true }
+                },
+                // Thumbtack button on a drawer row: same default-group toggle
+                // the pills do (Logan 2026-09-18). Long press is NOT used
+                // here, it collided with the List's hold-and-drag reorder.
+                // The drawer stays open so the pin change is visible.
+                onSetDefault: { token in
+                    debugLog("[DRAWER] set default from row: \(token)")
+                    setDefaultGroup(token)
+                }
+            )
+            // Width is owned by PhoneGroupDrawer (it fits itself to the
+            // longest visible group label), so the slide-in transition and
+            // the scrim both work off the same computed value.
+            .background(Color.appBackground.ignoresSafeArea())
+            .shadow(color: .black.opacity(0.45), radius: 24, x: 8, y: 0)
+            .transition(.move(edge: .leading))
+        }
+    }
+
+    /// GH #72 (ochaos, 1.8.16): a group with no channels rendered a blank
+    /// guide / list containing nothing focusable. In sidebar mode the group
+    /// pills are hidden, so once the user landed in an empty group there was
+    /// no control left on screen at all. This notice keeps a focusable way
+    /// back to every channel on screen no matter which group-selection mode,
+    /// view mode, or platform the user is on. The hold-Left fix in
+    /// EPGGuideView (the sidebar no longer requires a focused cell) is the
+    /// other half; this is the one that does not depend on a remote gesture.
+    @ViewBuilder
+    private var emptyGroupNotice: some View {
+        EmptyStateView(
+            icon: searchText.isEmpty ? "rectangle.on.rectangle.slash" : "magnifyingglass",
+            title: searchText.isEmpty ? "No Channels in This Group" : "No Matching Channels",
+            message: searchText.isEmpty
+                ? "This group has no channels yet. It fills in as soon as the provider assigns some."
+                : "No channels in this group match that search.",
+            action: {
+                searchText = ""
+                selectedGroup = fallbackGroup
+            },
+            actionTitle: "Show All Channels"
+        )
+    }
+
+    @ViewBuilder
+    private var bodyContent: some View {
+        if servers.isEmpty {
+            EmptyStateView(
+                icon: "antenna.radiowaves.left.and.right",
+                title: "No Servers",
+                message: "Add a server in Settings to browse Live TV channels."
+            )
+        } else if channelStore.isLoading && channelStore.channels.isEmpty {
+            LoadingView(message: "Loading channels…")
+        } else if let error = channelStore.error, channelStore.channels.isEmpty {
+            errorView(error)
+        } else if channelStore.channels.isEmpty {
+            EmptyStateView(
+                icon: "tv",
+                title: "No Channels",
+                message: "No channels found on the active server.",
+                action: { Task { await channelStore.forceRefresh(servers: servers, modelContext: modelContext) } },
+                actionTitle: "Refresh"
+            )
+        } else if showGuideView || Self.guideOnlyPlatform {
+            // v1.6.13.x: Outer VStack with a 0-height GHOST CAPTURE
+            // POINT as its first child, then the actual padded VStack
+            // as its second child. The ghost's position equals
+            // bodyContent's natural top (= chip row's natural top
+            // before any push). Padding the inner VStack stretches
+            // the outer VStack DOWNWARD but doesn't move the ghost,
+            // so the captured value is rock-stable. This is what
+            // every prior attempt was trying to achieve via various
+            // marker placements; this position is the one SwiftUI
+            // actually honors.
+            VStack(spacing: 0) {
+                Color.clear
+                    .frame(height: 0)
+                    .allowsHitTesting(false)
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.frame(in: .global).minY
+                    } action: { newValue in
+                        capturedNaturalTop = newValue
+                    }
+
+                // Overlay, not a docked column (Logan 2026-09-05): the pane
+                // sits over the guide's channel column, below the banner and
+                // pill row, and nothing else moves. The Shift guide sidebar
+                // layout (Logan 2026-09-14) instead moves only the guide grid
+                // right by the pane's width, with no scrim.
+                ZStack(alignment: .topLeading) {
+                    VStack(spacing: 0) {
+                        // Compact-chrome honors the user's hide-filter preference even
+                        // in the iPad Guide layout (iPad itself is gated by the flag,
+                        // so this only activates on actual iPhones in landscape).
+                        if isPhoneIdiom {
+                            phoneHeaderRow
+                        } else if (channelStore.orderedGroups.count > 1 || !hiddenGroups.isEmpty)
+                            && !compactChromeHidesFilterBar {
+                            groupFilterBar
+                                .padding(.vertical, 10)
+                        }
+                        EPGGuideView(
+                            channels: filteredChannels,
+                            servers: Array(servers),
+                            onSelectChannel: { item in
+                                pickChannel(item)
+                            },
+                            sidebarOpen: guideSidebarOpen,
+                            chromeFocusHold: guideChromeFocusHold,
+                            onPreviewProgramChange: previewProgramHandler,
+                            onRequestGroupSidebar: { programID in
+                                guideSidebarReturnProgramID = programID
+                                // #196: remember the group for the Back-revert
+                                // of a live preview.
+                                guideSidebarOriginalGroup = selectedGroup
+                                withAnimation(.easeOut(duration: 0.28)) { guideSidebarOpen = true }
+                            }
+                        )
+                        // iPad guide cut off after 8 rows (Logan 2026-10-05,
+                        // ipad 23:39-23:40): the keyboard from editing the
+                        // playlist in Settings left its bottom inset on this
+                        // off-screen tab, so the grid kept a frame ending at
+                        // the old keyboard top (about 340 pt short). The grid
+                        // has no text input, so it never yields to the keyboard.
+                        .ignoresSafeArea(.keyboard, edges: .bottom)
+                        // GH #72: the guide itself stays mounted (it owns the
+                        // hold-Left / sidebar receivers), the notice just
+                        // covers its empty grid.
+                        .overlay {
+                            if filteredChannels.isEmpty {
+                                emptyGroupNotice
+                                    .background(Color.appBackground)
+                            }
+                        }
+                    }
+                }
+                .padding(.top, miniPlayerTopInset(naturalTopAbsolute: capturedNaturalTop))
+                .animation(.spring(response: 0.35), value: capturedNaturalTop)
+                .animation(.spring(response: 0.35), value: nowPlaying.isMinimized)
+                .animation(.spring(response: 0.35), value: nowPlaying.miniPlayerBottomAbs)
+                // #42 Part 1: long-press Left anywhere in the guide jumps focus
+                // to the "All" pill. The detector installs a window-level Left
+                // long-press recognizer (mounted only while the guide is shown);
+                // a short Left still scrolls the timeline via onMoveCommand.
+            }
+        } else {
+            channelListContent
+        }
+    }
+
+    // MARK: - Channel List Content
+
+    private var channelListContent: some View {
+        channelListBody
+    }
+
+    private var channelListBody: some View {
+        VStack(spacing: 0) {
+            // v1.6.18, pills only live in the VStack on iPad and tvOS,
+            // where they're always visible. The iPhone scroll-collapse
+            // path moves the pills into `.safeAreaInset(.top)` on the
+            // List itself (further down), see the comment at that
+            // attachment for the full rationale. Short version: pills
+            // here in the VStack, conditionally rendered with the iPhone
+            // `isChromeCollapsed` `if`, caused an infinite layout
+            // oscillation at the snap-out threshold. Removing the pills
+            // shrunk the VStack which shifted the List's frame, which
+            // perturbed the scroll geometry, which re-triggered the
+            // hysteresis check, which un-collapsed the pills, repeat.
+            // Pulling the iPhone pills out of the VStack and into a
+            // List-level safe area inset means show/hide changes the
+            // List's TOP INSET only, the List's content offset and
+            // outer frame are stable, so the feedback loop can't form.
+            if (channelStore.orderedGroups.count > 1 || !hiddenGroups.isEmpty)
+                && !compactChromeHidesFilterBar {
+                if !usesPhoneLiveTVLayout {
+                    groupFilterBar
+                        .padding(.vertical, 10)
+                }
+            }
+
+            // A lazy stack, not a List (probe 2026-09-06): the List ran every
+            // channel row's body on each store publish (655 distinct rows per
+            // pass, two passes per render), so a guide commit or a tab switch
+            // rebuilt the whole playlist. LazyVStack builds only the rows on
+            // screen. The rows draw their own card chrome, so the old row
+            // insets become padding; pull-to-refresh, the header inset, the
+            // group swipe and scroll-away all work on a ScrollView.
+            ScrollViewReader { listProxy in
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 0) {
+                    // Re-tap-the-tab anchor (zero height, so it changes
+                    // nothing about the layout): the list has no header row
+                    // that is guaranteed to exist, and the first channel row
+                    // sits below the group chrome.
+                    Color.clear.frame(height: 0).id("list.top")
+                    // GH #72: an empty group is a legitimate state (a provider
+                    // group the upstream has not populated yet), not an error,
+                    // so it gets a notice with a way out rather than a blank list.
+                    if filteredChannels.isEmpty {
+                        emptyGroupNotice
+                            .frame(minHeight: 320)
+                    }
+                    // Key rows by the unique stream URL, not the channel id,
+                    // so a provider that reuses one tvg-id across distinct
+                    // channels can't produce duplicate SwiftUI identities.
+                    ForEach(filteredChannels, id: \.rowKey) { item in
+                        ChannelRow(
+                            item: item,
+                            onTap: { pickChannel(item) },
+                            fetchUpcoming: makeFetchUpcoming(for: item)
+                        )
+                        .padding(.vertical, sizeClass == .regular ? 5 : 3)
+                        .padding(.horizontal, sizeClass == .regular ? 24 : 16)
+                        .id(item.id)
+                    }
+                    // GH #20 follow-up: with the list frame extended under the
+                    // floating tab bar (ignoresSafeArea below), this spacer is
+                    // the bottom content padding that lets the last channel row
+                    // scroll clear of the bar + home indicator.
+                    Color.clear.frame(height: 96)
+                }
+            }
+            .background(Color.appBackground)
+            // Apple GH #55 (jayegles): swiping left/right on the list cycles
+            // the selected group pill (left = next, right = previous, clamped
+            // at the ends). simultaneousGesture plus the horizontal-dominance
+            // check keeps vertical scrolling, pull-to-refresh, and row taps
+            // untouched. A collection filter isn't part of the cycle; the
+            // first swipe from one lands on All. Mirrored on Android.
+            //
+            // 2026-07-12: interactive drag - the list follows the finger
+            // (rubber-banded when there's no group on that side), and a
+            // committed swipe pages the old list off-screen before the new
+            // group's list slides in from the opposite edge, so it reads as
+            // dragging between pages instead of an instant filter change.
+            .offset(x: groupDragOffset)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 40)
+                    .onChanged { value in
+                        let dx = value.translation.width
+                        let dy = value.translation.height
+                        // Latch dominance once per gesture so a drag that
+                        // starts vertical can never morph into a group drag
+                        // mid-flight (and vice versa).
+                        if groupDragIsHorizontal == nil {
+                            groupDragIsHorizontal = abs(dx) > abs(dy) * 1.5
+                        }
+                        guard groupDragIsHorizontal == true else { return }
+                        groupDragOffset = canCycleGroup(forward: dx < 0) ? dx : dx / 3
+                    }
+                    .onEnded { value in
+                        let wasHorizontal = groupDragIsHorizontal == true
+                        groupDragIsHorizontal = nil
+                        let dx = value.translation.width
+                        let dy = value.translation.height
+                        guard wasHorizontal, abs(dx) > 70, abs(dx) > abs(dy) * 1.5,
+                              canCycleGroup(forward: dx < 0) else {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                groupDragOffset = 0
+                            }
+                            return
+                        }
+                        let forward = dx < 0
+                        let width = UIScreen.main.bounds.width
+                        withAnimation(.easeIn(duration: 0.12)) {
+                            groupDragOffset = forward ? -width : width
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                            cycleGroup(forward: forward)
+                            // Re-enter from the opposite edge with the new group.
+                            groupDragOffset = forward ? width : -width
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                                groupDragOffset = 0
+                            }
+                        }
+                    }
+            )
+            // Multiview staging: the dock card above the tab bar (HomeView,
+            // Logan 2026-10-06) replaced the strip that was inset here.
+            // v1.6.18, iPhone pills moved here from the VStack
+            // sibling above. When the user scrolls past 80pt the
+            // pills tuck away to reclaim ~40% of vertical chrome;
+            // expanding again near the top (< 20pt) brings them
+            // back. By living in `.safeAreaInset(.top)` instead of
+            // a VStack sibling, show/hide changes only the List's
+            // top safe-area inset, the List's outer frame and
+            // content offset stay stable across the transition,
+            // so the layout-recalibration → re-trigger feedback
+            // loop that produced the v1.6.17 oscillation can't
+            // form. iPad / tvOS still render the pills above the
+            // List in the VStack at the top of `channelListContent`.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                // The collapse flag is read INSIDE this leaf view, never in
+                // ChannelListView's body, so a flick re-renders the inset
+                // alone instead of every row. See `chrome`.
+                PhoneChromeInset(chrome: chrome) {
+                    phoneHeaderRow
+                        .background(Color.appBackground)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .refreshable {
+                // The refresh work runs in an unstructured main-actor Task so
+                // a cancelled refreshable task (view re-render / teardown)
+                // cannot cancel the network fetch; the spinner still waits
+                // on task.value. [PULL] logs time the outer cancellation.
+                let pullStart = Date()
+                debugLog("[PULL] pull to refresh started")
+                let work = Task { @MainActor in
+                    await EPGCache.shared.invalidateAll()
+                    await channelStore.forceRefresh(servers: servers, modelContext: modelContext)
+                }
+                await withTaskCancellationHandler {
+                    await work.value
+                } onCancel: {
+                    let ms = Int(Date().timeIntervalSince(pullStart) * 1000)
+                    debugLog("[PULL] refreshable task cancelled after \(ms)ms")
+                }
+                let ms = Int(Date().timeIntervalSince(pullStart) * 1000)
+                debugLog("[PULL] pull to refresh finished in \(ms)ms (cancelled=\(Task.isCancelled))")
+            }
+            // iPhone-only: collapse the chrome (filter pills) when the
+            // list scrolls past 80pt; expand again near the top (< 20pt).
+            // Hysteresis prevents jitter at the boundary. iPad keeps the
+            // chrome visible, it has plenty of vertical space.
+            // The tab bar rides the same observer but with DIRECTION
+            // tracking (2026-07-12, Android parity): hide on a deliberate
+            // downward scroll, full bar back on any upward scroll.
+            .onScrollGeometryChange(for: CGFloat.self) { geo in
+                geo.contentOffset.y
+            } action: { oldY, y in
+                guard usesPhoneLiveTVLayout else { return }
+                // Writes land on the observable box, which only the two leaf
+                // views below observe: reading a property in THIS closure is
+                // not a body dependency, so the list is not invalidated.
+                // A flip is applied at once while the finger is down, and
+                // held back to .idle while the list decelerates: see
+                // ListScrollChrome for the measurement behind that split.
+                let deferred = chrome.isDecelerating
+                if y > 80 && !chrome.targetCollapsed {
+                    chrome.applyCollapsed(true, deferred: deferred)
+                } else if y < 20 && chrome.targetCollapsed {
+                    chrome.applyCollapsed(false, deferred: deferred)
+                }
+                // The tab bar is never deferred: it slides with a layer
+                // transform (TabBarCollapseState) and changes no inset, so
+                // the deceleration relayout the deferral guards against does
+                // not apply. Holding it to idle made a long flick tuck the
+                // bar away seconds after the gesture (iPhone recording
+                // 2026-10-02 13:47: hide decided at 24.5 s, applied at 26.9 s).
+                if let hidden = tabBarTracker.update(oldY: oldY, newY: y,
+                                                     hidden: chrome.targetTabBarAway) {
+                    chrome.applyTabBarAway(hidden, deferred: false)
+                }
+            }
+            .onScrollPhaseChange { _, phase in
+                guard usesPhoneLiveTVLayout else { return }
+                switch phase {
+                case .decelerating, .animating:
+                    chrome.isDecelerating = true
+                case .idle:
+                    chrome.flushPending()
+                default:
+                    // A finger landing mid-deceleration ends the deceleration
+                    // just as surely as coming to rest, so publish anything
+                    // parked for idle now. Leaving it parked lost the first
+                    // hide of every flick that was caught before it settled:
+                    // the next scroll up cleared the pending hide and the bar
+                    // only tucked away on the second scroll down (iPhone log
+                    // 2026-10-02 13:43, [CHROME] tabBarAway=true deferred then
+                    // tabBarAway=false 0.5 s later with no idle between).
+                    chrome.flushPending()
+                }
+            }
+            // GH #20 (Android parity): tuck the tab bar away on scroll so
+            // the list reclaims its height. Phone-only by construction:
+            // the observer above never sets the flag on iPad.
+            // Reads the flag inside the modifier's own body, not here.
+            .scrollAwayTabBar(observing: chrome)
+            // GH #20 follow-up (user report 2026-07-12): on iOS 26 the list's
+            // frame stopped at the safe-area line above the tab bar, leaving
+            // a dead band that stayed behind when the system minimized the
+            // bar. Mirror the Android solution outright: extend the list's
+            // frame to the physical bottom edge (rows show under/behind the
+            // floating bar) and give the CONTENT a bottom margin so the last
+            // row can scroll clear of the bar + home indicator.
+            .ignoresSafeArea(.container, edges: .bottom)
+            // ...and stop the iOS 26 bottom scroll-edge effect from painting
+            // an opaque platter over the rows in the bar region (the actual
+            // "dead band" - see astralContentUnderTabBar).
+            .astralContentUnderTabBar()
+            // Group change (Logan 2026-10-04): same guard as the guide. An
+            // offset kept from a longer group can sit past the end of a
+            // shorter one and leave the LazyVStack with no row on screen.
+            .onChange(of: selectedGroup) { _, group in
+                debugLog("[GUIDE] list group -> \(group): rows=\(filteredChannels.count)")
+                listProxy.scrollTo("list.top", anchor: .top)
+            }
+            // Tapping the Live TV tab while already on the list view: the
+            // channel list animates back to the top and the floating bar
+            // comes back (the trackers ignore a programmatic jump, so the
+            // chrome is expanded here).
+            .onReceive(
+                NotificationCenter.default.publisher(for: .astralTabReselected)
+            ) { note in
+                guard (note.userInfo?["tab"] as? String) == AppTab.liveTV.rawValue else { return }
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    listProxy.scrollTo("list.top", anchor: .top)
+                }
+                chrome.applyTabBarAway(false, deferred: false)
+                chrome.applyCollapsed(false, deferred: false)
+            }
+            }
+        }
+        // v1.6.13: same mini push-down as the Guide branch above.
+        // iOS-only in practice (tvOS uses Guide). Natural top is
+        // captured by the sibling marker in `mainContent`.
+        .padding(.top, miniPlayerTopInset(naturalTopAbsolute: capturedNaturalTop))
+        .animation(.spring(response: 0.35), value: capturedNaturalTop)
+        .animation(.spring(response: 0.35), value: nowPlaying.isMinimized)
+        .animation(.spring(response: 0.35), value: nowPlaying.miniPlayerBottomAbs)
+    }
+
+    // MARK: - Group Filter Bar
+
+    private var groupFilterBar: some View {
+        // ScrollViewReader so a group swipe on the list (GH #55) can glide
+        // the pill row to the newly selected pill - the pills visibly follow
+        // the swipe. iOS-only in effect: only the iOS pills carry the
+        // "pill_" ids, so the tvOS scrollTo is a no-op and its focus-driven
+        // scrolling stays untouched.
+        ScrollViewReader { pillProxy in
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                // tvOS pill-row Guide/List toggle + search pill REMOVED
+                // (Logan 2026-08-13): the List-vs-Guide default lives in
+                // Settings > App Behaviors > Default Live TV View
+                // (defaultLiveTVView), and search moved to the in-place
+                // screen behind the circle next to the nav bar (#247).
+                // The pill row now starts directly at the group pills.
+                // (#42 Part 1's leftHoldPinningAll gate stays on the
+                // remaining leading controls elsewhere in this row.)
+
+                // Compact-chrome mode hoists Manage Groups into the nav bar
+                // (see the toolbar block above), so we drop it from the pill
+                // row here to avoid a duplicate button. Classic layout
+                // keeps the inline button exactly where it was.
+                if !isCompactChrome && !isPhoneIdiom {
+                    ManageGroupsButton(
+                        action: { showManageGroups = true },
+                        hiddenCount: hiddenGroups.count
+                    )
+                }
+                // v1.6.13.x: iPad search button + inline TextField,
+                // placed immediately to the right of Manage Groups
+                // per user spec. Replaces the previous nav-bar
+                // search drawer that wouldn't actually hide. The
+                // TextField only renders when the toggle is on, so
+                // the chip row keeps its original height by default.
+                if UIDevice.current.userInterfaceIdiom == .pad && !isPhoneIdiom {
+                    // v1.6.23 (Codex UX P3): the search button used
+                    // to clear `searchText` when the user collapsed
+                    // the field, destroying their query along with
+                    // the chrome. Hiding the control and clearing
+                    // the user's intent are different actions; we
+                    // now preserve the query when the field is
+                    // hidden so re-opening restores the previous
+                    // search. The button visual flips to a "filled"
+                    // glyph when a search is active but hidden, so
+                    // users can tell at a glance that a filter is
+                    // still in effect.
+                    let hasActiveSearch = !searchText.isEmpty
+                    let buttonGlyph: String = {
+                        if iPadSearchPresented {
+                            return "magnifyingglass.circle.fill"
+                        } else if hasActiveSearch {
+                            return "magnifyingglass.circle"
+                        } else {
+                            return "magnifyingglass"
+                        }
+                    }()
+                    Button {
+                        withAnimation(.spring(response: 0.25)) {
+                            iPadSearchPresented.toggle()
+                            // Intentionally NOT clearing searchText
+                            // on collapse. Users who want to clear
+                            // the filter can do so by emptying the
+                            // field (the existing clear-X inside
+                            // the TextField, or backspace).
+                        }
+                    } label: {
+                        Image(systemName: buttonGlyph)
+                            .scaledFont(.system(size: 16, weight: .medium))
+                            .foregroundColor(iPadSearchPresented ? .appBackground : (hasActiveSearch ? .accentPrimary : Color.contrastText(.textSecondary)))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                Capsule()
+                                    .fill(iPadSearchPresented ? Color.accentPrimary : Color.elevatedBackground)
+                            )
+                    }
+                    .accessibilityLabel(
+                        iPadSearchPresented
+                            ? "Hide Search"
+                            : (hasActiveSearch ? "Search Channels (filter active)" : "Search Channels")
+                    )
+
+                    if iPadSearchPresented {
+                        TextField("Search channels", text: $searchText)
+                            .textFieldStyle(.plain)
+                            .scaledFont(.labelMedium)
+                            .foregroundColor(.textPrimary)
+                            .frame(width: 240)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                Capsule()
+                                    .fill(Color.elevatedBackground)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(Color.accentPrimary.opacity(0.3), lineWidth: 1)
+                                    )
+                            )
+                            .submitLabel(.search)
+                    }
+                }
+
+                // Everything from here down is group selection, and only that,
+                // so it is the part that hides in sidebar mode or when the
+                // playlist has no groups. The controls above stay put.
+                if showsGroupPills {
+                // Logan 2026-10-10 (explicit decision): on TV the round Manage
+                // Groups button sits to the LEFT of the first group pill.
+                // #42 Part 1: not focusable while a guide hold-Left pins focus
+                // to "All", so the hold cannot land on it. Initial focus still
+                // goes to the selected pill (groupPillFocused).
+                // #45: collections placed at the beginning sit before "All".
+                // #42 Part 1: also non-focusable while a guide Left is held, so
+                // the hold cannot land on a beginning collection before "All".
+                ForEach(collectionsStore.beginningCollections) { c in
+                    collectionPill(c, canFocus: !leftHoldPinningAll)
+                }
+
+                ForEach(groupTokens, id: \.self) { group in
+                    // Not a Button: tap and long press stay separate gestures
+                    // so holding a pill sets/clears the default group without
+                    // the release also selecting it (Logan 2026-09-17).
+                    HStack(spacing: 5) {
+                        Text(Self.groupTitle(group))
+                            .scaledFont(.labelMedium)
+                        if group == defaultGroupToken
+                            || (group == DefaultChannelGroupStore.allToken && defaultGroupToken.isEmpty) {
+                            Image(systemName: "pin.fill")
+                                .scaledFont(.system(size: 11))
+                                .foregroundColor(selectedGroup == group
+                                                 ? .appBackground
+                                                 : Color.contrastText(.textTertiary))
+                        }
+                    }
+                    .foregroundColor(selectedGroup == group ? .appBackground : Color.contrastText(.textSecondary))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(
+                        selectedGroup == group
+                            ? AnyView(Capsule().fill(Color.accentPrimary))
+                            : AnyView(Capsule().fill(Color.elevatedBackground))
+                    )
+                    .contentShape(Capsule())
+                    .accessibilityAddTraits(.isButton)
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.25)) { selectedGroup = group }
+                    }
+                    .onLongPressGesture(minimumDuration: 0.4) {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        setDefaultGroup(group)
+                    }
+                    .id("pill_\(group)")
+                }
+
+                // #45: collections placed at the end sit after the last group.
+                ForEach(collectionsStore.endCollections) { c in
+                    collectionPill(c)
+                }
+
+                }   // showsGroupPills
+            }
+            .padding(.horizontal, 16)
+        }
+        .onChange(of: selectedGroup) { _, newValue in
+            withAnimation(.spring(response: 0.3)) {
+                pillProxy.scrollTo("pill_\(newValue)", anchor: .center)
+            }
+        }
+        }
+    }
+
+    /// #45: one collection filter pill, matching the group-pill look. Selecting
+    /// it sets `selectedGroup` to the `collection:<id>` sentinel that
+    /// `filterChannels()` resolves to the collection's members.
+    @ViewBuilder
+    private func collectionPill(_ c: ChannelCollection, canFocus: Bool = true) -> some View {
+        let token = "collection:\(c.id)"
+        Button {
+            withAnimation(.spring(response: 0.25)) { selectedGroup = token }
+        } label: {
+            Text(c.name)
+                .scaledFont(.labelMedium)
+                .foregroundColor(selectedGroup == token ? .appBackground : Color.contrastText(.textSecondary))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(
+                    selectedGroup == token
+                        ? AnyView(Capsule().fill(Color.accentPrimary))
+                        : AnyView(Capsule().fill(Color.elevatedBackground))
+                )
+        }
+        .buttonStyle(.plain)
+        .id("pill_\(token)")
+        .contextMenu { collectionManageActions(c) }
+    }
+
+    /// #45: pill long-press actions (tvOS confirmationDialog + iOS contextMenu):
+    /// move the collection's pill front/back, or delete the collection.
+    @ViewBuilder
+    private func collectionManageActions(_ c: ChannelCollection) -> some View {
+        if c.placement == .end {
+            Button {
+                ChannelCollectionsStore.shared.setPlacement(id: c.id, to: .beginning)
+            } label: { Label("Move to Front", systemImage: "arrow.left.to.line") }
+        } else {
+            Button {
+                ChannelCollectionsStore.shared.setPlacement(id: c.id, to: .end)
+            } label: { Label("Move to Back", systemImage: "arrow.right.to.line") }
+        }
+        Button(role: .destructive) {
+            // Mirror the hidden-group reset: if we're filtered to this
+            // collection, drop back to All before its pill vanishes.
+            if selectedGroup == "collection:\(c.id)" { selectedGroup = fallbackGroup }
+            ChannelCollectionsStore.shared.delete(id: c.id)
+        } label: { Label("Delete Collection", systemImage: "trash") }
+    }
+
+    // MARK: - Error View
+
+    private func errorView(_ message: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .scaledFont(.system(size: 40))
+                .foregroundColor(.statusWarning)
+            Text("Connection Error")
+                .scaledFont(.headlineLarge)
+                .foregroundColor(.textPrimary)
+            Text(message)
+                .scaledFont(.bodyMedium.subtext())
+                .foregroundColor(Color.contrastText(.textSecondary))
+                .multilineTextAlignment(.center)
+            PrimaryButton("Try Again") {
+                Task { await channelStore.forceRefresh(servers: servers, modelContext: modelContext) }
+            }
+            .frame(maxWidth: 200)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Filtering
+
+    private var visibleGroups: [String] {
+        GroupOrderStore.displayOrder(channelStore.orderedGroups, mode: groupSortMode, order: groupOrder)
+            .filter { !hiddenGroups.contains($0) }
+    }
+
+    /// GH #80: the pill tokens actually shown. "All" can be hidden like any
+    /// group (its sentinel lives in `hiddenGroups`); it is kept when nothing
+    /// else would be left so the list never goes unfilterable.
+
+    private var groupTokens: [String] {
+        let visible = visibleGroups
+        var tokens: [String] = []
+        if favoritesStore.hasFavorites && !hiddenGroups.contains(favoritesToken) {
+            tokens.append(favoritesToken)
+        }
+        if !recentsStore.recentIDs.isEmpty && !hiddenGroups.contains(recentlyWatchedToken) {
+            tokens.append(recentlyWatchedToken)
+        }
+        if !(hiddenGroups.contains("All") && !visible.isEmpty) { tokens.append("All") }
+        let all = tokens + visible
+        // Manual order may place Favorites / All Channels anywhere (Logan
+        // 2026-09-06); orders that never mention them keep them in front.
+        guard groupSortMode == GroupSortMode.manual.rawValue else { return all }
+        return GroupOrderStore.applyTokens(all, order: groupOrder,
+                                           pinnedFirst: [favoritesToken, recentlyWatchedToken, "All"])
+    }
+
+    private func pillIcon(for token: String) -> String? {
+        if token == favoritesToken { return "star.fill" }
+        if token == recentlyWatchedToken { return "clock.arrow.circlepath" }
+        return nil
+    }
+
+    /// Pill / row title for a group token.
+    static func groupTitle(_ token: String) -> String {
+        if token == favoritesToken { return "Favorites" }
+        if token == recentlyWatchedToken { return "Recently Watched" }
+        return token
+    }
+
+    /// Manage Groups (hide / order / default group). Its own property: the
+    /// call inline in the body's modifier chain pushed the type checker over
+    /// its budget once the default-group arguments were added.
+    private var manageGroupsSheet: some View {
+        ManageGroupsSheet(
+            title: "Manage Groups",
+            allGroups: channelStore.orderedGroups,
+            storageKey: hiddenGroupsKey,
+            onDismiss: { updated in
+                hiddenGroups = updated
+                // Reset selection if the current group was hidden
+                if !selectedGroup.hasPrefix("collection:") && !groupTokens.contains(selectedGroup) {
+                    selectedGroup = fallbackGroup
+                }
+                filterChannels()
+            },
+            orderStorageKey: channelGroupOrderKey,
+            onConfigChanged: { mode, newOrder in
+                groupSortMode = mode
+                groupOrder = newOrder
+                filterChannels()
+            },
+            defaultGroupKey: defaultChannelGroupKey,
+            favoritesAvailable: favoritesStore.hasFavorites,
+            recentlyWatchedAvailable: true,
+            sidebarLayoutAvailable: offersGuideSidebarLayout
+        )
+    }
+
+    /// Manage Groups offers the guide Sidebar layout only on Apple TV with the
+    /// Sidebar Menu group selector; the layout means nothing elsewhere.
+    private var offersGuideSidebarLayout: Bool {
+        return false
+    }
+
+    /// The guide now writes GuidePreviewState directly, so there is nothing to
+    /// forward. Kept as nil on both platforms so the guide's optional callback
+    /// stays unused rather than re-introducing a host-level @State write on the
+    /// focus path.
+    private var previewProgramHandler: ((GuideProgram?, ChannelDisplayItem?) -> Void)? { nil }
+
+
+    private func favoritesDidChange() {
+        if selectedGroup == favoritesToken && !favoritesStore.hasFavorites {
+            selectedGroup = fallbackGroup
+        }
+        applyDefaultGroupIfNeeded()
+        filterChannels()
+    }
+
+    /// A group selected under the previous playlist may not exist in the one
+    /// just activated; only reset once the new group list is non-empty.
+    /// Favorites and collection tokens are cross-playlist.
+    private func reconcileSelectedGroupWithPlaylist() {
+        if selectedGroup != "All",
+           selectedGroup != favoritesToken,
+           selectedGroup != recentlyWatchedToken,
+           !selectedGroup.hasPrefix("collection:"),
+           !channelStore.orderedGroups.isEmpty,
+           !channelStore.orderedGroups.contains(selectedGroup) {
+            selectedGroup = fallbackGroup
+            defaultGroupApplied = false
+        }
+        if !channelStore.orderedGroups.isEmpty { applyDefaultGroupIfNeeded() }
+    }
+
+    /// Applies the user's default group the first time the playlist's groups
+    /// are known. A default that is not present (other playlist, hidden,
+    /// no favorites yet) is skipped, not forced: the decision is made once
+    /// per playlist load, so a later favorites edit or channel refresh never
+    /// yanks the user off the group they picked.
+    /// Long-press handler shared by the tvOS sidebar rows and the iOS pills:
+    /// toggles the default group through the one store that owns the rule,
+    /// then picks up the un-hide side effect (Recently Watched) locally.
+    /// tvOS pill hold: set/clear the default group with a brief confirmation
+    /// (Logan 2026-10-10, Android TV parity); the thumbtack is the lasting mark.
+    private func setDefaultGroupConfirmed(_ token: String) {
+        let clearing = token == defaultGroupToken
+        setDefaultGroup(token)
+        let message = clearing ? "Default group cleared" : "Live TV opens on \(Self.groupTitle(token))"
+        debugLog("[GROUPS] default group \(clearing ? "cleared" : "set") via pill: \(token)")
+        withAnimation(.easeInOut(duration: 0.2)) { defaultGroupToast = message }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if defaultGroupToast == message {
+                withAnimation(.easeInOut(duration: 0.2)) { defaultGroupToast = nil }
+            }
+        }
+    }
+
+    private func setDefaultGroup(_ token: String) {
+        defaultGroupToken = DefaultChannelGroupStore.toggle(token)
+        let stored = HiddenGroupsStore.load(forKey: hiddenGroupsKey)
+        guard stored != hiddenGroups else { return }
+        hiddenGroups = stored
+        filterChannels()
+    }
+
+    private func applyDefaultGroupIfNeeded() {
+        guard !defaultGroupApplied else { return }
+        defaultGroupApplied = true
+        guard let wanted = UserDefaults.standard.string(forKey: defaultChannelGroupKey),
+              !wanted.isEmpty, wanted != selectedGroup else { return }
+        if groupTokens.contains(wanted) || wanted.hasPrefix("collection:") {
+            selectedGroup = wanted
+            debugLog("[GROUPS] default group applied: \(wanted)")
+        }
+    }
+
+    /// Where a reset lands: All when shown, else the first visible group.
+    /// Not simply the first token: Favorites is pinned ahead of All, so a
+    /// reset would otherwise land on Favorites whenever the user has any.
+    private var fallbackGroup: String {
+        let tokens = groupTokens
+        return tokens.contains("All") ? "All" : (tokens.first ?? "All")
+    }
+
+    /// Apple GH #55: step the selected group pill from a horizontal list
+    /// swipe. The cycle matches the pill row (All first, then the visible
+    /// groups in display order) and clamps at both ends.
+    private func cycleGroup(forward: Bool) {
+        let cycle = groupTokens
+        guard cycle.count > 1 else { return }
+        let current = cycle.firstIndex(of: selectedGroup) ?? 0
+        let target = min(max(forward ? current + 1 : current - 1, 0), cycle.count - 1)
+        guard cycle[target] != selectedGroup else { return }
+        // NO withAnimation: this only runs mid swipe-commit, where the list
+        // is already animating the page transition. Animating the content
+        // diff at the same time made the slide-in visibly stutter (user
+        // report vs the Android build); the pill row's follow-scroll is
+        // animated separately by groupFilterBar's onChange.
+        selectedGroup = cycle[target]
+    }
+
+    /// True when a swipe in that direction has a group to land on (the
+    /// interactive drag rubber-bands instead of following at the ends).
+    private func canCycleGroup(forward: Bool) -> Bool {
+        let cycle = groupTokens
+        guard cycle.count > 1 else { return false }
+        let current = cycle.firstIndex(of: selectedGroup) ?? 0
+        let target = forward ? current + 1 : current - 1
+        return target >= 0 && target < cycle.count
+    }
+
+    private func handleChannelListAppear() {
+        // Sendable workaround: the message is built in locals FIRST.
+        // Folding the whole interpolation (ChannelStore chains +
+        // Thread capture) into the @autoclosure argument makes the
+        // hoisted closure a Sendable/Optional type-check trap.
+        let shownChannelCount: Int = channelStore.channels.count
+        let shownIsLoading: Bool = channelStore.isLoading
+        let shownThread: Thread = Thread.current
+        let appearMessage: String = "🔷 ChannelListView.onAppear: channels=\(shownChannelCount), isLoading=\(shownIsLoading), thread=\(shownThread)"
+        debugLog(appearMessage)
+        // Pull iCloud data while the user waits for channels/EPG to load
+        // (runs concurrently, doesn't block channel startup).
+        SyncManager.shared.pullFromCloud()
+        // Default to guide view if the active server has EPG data.
+        // M3U without EPG → default to list view (no guide data to show).
+        let activeServer = servers.first(where: { $0.isActive }) ?? servers.first
+        let hasEPG: Bool = {
+            guard let s = activeServer else { return false }
+            if s.type == .m3uPlaylist { return !s.effectiveEPGURL.isEmpty }
+            return true
+        }()
+
+        // Width-adaptive default: compact (iPhone portrait, folded
+        // foldable) opens List unless the user explicitly chose
+        // Guide; regular (iPad, unfolded foldable, Plus / Max
+        // landscape) opens Guide unless the user explicitly chose
+        // List. See resolvedGuideDefault. A toggle made earlier
+        // THIS SESSION wins over the default (view recreation on
+        // tab switches must not revert the user's choice).
+        if let sessionChoice = LiveTVViewSession.showGuideView {
+            showGuideView = sessionChoice
+            userDidToggleView = true
+        } else {
+            showGuideView = resolvedGuideDefault(hasEPG: hasEPG)
+        }
+        // EPG-search jump (cold path): if SearchView stashed a
+        // pending guide target, force guide mode so EPGGuideView
+        // can scroll to it once it mounts.
+        if UserDefaults.standard.object(forKey: "guideJumpChannelID") != nil {
+            showGuideView = true
+            if selectedGroup != fallbackGroup { selectedGroup = fallbackGroup }
+        }
+        ManageGroupsSheet.seedRecentlyWatchedHidden(storageKey: hiddenGroupsKey)
+        hiddenGroups = HiddenGroupsStore.load(forKey: hiddenGroupsKey)
+        defaultGroupToken = DefaultChannelGroupStore.current
+        groupOrder = GroupOrderStore.load(forKey: channelGroupOrderKey)
+        groupSortMode = GroupOrderStore.loadMode(forKey: channelGroupSortModeKey)
+        filterChannels()
+        favoritesStore.register(items: channelStore.channels)
+        debugLog("🔷 ChannelListView.onAppear: done")
+    }
+
+    private func filterChannels() {
+        var result = channelStore.channels
+        // Recently Watched: recency order IS the order, so this group skips
+        // the channel sort and the group re-sort below.
+        let preservesOrder = selectedGroup == recentlyWatchedToken
+        if selectedGroup == recentlyWatchedToken {
+            // Synthetic group: the last 25 channels watched on this
+            // playlist, most recent first. Hidden-group exclusion does not
+            // apply to an explicit pick, same as Favorites.
+            ChannelCollectionsStore.shared.activeFilterCollectionID = nil
+            result = recentsStore.resolved
+        } else if selectedGroup == favoritesToken {
+            // Favorites group: the user's own list, in their order; hidden
+            // groups do not apply to an explicit pick.
+            ChannelCollectionsStore.shared.activeFilterCollectionID = nil
+            result = favoritesStore.favoriteItems
+        } else if selectedGroup.hasPrefix("collection:") {
+            // #45: collection filter, show exactly the curated members. The
+            // user explicitly chose them, so hidden-group exclusion is bypassed.
+            // If the collection was deleted, fall through to showing everything.
+            let cid = String(selectedGroup.dropFirst("collection:".count))
+            ChannelCollectionsStore.shared.activeFilterCollectionID = cid
+            if let c = ChannelCollectionsStore.shared.collection(id: cid) {
+                let memberSet = Set(c.memberIDs)
+                result = result.filter { memberSet.contains($0.id) }
+            }
+        } else {
+            ChannelCollectionsStore.shared.activeFilterCollectionID = nil
+            // Exclude channels belonging to hidden groups
+            if !hiddenGroups.isEmpty {
+                result = result.filter { !hiddenGroups.contains($0.group) }
+            }
+            if selectedGroup != "All" {
+                result = result.filter { $0.group == selectedGroup }
+            }
+        }
+        if !searchText.isEmpty {
+            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        }
+        // Apply sort
+        switch preservesOrder ? "recency" : sortModeRaw {
+        case "name":
+            result.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case "favorites":
+            // Partition preserves the original order within each bucket
+            // (channels arrive from ChannelStore in number order), so
+            // favorites appear first in number order and non-favorites
+            // follow in number order. The previous implementation used
+            // `.sort` with a localizedCaseInsensitiveCompare tiebreaker,
+            // which silently switched non-favorites to alphabetical even
+            // though the user never asked for "By Name", that was the
+            // bug the user reported.
+            let favs = result.filter { favoritesStore.isFavorite($0.id) }
+            let nonFavs = result.filter { !favoritesStore.isFavorite($0.id) }
+            result = favs + nonFavs
+        default: // "number"
+            // Most groups arrive in ChannelStore (provider/number) order
+            // already. Favorites is built from the favorites list, which is
+            // in favoriting order (#100), so restore ChannelStore order with
+            // a stable reorder; ids missing from the store keep their
+            // relative order at the end.
+            if selectedGroup == favoritesToken {
+                let storeRank = Dictionary(channelStore.channels.enumerated().map { ($0.element.id, $0.offset) },
+                                           uniquingKeysWith: { first, _ in first })
+                result = result.enumerated().sorted { lhs, rhs in
+                    let rl = storeRank[lhs.element.id] ?? Int.max
+                    let rr = storeRank[rhs.element.id] ?? Int.max
+                    if rl != rr { return rl < rr }
+                    return lhs.offset < rhs.offset
+                }.map { $0.element }
+            }
+        }
+        // Group ordering: when a non-default group order is chosen in
+        // Manage Groups (A-Z or Manual), reorder channels so they are
+        // grouped by that order. This is a STABLE re-sort, so the channel
+        // sort applied above (number / name / favorites) is preserved as
+        // the within-group order. Default group order leaves the global
+        // channel sort untouched (pre-existing behavior). Drives both the
+        // list and the guide, which both render `filteredChannels`.
+        if !preservesOrder, (GroupSortMode(rawValue: groupSortMode) ?? .default) != .default {
+            let ordered = GroupOrderStore.displayOrder(channelStore.orderedGroups, mode: groupSortMode, order: groupOrder)
+            let rank = Dictionary(ordered.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first })
+            result = result.enumerated().sorted { lhs, rhs in
+                let rl = rank[lhs.element.group] ?? Int.max
+                let rr = rank[rhs.element.group] ?? Int.max
+                if rl != rr { return rl < rr }
+                return lhs.offset < rhs.offset
+            }.map { $0.element }
+        }
+        debugLog("[GROUP] filter group=\(Self.groupTitle(selectedGroup)) raw=\(channelStore.channels.count) rows=\(result.count) first=\(result.first?.name ?? "none")")
+        filteredChannels = result
+        prefetchEPGForVisibleChannels(result)
+    }
+
+    /// Pre-warm the EPG cache for the first 20 visible channels so cards open instantly.
+    /// Skipped entirely when playback is active, network requests compete with the
+    /// IPTV stream and cause visible stuttering / rebuffer events.
+    private func prefetchEPGForVisibleChannels(_ channels: [ChannelDisplayItem]) {
+        prefetchTask?.cancel()
+        // Don't fetch EPG while a stream is playing, bandwidth contention causes stutter.
+        guard !nowPlaying.isActive else {
+            debugLog("📺 EPG prefetch: skipped, playback active")
+            return
+        }
+        prefetchTask = Task(priority: .utility) {
+            // Circuit breaker: if the server is slow/down, three
+            // consecutive 5s timeouts chew up 15 seconds of a uwsgi
+            // worker AND delay everything queued behind us in the
+            // serial loop. Bail early so we stop hammering a server
+            // we've already proven unresponsive. Threshold of 4.5s
+            // sits comfortably below `getUpcomingPrograms`'s 5s
+            // timeout and well above any realistic success latency
+            // (successes normally land in 100–500ms on a healthy
+            // server). Makes this independent of GuideStore's own
+            // breaker so either path alone is enough to protect
+            // Dispatcharr.
+            var consecutiveSlow = 0
+            let slowThreshold: TimeInterval = 4.5
+            let maxConsecutiveSlow = 3
+            for (idx, item) in channels.prefix(20).enumerated() {
+                guard !Task.isCancelled else { return }
+                if consecutiveSlow >= maxConsecutiveSlow {
+                    debugLog("📺 EPG prefetch: CIRCUIT BREAKER tripped, \(maxConsecutiveSlow) consecutive slow fetches, aborting after \(idx)/20 channels")
+                    return
+                }
+                guard let fetch = makeFetchUpcoming(for: item) else { continue }
+                let start = Date()
+                _ = await fetch()
+                let elapsed = Date().timeIntervalSince(start)
+                if elapsed >= slowThreshold {
+                    consecutiveSlow += 1
+                } else {
+                    consecutiveSlow = 0
+                }
+            }
+        }
+    }
+
+    // MARK: - Player Headers
+
+    private func playerHeaders() -> [String: String] {
+        guard let server = channelStore.activeServer ?? servers.first(where: { $0.isActive }) ?? servers.first else {
+            return ["Accept": "*/*"]
+        }
+        return server.authHeaders
+    }
+
+    // MARK: - Playback entry helper (Phase B)
+
+    /// Unified entry point for channel taps / deep-links / EPG picks.
+    /// Routes through the new `PlayerSession.begin(...)` API when the
+    /// `"playback.unified"` feature flag is on; falls back to the
+    /// legacy `NowPlayingManager.startPlaying(...)` path otherwise.
+    ///
+    /// Both paths get the same guard (`!streamURLs.isEmpty`) so the
+    /// call sites can just be `startPlayback(item)`. The server
+    /// lookup mirrors `playerHeaders()` so header semantics are
+    /// identical across both paths.
+    ///
+    /// Phase D deletes the flag-gate and this helper keeps calling
+    /// `begin(...)` directly.
+    /// A channel PICK (row, guide, Kept Live): asks Play Here / Play on
+    /// <receiver> while a remote session is active (PlayWhereRouter).
+    private func pickChannel(_ item: ChannelDisplayItem) {
+        guard !item.streamURLs.isEmpty else { return }
+        PlayWhereRouter.shared.request(title: item.name, item: .live(item)) {
+            startPlayback(item)
+        }
+    }
+
+    private func startPlayback(_ item: ChannelDisplayItem) {
+        guard !item.streamURLs.isEmpty else { return }
+        // A channel the backend declares radio opens Radio Mode (the same
+        // entry as the long-press Radio Mode item); long-press Watch, a
+        // Multiview grid and remote sessions keep the normal player.
+        if RadioModeSession.openIfDeclared(item, server: channelStore.activeServer
+                                           ?? servers.first(where: { $0.isActive }) ?? servers.first) {
+            return
+        }
+        // "Play Channels In: Mini Player" (Remote Control settings, tvOS-only,
+        // default off; Android #226 twin, AstralTV-Android 8cfddab). First
+        // Select on a browse tune mounts the session ALREADY minimized (the
+        // old begin-fullscreen-then-minimize-400ms flow flashed the full
+        // player over the guide). A second Select on the channel already
+        // playing in the corner promotes it to fullscreen instead of
+        // re-tuning the same stream. Resume / deep-link / cast paths don't
+        // route through here, so they stay fullscreen.
+        if PlaybackFeatureFlags.useUnifiedPlayback {
+            let server = channelStore.activeServer
+                ?? servers.first(where: { $0.isActive })
+                ?? servers.first
+            _ = PlayerSession.shared.begin(item: item, server: server)
+        } else {
+            nowPlaying.startPlaying(item, headers: playerHeaders())
+        }
+    }
+
+    // MARK: - Deep Link Handler
+
+
+    // MARK: - Upcoming EPG Closure Factory
+
+    private func makeFetchUpcoming(for item: ChannelDisplayItem) -> (() async -> [EPGEntry])? {
+        guard let server = channelStore.activeServer ?? servers.first(where: { $0.isActive }) ?? servers.first else { return nil }
+        switch server.type {
+        case .dispatcharrAPI:
+            let tvgID    = item.tvgID ?? ""
+            let channelID = Int(item.id)
+            // Need at least one identifier to query EPG
+            guard !tvgID.isEmpty || channelID != nil else { return nil }
+            let baseURL  = server.effectiveBaseURL
+            // The API key is a Keychain read (SecItemCopyMatching, a
+            // synchronous IPC). This factory runs in every row's body, so the
+            // read now happens inside the closure, off the main thread, and
+            // only on an EPGCache miss (iPad log 2026-10-07 23:05:16: a main
+            // thread sample parked in effectiveApiKey -> SecItemCopyMatching).
+            let apiKeyRef = ServerConnection.CredentialRef(server, field: .apiKey)
+            // v1.6.20: per-server auth shape capture.
+            let authMode = server.dispatcharrHeaderMode
+            let userAgent = server.effectiveUserAgent
+            // v1.7.x: capture identity + saved-username for the
+            // silent api_key re-bootstrap path.
+            let serverID = server.id
+            let savedUsername: String? = server.dispatcharrCredentialType == .usernamePassword
+                ? server.username : nil
+            let cacheKey = "d_\(baseURL)_\(tvgID.isEmpty ? item.id : tvgID)"
+            return {
+                if let cached = await EPGCache.shared.get(cacheKey) { return cached }
+                let apiKey = await apiKeyRef.resolveOffMain()
+                let dAPI = DispatcharrAPI(baseURL: baseURL, auth: .apiKey(apiKey),
+                                          userAgent: userAgent, authMode: authMode,
+                                          serverID: serverID, savedUsername: savedUsername)
+                do {
+                    let identifier = tvgID.isEmpty ? "channelID=\(channelID ?? 0)" : "tvgID=\(tvgID)"
+                    debugLog("📺 EPG fetch: \(identifier)")
+                    let programs = try await dAPI.getUpcomingPrograms(
+                        tvgIDs: tvgID.isEmpty ? nil : [tvgID],
+                        channelIDs: tvgID.isEmpty ? (channelID.map { [$0] }) : nil
+                    )
+                    debugLog("📺 EPG result: \(identifier) → \(programs.count) upcoming programs")
+                    let entries = programs.map {
+                        let desc = $0.description.isEmpty ? $0.subTitle : $0.description
+                        // v1.7.x: thread Dispatcharr `programID` so the
+                        // expanded panel's Program Info modal can
+                        // lazy-load categories the bulk grid strips.
+                        return EPGEntry(title: $0.title,
+                                        description: desc,
+                                        startTime: $0.startTime?.toDate(),
+                                        endTime:   $0.endTime?.toDate(),
+                                        programID: $0.programID,
+                                        subTitle: $0.subTitle.isEmpty ? nil : $0.subTitle,
+                                        season: $0.season, episode: $0.episode,
+                                        isNew: $0.isNew, isLiveBroadcast: $0.isLiveBroadcast,
+                                        isPremiere: $0.isPremiere, isFinale: $0.isFinale)
+                    }
+                    await EPGCache.shared.set(entries, for: cacheKey)
+                    return entries
+                } catch {
+                    let identifier = tvgID.isEmpty ? "channelID=\(channelID ?? 0)" : "tvgID=\(tvgID)"
+                    debugLog("📺 EPG fetch FAILED: \(identifier), \(error.localizedDescription)")
+                    DebugLogger.shared.logEPG(event: "getUpcomingPrograms failed",
+                                             channelID: tvgID.isEmpty ? item.id : tvgID, error: error)
+                    return []
+                }
+            }
+        case .xtreamCodes:
+            let baseURL   = server.effectiveBaseURL
+            let username  = server.username
+            let passwordRef = ServerConnection.CredentialRef(server, field: .password)
+            let streamID  = item.id
+            let cacheKey  = "x_\(baseURL)_\(streamID)"
+            return {
+                if let cached = await EPGCache.shared.get(cacheKey) { return cached }
+                let password = await passwordRef.resolveOffMain()
+                let xAPI = XtreamCodesAPI(baseURL: baseURL, username: username, password: password)
+                guard let epg = try? await xAPI.getEPG(streamID: streamID, limit: 48) else { return [] }
+                let now = Date()
+                let entries = epg.epgListings.compactMap { listing -> EPGEntry? in
+                    let start = XtreamDateParser.parse(listing.start)
+                    let end   = XtreamDateParser.parse(listing.end)
+                    if let e = end, now >= e { return nil }
+                    if let s = start, let e = end, now >= s && now < e { return nil }
+                    return EPGEntry(title: listing.title, description: listing.description, startTime: start, endTime: end)
+                }
+                await EPGCache.shared.set(entries, for: cacheKey)
+                return entries
+            }
+        case .m3uPlaylist:
+            let epgURL   = server.effectiveEPGURL
+            // No EPG URL → no schedule data to fetch
+            guard !epgURL.isEmpty else { return nil }
+            guard let tvgID = item.tvgID, !tvgID.isEmpty else { return nil }
+            let cacheKey = "m3u_\(tvgID)"
+            return {
+                if let cached = await EPGCache.shared.get(cacheKey) { return cached }
+                // Cache miss, re-fetch and re-index the full XMLTV feed.
+                guard !epgURL.isEmpty, let epgURLParsed = URL(string: epgURL),
+                      let programs = try? await XMLTVParser.fetchAndParse(url: epgURLParsed)
+                else { return [] }
+                let now = Date()
+                var byChannel: [String: [ParsedEPGProgram]] = [:]
+                for prog in programs { byChannel[prog.channelID, default: []].append(prog) }
+                // Repopulate cache for all channels in the feed.
+                for (channelID, progs) in byChannel {
+                    let upcoming = progs
+                        .filter { $0.endTime > now }
+                        .sorted { $0.startTime < $1.startTime }
+                        .map {
+                            // M3U EPG comes from XMLTV, which DOES
+                            // have `<category>` tags. Passing it
+                            // through keeps List view's expanded
+                            // schedule tinted on M3U sources the
+                            // same as on Dispatcharr sources.
+                            EPGEntry(title: $0.title, description: $0.description,
+                                     startTime: $0.startTime, endTime: $0.endTime,
+                                     category: $0.category,
+                                     subTitle: $0.subTitle, season: $0.season,
+                                     episode: $0.episode, isNew: $0.isNew,
+                                     isLiveBroadcast: $0.isLiveBroadcast,
+                                     isPremiere: $0.isPremiere, isFinale: $0.isFinale,
+                                     isRepeat: $0.isRepeat)
+                        }
+                    if !upcoming.isEmpty {
+                        await EPGCache.shared.set(upcoming, for: "m3u_\(channelID)")
+                    }
+                }
+                return await EPGCache.shared.get(cacheKey) ?? []
+            }
+        }
+    }
+}
+
+// MARK: - Channel Display Item
+/// Shows `.astralChannelListToast` messages through the list's toast
+/// state (tvOS draws it in the existing overlay; iOS draws it here).
+private struct ChannelListToastHost: ViewModifier {
+    @Binding var toast: String?
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .bottom) {
+                if let msg = toast {
+                    Text(msg)
+                        .scaledFont(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 10)
+                        .background(Capsule().fill(Color.black.opacity(0.8)))
+                        .padding(.bottom, 110)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .astralChannelListToast)) { note in
+                guard let message = note.userInfo?["message"] as? String else { return }
+                withAnimation(.easeInOut(duration: 0.2)) { toast = message }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    if toast == message {
+                        withAnimation(.easeInOut(duration: 0.2)) { toast = nil }
+                    }
+                }
+            }
+    }
+}
+
+struct ChannelDisplayItem: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let number: String
+    let logoURL: URL?
+    let group: String
+    let categoryOrder: Int
+    var streamURL: URL?
+    var streamURLs: [URL]
+    /// GH #59: the provider's own row position, when that ordering is more
+    /// trustworthy than `number`.
+    ///
+    /// Set only for Xtream playlists served by a Dispatcharr backend. Its XC
+    /// emulation cannot express decimal channel numbers, so it remaps them to
+    /// collision-free integers server-side (`_xc_live_streams_setup` in
+    /// `apps/output/views.py`): a lineup of 1.1/1.2/1.3/2/3/4 arrives as
+    /// 1/5/6/2/3/4, and sorting on that scatters subchannels to the end of the
+    /// list, the "subchannels are not appearing" report. Dispatcharr does
+    /// emit the list `.order_by("effective_channel_number")` though, so the
+    /// ROW ORDER still carries the truth the numbers lost.
+    ///
+    /// `nil` everywhere else, so real Xtream panels and M3U keep sorting by
+    /// channel number exactly as before.
+    var panelOrder: Int? = nil
+    var tvgID: String? = nil
+    /// Dispatcharr-only: the channel's server-side UUID string.
+    /// Needed as an EPG-matching key because Dispatcharr's Dummy
+    /// EPG feature (see `apps/epg/api_views.py` in the Dispatcharr
+    /// repo, `EPGGridAPIView`) tags synthesized dummy program
+    /// entries with `tvg_id = str(channel.uuid)`. Without this
+    /// field, channels that rely on Dummy EPG (rather than an
+    /// uploaded XMLTV source) appear blank in the guide even
+    /// though Dispatcharr's own web UI shows them. `nil` for XC
+    /// and M3U where there's no server-side UUID concept.
+    var uuid: String? = nil
+    /// Dispatcharr-only: the channel's numeric server-side ID
+    /// (`DispatcharrChannel.id`). v1.6.8 (Codex A2): added so
+    /// `RecordProgramSheet` can pass an explicit, type-safe int
+    /// to `RecordingCoordinator.scheduleDispatcharrRecording`
+    /// instead of doing `Int(channelID) ?? 0` against the string
+    /// `id`. The previous approach worked by accident, Dispatcharr's
+    /// `ChannelDisplayItem.id` happens to be `String(ch.id)`, but
+    /// returned a silent `0` for any provider whose `id` is a UUID
+    /// (M3U) or any future format change. `nil` for non-Dispatcharr
+    /// providers; record-to-server is gated on this being non-nil.
+    var dispatcharrChannelID: Int? = nil
+    /// Dispatcharr-only: the channel's `epg_data_id` foreign-key
+    /// integer (`Channel.epg_data_id` in Dispatcharr's models). v1.6.22
+    /// uses this to bridge to `/api/epg/epgdata/`'s `tvg_id` value
+    /// when matching the bulk grid response to channels. About 25%
+    /// of real-world channels have `Channel.tvg_id !=
+    /// EPGData.tvg_id` (EPGData is set at XMLTV ingest, Channel is
+    /// user-configurable). Without this bridge, those channels
+    /// render blank in the Live TV guide. `nil` for non-Dispatcharr
+    /// providers, or for Dispatcharr channels with no linked EPG
+    /// source.
+    var dispatcharrEPGDataID: Int? = nil
+    var currentProgram: String? = nil
+    var currentProgramDescription: String? = nil
+    var currentProgramStart: Date? = nil
+    var currentProgramEnd: Date? = nil
+    /// Raw XMLTV `<category>` (or Xtream `genre`) of the currently-airing
+    /// program, if the EPG source provided one. Read by `CategoryColor.bucket(for:)`
+    /// when the optional "Tint channel cards" toggle is on. Nil for sources that
+    /// don't expose category data (Dispatcharr and Xtream Codes currently).
+    var currentProgramCategory: String? = nil
+    /// Catch-up (timeshift): how many days of already-aired programming
+    /// this channel's provider archives. 0 = no catch-up. Dispatcharr:
+    /// the server-side MAX across the channel's provider streams
+    /// (`is_catchup`/`catchup_days` on /api/channels/channels/). Xtream
+    /// Codes: get_live_streams `tv_archive`/`tv_archive_duration`.
+    var catchupDays: Int = 0
+    /// The backend declares this channel radio (audio only): Dispatcharr
+    /// `effective_is_radio`, M3U `radio="true"`, Xtream `stream_type`
+    /// `radio_streams`. A pick opens Radio Mode, and every tune starts
+    /// audio-only from the first audio packet (AudioOnlyStartPolicy
+    /// `declared`).
+    var isRadio: Bool = false
+
+    /// Stable SwiftUI list identity keyed by the channel's UNIQUE stream
+    /// URL rather than `id`. A messy provider (large IPTV panels do this)
+    /// can assign the SAME tvg-id to multiple DISTINCT channels, and any
+    /// derived `id` that collapses onto tvg-id would then repeat across
+    /// rows. SwiftUI's `ForEach`/`List` require unique identities; a
+    /// duplicate drops rows, mis-animates, and logs "ID occurs multiple
+    /// times" (the same messy-playlist case hard-crashes the equivalent
+    /// LazyColumn on Android). The stream URL is unique per distinct
+    /// channel, so it disambiguates channels that merely share a tvg-id.
+    /// Falls back to `id` when a channel has no stream URL (Dispatcharr
+    /// channels with a nil server UUID), keeping the key total and
+    /// non-optional. Do NOT use this to replace `id` where scroll-to /
+    /// focus / selection is keyed on the channel id (tvOS guide list, EPG
+    /// guide grid): those stay on `id`, which the load-time dedup below
+    /// keeps unique anyway.
+    var rowKey: String { streamURL?.absoluteString ?? id }
+
+    /// True when this channel has any catch-up archive at all.
+    var hasCatchup: Bool { catchupDays > 0 }
+
+    /// Whether a programme spanning [start, end] can be replayed from the
+    /// channel's archive right now: it must have ENDED and still be inside
+    /// the provider's retention window (capped at 30 days, matching the
+    /// Dispatcharr server cap). Same gate drives the guide badge and the
+    /// Watch action so the two can never disagree (AstralTV-Android parity).
+    func canReplay(start: Date, end: Date, now: Date = Date()) -> Bool {
+        Self.canReplay(catchupDays: catchupDays, start: start, end: end, now: now)
+    }
+
+    /// Value-only form of `canReplay` so the List expanded-schedule builder
+    /// (`ListScheduleCache`) can run off the main thread with the same gate.
+    static func canReplay(catchupDays: Int, start: Date, end: Date, now: Date) -> Bool {
+        guard catchupDays > 0 else { return false }
+        guard end <= now else { return false }
+        let windowDays = min(catchupDays, 30)
+        return now.timeIntervalSince(end) <= Double(windowDays) * 86_400
+    }
+}
+
+// MARK: - EPG Entry (for upcoming schedule)
+struct EPGEntry: Identifiable, Equatable {
+    /// Stable id incorporating start AND end time. Including end time
+    /// guards against malformed EPG feeds where two adjacent programs
+    /// share the same title and start timestamp, without it, ForEach
+    /// would treat them as the same row and SwiftUI's contextMenu /
+    /// preview pair could bind to the wrong program (the long-pressed
+    /// row showed one title but the context-menu preview showed
+    /// another). See ChannelListView guidePanel for the consumer.
+    var id: String {
+        let s = startTime?.timeIntervalSinceReferenceDate ?? 0
+        let e = endTime?.timeIntervalSinceReferenceDate ?? 0
+        return "\(title)-\(s)-\(e)"
+    }
+    let title: String
+    let description: String
+    let startTime: Date?
+    let endTime: Date?
+    /// XMLTV `<category>` tag (or empty when the EPG source doesn't
+    /// expose one, e.g., Dispatcharr's JSON API or Xtream Codes).
+    /// Drives the per-program gradient tint on the List-view
+    /// expanded-schedule rows, mirroring what the Guide view already
+    /// shows via `GuideProgram.category`. Both views now read from
+    /// `GuideStore.programs` (via `seedEPGCache`) so they stay in
+    /// sync rather than each re-deriving category from scratch.
+    let category: String
+    /// v1.7.x: Dispatcharr's `ProgramData.id` when known. Threaded
+    /// through to `ProgramInfoView` so the modal can lazy-load
+    /// `<category>` data via `/api/epg/programs/<id>/` whenever the
+    /// row's `category` is empty (which happens for every non-airing
+    /// Dispatcharr program because the bulk `/api/epg/grid/` endpoint
+    /// strips category data server-side). Nil for XMLTV / Xtream
+    /// sources whose feeds already include categories inline.
+    let programID: Int?
+
+    // EPG badge metadata (list-row + info-sheet badges). Defaults keep
+    // the several call sites that don't carry this data compiling.
+    let subTitle: String?
+    let season: Int?
+    let episode: Int?
+    let isNew: Bool
+    let isLiveBroadcast: Bool
+    let isPremiere: Bool
+    let isFinale: Bool
+    let isRepeat: Bool
+
+    init(title: String, description: String = "", startTime: Date?,
+         endTime: Date?, category: String = "", programID: Int? = nil,
+         subTitle: String? = nil, season: Int? = nil, episode: Int? = nil,
+         isNew: Bool = false, isLiveBroadcast: Bool = false,
+         isPremiere: Bool = false, isFinale: Bool = false, isRepeat: Bool = false) {
+        self.title = title
+        self.description = description
+        self.startTime = startTime
+        self.endTime = endTime
+        self.category = category
+        self.programID = programID
+        self.subTitle = subTitle
+        self.season = season
+        self.episode = episode
+        self.isNew = isNew
+        self.isLiveBroadcast = isLiveBroadcast
+        self.isPremiere = isPremiere
+        self.isFinale = isFinale
+        self.isRepeat = isRepeat
+    }
+}
+
+// MARK: - Channel Row
+struct ChannelRow: View {
+    /// Settings > Appearance > Text Size (fixed text frames grow with it).
+    @Environment(\.astralTextScale) private var textScale
+    @Environment(\.astralSubtextScale) private var subtextScale
+    let item: ChannelDisplayItem
+    let onTap: () -> Void
+    var fetchUpcoming: (() async -> [EPGEntry])? = nil
+    @EnvironmentObject private var favoritesStore: FavoritesStore
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var isExpanded = false
+    /// Observe `GuideStore.programs` so the expanded-schedule
+    /// panel can read category-enriched programmes DIRECTLY
+    /// from the same dataset the Guide view already uses, no
+    /// intermediate `EPGCache` / `fetchUpcoming` hop. Two prior
+    /// rounds of debugging tried to fix the "expanded rows
+    /// don't tint" bug by patching the cache layer; both times
+    /// a different key-mismatch or timing race surfaced.
+    /// Reading from GuideStore eliminates the whole class of
+    /// problems: if the Guide view can tint it, so can we.
+    ///
+    /// Not observed (2026-10-03): ~650 rows re-rendered on every
+    /// whole-map publish. The collapsed row observes its own now/next
+    /// cell; the expanded panel observes a per-channel slice cell
+    /// (`GuideChannelSliceScope`) only while open.
+    private var guideStore: GuideStore { GuideStore.shared }
+    @StateObject private var nowNext = GuideNowNextWatch()
+    /// Opt-in sub-toggle nested under Settings → Guide Display →
+    /// "Color Programs by Category". When on AND the currently-airing
+    /// program's category matches one of the four buckets, a thin
+    /// colored stripe is drawn on the leading edge of the row.
+    /// Default off so existing users don't see a surprise visual change.
+    @AppStorage("tintChannelCards") private var tintChannelCards: Bool = false
+    /// Settings > Live TV > Program Info Button > List View, with the same
+    /// Off / Current / All choice the guide cells use.
+    @AppStorage(GuideProgramInfoButton.listViewKey) private var programInfoInList = false
+    @AppStorage(GuideProgramInfoButton.key) private var programInfoButtonMode = GuideProgramInfoButton.defaultValue
+    /// A list row shows the program airing now, so "Current" and "All"
+    /// both show it.
+    private var showsProgramInfoButton: Bool {
+        programInfoInList && liveProgram != nil
+            && GuideProgramInfoButton.shows(mode: programInfoButtonMode, isLive: true)
+    }
+
+    /// Currently-airing program for this row, picking the best
+    /// available source. v1.6.10: previously the row showed
+    /// `item.currentProgram` and silently fell back to
+    /// `item.group` (the channel's category, e.g. "Sports") when
+    /// that was nil. On Dispatcharr that fallback was the common
+    /// case, the heavy bulk current-program endpoint hadn't run
+    /// yet, so every channel rendered as just its group name.
+    /// Now we layer two sources:
+    ///
+    ///   1. `item.currentProgram*`, the lightweight per-item
+    ///      payload populated by Xtream short-EPG and Dispatcharr's
+    ///      current-programs cache when fresh. Cheapest source,
+    ///      preferred when present.
+    ///   2. `guideStore.programs[item.id]` filtered to `.isLive`,
+    ///      the same dataset the Guide grid uses, populated by the
+    ///      XMLTV parse and bulk EPG fetch. Reliable once the guide
+    ///      has loaded.
+    ///
+    /// Returns nil when neither source has anything, the row's
+    /// subtitle stays empty in that case (no more group-name
+    /// fallback). Both the inline "now playing" line in the row
+    /// and the progress bar consult this single tuple.
+    private var liveProgram: (title: String, subTitle: String?, description: String?, start: Date, end: Date, flags: EPGFlags)? {
+        if let title = item.currentProgram, !title.isEmpty,
+           let start = item.currentProgramStart,
+           let end = item.currentProgramEnd,
+           end > Date() {
+            // GH #96: an ended load-time snapshot falls through to the
+            // guide's live now/next cell below.
+            // ChannelDisplayItem doesn't carry the feed badge flags or the
+            // XMLTV <sub-title>; when GuideStore has the same now-airing
+            // program, borrow both so the collapsed row can show LIVE/NEW and
+            // the episode / sports-match name (GH #34).
+            let liveGuideProg = nowNext.live(for: item.id)
+            let flags = liveGuideProg
+                .map { EPGFlags(isNew: $0.isNew, isLiveBroadcast: $0.isLiveBroadcast,
+                                isPremiere: $0.isPremiere, isFinale: $0.isFinale,
+                                isRepeat: $0.isRepeat) } ?? EPGFlags()
+            return (title, liveGuideProg?.subTitle, item.currentProgramDescription, start, end, flags)
+        }
+        if let p = nowNext.live(for: item.id) {
+            return (p.title, p.subTitle, p.description, p.start, p.end,
+                    EPGFlags(isNew: p.isNew, isLiveBroadcast: p.isLiveBroadcast,
+                             isPremiere: p.isPremiere, isFinale: p.isFinale,
+                             isRepeat: p.isRepeat))
+        }
+        return nil
+    }
+
+    /// Per-view scale slider (#21) read by the iOS channel-row text
+    /// and padding. tvOS rows keep their fixed Emby metrics since
+    /// they're already tuned for 10-foot viewing. 0.85–1.25 matches
+    /// the slider range in Settings → Appearance → Display Scale.
+    @AppStorage("listScale") private var listScale: Double = 1.0
+    /// Clamp to the slider range so a corrupted UserDefaults value
+    /// (e.g., imported from an older build) can't blow up the row
+    /// layout. The 1e-3 margin is cosmetic, avoids reading exactly
+    /// 0.85 as "slightly below 0.85" when the floating-point step
+    /// lands on a binary-exact value.
+    private var listScaleClamped: CGFloat {
+        CGFloat(max(0.85, min(1.5, listScale)))
+    }
+
+    /// Issue #28: when off, the channel logo is hidden so the channel name
+    /// can use the full row width (the logo eats space and crops long names,
+    /// especially on iPhone). Cross-platform; defaults on.
+    @AppStorage("ui.showChannelLogos") private var showChannelLogos = true
+    /// Settings > Live TV > Logo Size. Scales the logo part of the leading
+    /// column and the logo's height floor, so the row grows or shrinks with it.
+    @AppStorage(liveTVLogoSizeKey) private var logoSizePercent = liveTVLogoSizeDefault
+    private var logoFactor: CGFloat {
+        showChannelLogos ? LiveTVLogoSize.factor(logoSizePercent) : 1
+    }
+    /// GH #19 (Android parity): when off, the channel-number column is
+    /// hidden. Cross-platform; defaults on.
+    @AppStorage("ui.showChannelNumbers") private var showChannelNumbers = true
+    /// Width a hidden number column frees for the logo (column + spacing).
+    // The old fixed number-column widths (42 / 36 / 26 plus HStack spacing)
+    // are gone: the column is measured from the monospaced digit advance so
+    // four-digit and "1500.5" numbers cannot truncate. See
+    // `numberColumnWidth(fontSize:)`, `tvFreedNumberColumn` and
+    // `freedNumberColumn(_:)`.
+    /// GH #73 (Android parity): when off, the channel NAME line is hidden
+    /// in the list row; the program text under it is untouched.
+    @AppStorage("ui.showChannelNames") private var showChannelNames = true
+    /// Numbers AND names both hidden: the logo slot takes the row's full
+    /// height (see `CachedLogoImage.fillsHeight`) and this multiplier
+    /// widens the numbers-off width proportionally, so tall/portrait art
+    /// gets height and wide art still gets room. The image is fit, never
+    /// cropped, and centered in the slot.
+    private static let bothHiddenWidthFactor: CGFloat = 1.5
+    /// True when the row has neither a number column nor a name line.
+    private var logoFillsRow: Bool { !showChannelNumbers && !showChannelNames }
+    /// Height of the row's text column, and so of the row: the SAME for
+    /// every row in the list, computed from the tallest layout a row can
+    /// have at the current Text Size and Subtext Size (Logan 2026-09-16).
+    /// A row with less text leaves the unused lines blank rather than
+    /// collapsing, so the list is uniform and every logo comes out the same
+    /// size by construction. Derived from the row's own font metrics, never
+    /// measured, so there is no geometry feedback and no per-row variation.
+    /// See `ChannelRowTextColumn`.
+    private var uniformTextHeight: CGFloat {
+        return ChannelRowTextColumn.iOSHeight(isWide: isWide,
+                                              scale: listScaleClamped,
+                                              showName: showChannelNames,
+                                              showSubtitle: showProgramSubtitles,
+                                              textScale: textScale,
+                                              subtextScale: subtextScale)
+    }
+    /// Characters the number column must fit, published by the list from the
+    /// widest number it is showing. See `ChannelNumberColumn`.
+    @Environment(\.astralChannelNumberChars) private var numberChars
+
+    /// Width of the channel-number column for a rendered point size. Measured
+    /// from the monospaced digit advance, so a four-digit number (or a
+    /// Dispatcharr sub-channel like "1500.5") can never truncate; the old
+    /// fixed 26 / 36 / 42 point columns clipped at four digits.
+    private func numberColumnWidth(fontSize: CGFloat) -> CGFloat {
+        ChannelNumberColumn.width(characters: numberChars,
+                                  fontSize: fontSize * max(1, textScale))
+    }
+
+    // MARK: Leading column (logo over number)
+    //
+    // Logan 2026-09-16, Android parity: the channel number no longer sits
+    // BESIDE the logo, it sits UNDER it, centered, in one leading column.
+    // Nothing competes with the number for width any more, so it can never
+    // truncate however many digits (or "1500.5" sub-channel forms) a
+    // provider hands out, and the logo gets the column's full width in
+    // every state instead of only when numbers are hidden.
+    //
+    // The column width is therefore the OLD numbers-off width in all
+    // states (the logo simply keeps the room the number used to take
+    // beside it), still multiplied by `bothHiddenWidthFactor` when neither
+    // the number nor the name is drawn.
+
+    /// Number point size for this row, before Text Size.
+    private var numberFontSize: CGFloat {
+        return (isWide ? 17 : 13) * listScaleClamped
+    }
+
+    /// Gap between the logo and the number under it.
+    private static let stackGap: CGFloat = 4
+
+    /// Width of the leading column: the logo's slot. Never narrower than the
+    /// number needs, so the number stays on one line even for a tiny logo.
+    private func leadingColumnWidth(_ s: CGFloat) -> CGFloat {
+        let base: CGFloat = (isWide ? 50 : 38) * s * logoFactor
+            + numberColumnWidth(fontSize: numberFontSize) + (isWide ? 14 : 10) * s
+        let width = logoFillsRow ? base * Self.bothHiddenWidthFactor : base
+        return max(width, numberColumnWidth(fontSize: numberFontSize))
+    }
+
+    @AppStorage(epgBadgesVisibleKey) private var showEpgBadges = true
+    /// Settings > Appearance > Channel List > Show Program Subtitles: some EPG
+    /// feeds repeat the description in the sub-title, so the row reads twice.
+    @AppStorage("ui.showProgramSubtitles") private var showProgramSubtitles = true
+    @State private var upcomingPrograms: [EPGEntry] = []
+    @State private var isLoadingUpcoming = false
+    /// True while the expanded schedule's rows are being built off-main.
+    @State private var isPreparingSchedule = false
+    @State private var reminderTarget: EPGEntry?
+    @State private var showReminderDialog = false
+    /// Unified sheet/cover driver for this channel row. Replaces the
+    /// previous triple of `recordTarget: EPGEntry?` +
+    /// `showRecordSheet: Bool` + `programInfoTarget:
+    /// ProgramInfoTarget?` plus two `.sheet` / `.fullScreenCover`
+    /// modifiers on the row body.
+    ///
+    /// Why: chaining multiple `.sheet(...)` modifiers on the same
+    /// view causes SwiftUI to rebuild the hierarchy while the
+    /// *other* sheet's binding is observed, which cascaded back
+    /// into the contextMenu / confirmationDialog presentation and
+    /// visibly flashed those on iPad when the user long-pressed a
+    /// program row. One `.sheet(item:)` driven by an enum payload
+    /// removes the cross-modifier invalidation path entirely.
+    fileprivate enum ChannelRowSheet: Identifiable {
+        case record(EPGEntry)
+        case programInfo(ProgramInfoTarget)
+        var id: String {
+            switch self {
+            case .record(let e):      return "record-\(e.id)"
+            case .programInfo(let t): return "info-\(t.id)"
+            }
+        }
+    }
+    @State private var activeSheet: ChannelRowSheet? = nil
+    /// tvOS: Program Info as its own binding (native sheet); Record keeps
+    /// the full-screen cover.
+    private var programInfoTarget: Binding<ProgramInfoTarget?> {
+        Binding(
+            get: { if case .programInfo(let t) = activeSheet { return t } else { return nil } },
+            set: { if $0 == nil, case .programInfo = activeSheet { activeSheet = nil } }
+        )
+    }
+    /// tvOS: the Record case only, so the full-screen cover never presents
+    /// (empty) for Program Info and blocks the sheet (trace 2026-09-05 12:32:
+    /// focus went to nil with nothing on screen).
+    private var recordSheet: Binding<ChannelRowSheet?> {
+        Binding(
+            get: { if case .record = activeSheet { return activeSheet } else { return nil } },
+            set: { if $0 == nil, case .record = activeSheet { activeSheet = nil } }
+        )
+    }
+    /// Catch-up: the resolved timeshift playback presented full screen
+    /// (recordings-pattern), or nil. Row-local: only the expanded row
+    /// that launched a replay ever sets it.
+    @State private var playingCatchup: CatchupPlayback? = nil
+    /// Catch-up: user-facing resolve failure, shown as an alert.
+    @State private var catchupErrorMessage: String? = nil
+    /// Tracks which upcoming-program row currently owns the popover
+    /// shown in response to a long-press. `EPGEntry.id` is
+    /// deterministic (title + start + end) so the binding is stable
+    /// across renders. Only one popover is visible at a time per
+    /// channel card; setting this to a new id is what presents it.
+    @State private var activePopoverEntryID: String?
+
+    private let upcomingScrollMaxHeight: CGFloat = 260
+
+    /// True when running on a wider display (iPad / macOS).
+    private var isWide: Bool { sizeClass == .regular }
+
+
+    // #45: per-channel "Add to Collection" picker + new-collection name alert.
+    // Used by the iOS row (iOSRow) as well as tvOS, so these stay unconditional.
+    // They were previously mis-scoped inside `#if os(tvOS)`, which left iOSRow
+    // referencing undeclared state on iOS, masked until the iOSRow type-check
+    // timeout was relieved by extracting the dialog builders.
+    @State private var showCollectionPicker = false
+    @State private var showNewCollectionAlert = false
+    @State private var newCollectionName = ""
+
+
+    var body: some View {
+        let _ = TabProbe.body("ChannelRow", key: item.id)
+        let _ = nowNext.bind(item.id)
+        VStack(spacing: 0) {
+            iOSRow
+
+            if isExpanded {
+                GuideChannelSliceScope(channelID: item.id) { guidePanel }
+            }
+        }
+        // When the XMLTV parse lands and EPGCache is re-seeded
+        // with category data, re-fetch our upcoming list so the
+        // per-program gradient tint picks up the new data. Only
+        // fires work when this card is actually expanded, a
+        // collapsed card has no rows to re-tint and would just
+        // be burning a fetch. Posted by
+        // `ChannelStore.primeXMLTVFromURL` after `seedEPGCache`.
+        .onReceive(NotificationCenter.default.publisher(for: .epgCategoriesDidUpdate)) { _ in
+            guard isExpanded, let fetch = fetchUpcoming else { return }
+            Task {
+                upcomingPrograms = await fetch()
+            }
+        }
+        // Clip to the same rounded shape as the background so
+        // expanded rows that now extend full-width (no horizontal
+        // outer padding, fixes the category-tint bleed on the
+        // sides) don't poke past the card's rounded bottom corners.
+        // tvOS does the same so both platforms render identically.
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.accentPrimary.opacity(0.04))
+                }
+                // Category tint, a linear gradient that fades from ~30%
+                // opacity on the leading edge down to 0 by the card's
+                // midline. This replaces the earlier 5 pt stripe, which
+                // users found visually cramped ("just a colored bar on
+                // the side", #22 feedback). The fade keeps the right-
+                // hand 60% of the card completely uncolored, so the
+                // channel name, program title, progress bar, and the
+                // chevron all stay legible against their original
+                // background.
+                //
+                // Opt-in via Settings → Guide Display → "Tint Channel
+                // Cards". Stays transparent when either the master
+                // toggle or the channel-card variant is off, or when
+                // the current program's category doesn't match a bucket.
+                .overlay {
+                    if tintChannelCards,
+                       CategoryColor.isEnabled,
+                       let raw = item.currentProgramCategory,
+                       let bucket = CategoryColor.bucket(for: raw) {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: CategoryColor.tint(bucket.baseColor, 0.30), location: 0.0),
+                                        .init(color: CategoryColor.tint(bucket.baseColor, 0.18), location: 0.22),
+                                        .init(color: CategoryColor.tint(bucket.baseColor, 0.06), location: 0.45),
+                                        .init(color: .clear,                          location: 0.65),
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .accessibilityHidden(true)
+                    }
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.accentPrimary.opacity(0.10), lineWidth: 1)
+                }
+        }
+        // iOS: attached at the outer body so this works whether the
+        // card is collapsed (long-press dialog trigger) or expanded
+        // (tap on an upcoming-schedule row trigger). Single
+        // `.sheet(item:)` to keep the contextMenu / popover from
+        // flickering during presentation (see `ChannelRowSheet` doc).
+        .sheet(item: recordSheet) { sheet in
+            switch sheet {
+            case .record(let entry):
+                RecordProgramSheet(
+                    programTitle: entry.title,
+                    programDescription: entry.description,
+                    channelID: item.id,
+                    channelName: item.name,
+                    scheduledStart: entry.startTime ?? Date(),
+                    scheduledEnd: entry.endTime ?? Date().addingTimeInterval(3600),
+                    isLive: (entry.startTime ?? Date()) <= Date(),
+                    dispatcharrChannelID: item.dispatcharrChannelID,
+                    streamURL: item.streamURL,
+                    channelLogoURL: item.logoURL,
+                    channelTVGID: item.tvgID
+                )
+            case .programInfo:
+                EmptyView()   // presented by the presenter below
+            }
+        }
+        // Phone: floating card like tvOS; iPad: system sheet.
+        .programInfoPresenter(item: programInfoTarget)
+    }
+
+    // MARK: - tvOS Row
+    // Three focusable elements side-by-side:
+    //   ★  ← star button (D-pad LEFT from main)
+    //      → channel info button (SELECT plays)
+    //   ›  → expand button (D-pad RIGHT from main, toggles guide panel)
+
+    // MARK: - iOS / iPadOS Row (unchanged)
+    private var iOSRow: some View {
+        // `s` is the Live TV List scale slider (Appearance → Display
+        // Scale → Live TV List). Sizes multiply by `s` so dragging
+        // the slider resizes the row live. `isWide` still drives the
+        // iPad vs. iPhone branch before scale is applied.
+        let s = listScaleClamped
+        return HStack(spacing: (isWide ? 14 : 10) * s) {
+            // Leading column: the SHARED ChannelBadge, same component as the
+            // tvOS branch above and the guide's channel column
+            // (Logan 2026-09-16). showName is false here because the row's
+            // text column owns the channel name.
+            if showChannelLogos || showChannelNumbers {
+                ChannelBadge(logoURL: item.logoURL,
+                             number: item.number,
+                             name: item.name,
+                             showLogo: showChannelLogos,
+                             showNumber: showChannelNumbers,
+                             showName: false,
+                             width: leadingColumnWidth(s),
+                             // Row height stays driven by the text column,
+                             // measured below; the badge fills it.
+                             maxHeight: max((isWide ? 34 : 26) * s * logoFactor, uniformTextHeight),
+                             numberFontSize: (isWide ? 17 : 13) * s,
+                             // Same 12pt row card as the tvOS branch.
+                             containerRadius: 12,
+                             lineGap: Self.stackGap,
+                             minimumLogoHeight: (isWide ? 34 : 26) * s * logoFactor,
+                             logoSizedByWidth: true)
+            }
+
+            VStack(alignment: .leading, spacing: (isWide ? 4 : 2) * s) {
+                HStack(spacing: 5 * s) {
+                    // GH #73: the name line collapses when names are off;
+                    // the star/catch-up badges and program text stay.
+                    if showChannelNames {
+                        Text(item.name)
+                            .scaledFont(.system(size: (isWide ? 17 : 15) * s, weight: .medium))
+                            .foregroundColor(.textPrimary)
+                            .lineLimit(1)
+                    }
+                    // Favorite star, like the guide's channel column
+                    // (Logan 2026-09-05).
+                    if favoritesStore.isFavorite(item.id) {
+                        Image(systemName: "star.fill")
+                            .scaledFont(.system(size: (isWide ? 12 : 10) * s, weight: .semibold))
+                            .foregroundColor(.statusWarning)
+                    }
+                    // Catch-up badge (see tvOS row above).
+                    if item.hasCatchup {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .scaledFont(.system(size: (isWide ? 12 : 10) * s, weight: .semibold))
+                            .foregroundColor(Color.contrastText(.textTertiary))
+                    }
+                    KeptChannelBadge(channelID: item.id, compact: !isWide)
+                }
+
+                if let prog = liveProgram {
+                    HStack(spacing: 8) {
+                        MarqueeText(text: prog.title,
+                                    font: .system(size: (isWide ? 15 : 11) * s).subtext(),
+                                    color: .contrastText(.accentPrimary.opacity(0.85)),
+                                    isActive: false)  // Static during scroll: saves GPU
+                            .frame(height: TextScale.grow((isWide ? 20 : 16) * s, textScale * subtextScale))
+                        nowPlayingTimeRemaining(end: prog.end)
+                        // Feed badges (LIVE/NEW/PREMIERE/...) for the
+                        // now-airing program; renders nothing when none.
+                        if showEpgBadges {
+                            EPGFlagsRow(flags: prog.flags.badges, compact: true)
+                        }
+                    }
+                    // GH #34: XMLTV <sub-title> (match/episode name), guarded
+                    // against the Dispatcharr promote-into-description case.
+                    if showProgramSubtitles, let sub = prog.subTitle,
+                       !EPGText.subtitleIsRedundant(sub, title: prog.title, description: prog.description) {
+                        Text(sub)
+                            .scaledFont(.system(size: (isWide ? 12 : 10) * s).subtext())
+                            .italic()
+                            .foregroundColor(Color.contrastText(.textSecondary))
+                            .lineLimit(1)
+                    }
+                    if let desc = prog.description, !desc.isEmpty {
+                        Text(desc)
+                            .scaledFont(.system(size: (isWide ? 12 : 10) * s).subtext())
+                            .foregroundColor(Color.contrastText(.textSecondary))
+                            .lineLimit(2)
+                    }
+                }
+                // No fallback: when no program info is available the
+                // subtitle slot stays empty rather than printing the
+                // channel's group/category name. v1.6.10, see
+                // `liveProgram` doc.
+
+                if let prog = liveProgram {
+                    nowPlayingProgressBar(start: prog.start, end: prog.end)
+                }
+            }
+            // Every row is the tallest layout's height; see the tvOS branch
+            // and `uniformTextHeight`.
+            .frame(height: uniformTextHeight, alignment: .top)
+
+            Spacer()
+
+            // 2026-07-12 (user): the per-row ellipsis "More" button was
+            // removed as redundant - long-pressing the row opens the same
+            // menu. (History: the button was added in v1.6.23 for issues
+            // #18/#35 long-press discoverability; the guide's tappable
+            // favorite star now covers that affordance.)
+
+            // Program Info button (List View): the guide cell's glyph, size
+            // and behavior, just before the expand control.
+            if showsProgramInfoButton {
+                Button {
+                    presentLiveProgramInfo()
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 18, weight: .medium))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundColor(.textSecondary)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Program Info")
+            }
+
+            // -- Expand chevron --
+            if item.currentProgram != nil || fetchUpcoming != nil {
+                Button {
+                    // No spring on iOS: an animated row-height change in
+                    // the List relayouts every visible cell per frame.
+                    toggleExpanded(animated: false)
+                } label: {
+                    if isWide {
+                        HStack(spacing: 5) {
+                            Image(systemName: isExpanded ? "chevron.up" : "list.bullet")
+                                .scaledFont(.system(size: 11, weight: .medium))
+                            Text(isExpanded ? "Hide Schedule" : "Schedule")
+                                .scaledFont(.subheadline.weight(.medium))
+                        }
+                        .foregroundColor(.accentPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.accentPrimary.opacity(0.12)))
+                        .contentShape(Capsule())
+                    } else {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 13, weight: .medium))  // glyph in a fixed box: not text, stays fixed
+                            .foregroundColor(Color.contrastText(.textTertiary))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, (isWide ? 18 : 13) * s)
+        .padding(.horizontal, (isWide ? 18 : 14) * s)
+        // Tap and long press through a clear UIKit anchor, as in the guide
+        // (Logan 2026-09-06): the system menu opens with nothing lifted and
+        // the card never changes. The trailing strip stays with the
+        // expand button.
+        .overlay(alignment: .leading) {
+            SystemMenuAnchor(items: { cardMenuItems }, onTap: onTap)
+                // The Program Info button sits left of the expand strip and
+                // must stay outside the tap anchor.
+                .padding(.trailing, (isWide ? 150 : 58) * s + (showsProgramInfoButton ? 44 : 0))
+        }
+        // #45: per-channel "Add to Collection", toggle membership in any
+        // existing collection (a checkmark marks current members) or create a
+        // new one with this channel already in it.
+        .confirmationDialog("Add to Collection", isPresented: $showCollectionPicker, titleVisibility: .visible) {
+            collectionPickerButtons
+        }
+        .alert("New Collection", isPresented: $showNewCollectionAlert) {
+            newCollectionAlertButtons
+        } message: {
+            Text("Name the collection and choose where its pill appears in the Live TV row.")
+        }
+    }
+
+    // #49 follow-up: the card-menu / collection-picker / new-collection-alert
+    // button builders are pulled out of `iOSRow` into their own @ViewBuilder
+    // members. Inline (the #45 shape) they pushed the iOSRow body past the
+    // Swift type-checker's expression budget ("unable to type-check in
+    // reasonable time"), which only surfaced on the iOS build (tvOS uses the
+    // separate, lighter `tvRow`). Behaviour is unchanged.
+    /// Mirror of `EPGGuideView.handleMultiviewIntent`: the first add from a
+    /// menu starts a fresh pile and flags staging; later taps toggle.
+    private func toggleMultiview() {
+        _ = PlayerSession.shared.handleLiveTVMultiviewIntent(item, server: ChannelStore.shared.activeServer)
+    }
+
+    /// `cardMenuButtons` as data for `SystemMenuAnchor` (iOS rows).
+    private var cardMenuItems: [SystemMenuItem] {
+        var items: [SystemMenuItem] = []
+        items.append(.init(title: "Watch", systemImage: "play.fill") {
+            RadioModeSession.noteWatchVideo(item)
+            onTap()
+        })
+        if let radioTitle = RadioModeSession.menuTitle(for: item) {
+            items.append(.init(title: radioTitle, systemImage: RadioModeSession.menuSymbol) {
+                RadioModeSession.menuAction(for: item)
+            })
+        }
+        if let flagTitle = RadioModeSession.radioFlagMenuTitle(for: item) {
+            items.append(.init(title: flagTitle, systemImage: RadioModeSession.radioFlagMenuSymbol) {
+                RadioModeSession.radioFlagMenuAction(for: item)
+            })
+        }
+        let isFav = favoritesStore.isFavorite(item.id)
+        items.append(.init(title: isFav ? "Remove from Favorites" : "Add to Favorites",
+                           systemImage: isFav ? "star.slash" : "star") { favoritesStore.toggle(item) })
+        if RecentChannelsStore.shared.contains(item.id) {
+            items.append(.init(title: "Remove from Recently Watched", systemImage: "clock.badge.xmark", destructive: true) {
+                RecentChannelsStore.shared.remove(id: item.id)
+            })
+        }
+        let mvState = PlayerSession.shared.liveTVMultiviewMenuState(channelID: item.id)
+        let isStaged = mvState == .remove
+        items.append(.init(title: isStaged ? "Remove from Multiview" : "Add to Multiview",
+                           systemImage: isStaged ? "rectangle.3.group" : "rectangle.3.group.fill",
+                           disabled: mvState == .addDisabled) { toggleMultiview() })
+        items.append(.init(title: "Add Channel to Collection", systemImage: "folder.badge.plus") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showCollectionPicker = true }
+        })
+        if let cid = ChannelCollectionsStore.shared.activeFilterCollectionID,
+           let coll = ChannelCollectionsStore.shared.collection(id: cid),
+           coll.memberIDs.contains(item.id) {
+            items.append(.init(title: "Remove from \(coll.name)", systemImage: "folder.badge.minus", destructive: true) {
+                ChannelCollectionsStore.shared.removeMember(channelID: item.id, in: cid)
+            })
+        } else if ChannelCollectionsStore.shared.activeFilterCollectionID == nil,
+                  ChannelCollectionsStore.shared.isInAnyCollection(item.id) {
+            items.append(.init(title: "Remove from All Collections", systemImage: "folder.badge.minus", destructive: true) {
+                ChannelCollectionsStore.shared.removeFromAllCollections(item.id)
+            })
+        }
+        let live = liveProgram
+        if live != nil {
+            items.append(.init(title: "Program Info", systemImage: "info.circle") {
+                presentLiveProgramInfo(after: 0.35)
+            })
+        }
+        if item.streamURL != nil {
+            items.append(.init(title: live != nil ? "Record from Now" : "Record", systemImage: "record.circle") {
+                let now = Date()
+                let entry = EPGEntry(title: live?.title ?? "\(item.name) live recording",
+                                     description: live?.description ?? "",
+                                     startTime: live?.start ?? now,
+                                     endTime: (live?.end).flatMap { $0 > now ? $0 : nil } ?? now.addingTimeInterval(3600))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { activeSheet = .record(entry) }
+            })
+        }
+        return items
+    }
+
+    /// Program Info for the row's current program (list button and menu).
+    private func presentLiveProgramInfo(after delay: Double = 0) {
+        guard let live = liveProgram else { return }
+        let nowAiring = guideStore.liveProgram(for: item.id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            activeSheet = .programInfo(
+                ProgramInfoTarget(
+                    channelName: item.name, title: live.title, start: live.start, end: live.end,
+                    description: live.description ?? nowAiring?.description ?? "",
+                    category: item.currentProgramCategory ?? nowAiring?.category ?? "",
+                    programID: nowAiring?.programID,
+                    subTitle: live.subTitle ?? nowAiring?.subTitle,
+                    season: nowAiring?.season, episode: nowAiring?.episode,
+                    isNew: nowAiring?.isNew ?? false, isLiveBroadcast: nowAiring?.isLiveBroadcast ?? false,
+                    isPremiere: nowAiring?.isPremiere ?? false, isFinale: nowAiring?.isFinale ?? false,
+                    isRepeat: nowAiring?.isRepeat ?? false))
+        }
+    }
+
+    @ViewBuilder
+    private var cardMenuButtons: some View {
+        let isFav = favoritesStore.isFavorite(item.id)
+        Button {
+            RadioModeSession.noteWatchVideo(item)
+            onTap()
+        } label: { Label("Watch", systemImage: "play.fill") }
+        if let radioTitle = RadioModeSession.menuTitle(for: item) {
+            Button { RadioModeSession.menuAction(for: item) } label: {
+                Label(radioTitle, systemImage: RadioModeSession.menuSymbol)
+            }
+        }
+        if let flagTitle = RadioModeSession.radioFlagMenuTitle(for: item) {
+            Button { RadioModeSession.radioFlagMenuAction(for: item) } label: {
+                Label(flagTitle, systemImage: RadioModeSession.radioFlagMenuSymbol)
+            }
+        }
+        Button { favoritesStore.toggle(item) } label: {
+            Label(isFav ? "Remove from Favorites" : "Add to Favorites", systemImage: isFav ? "star.slash" : "star")
+        }
+        // GH Android#130: drop this channel from Recently Watched.
+        if RecentChannelsStore.shared.contains(item.id) {
+            Button(role: .destructive) {
+                RecentChannelsStore.shared.remove(id: item.id)
+            } label: { Label("Remove from Recently Watched", systemImage: "clock.badge.xmark") }
+        }
+        // Same Multiview toggle as the guide menu (Logan 2026-09-06):
+        // stage the channel for the Multiview tab, the guide's banner
+        // and the Multiview tab both read the store.
+        let mvState = PlayerSession.shared.liveTVMultiviewMenuState(channelID: item.id)
+        let isStaged = mvState == .remove
+        Button { toggleMultiview() } label: {
+            Label(isStaged ? "Remove from Multiview" : "Add to Multiview",
+                  systemImage: isStaged ? "rectangle.3.group" : "rectangle.3.group.fill")
+        }
+        .disabled(mvState == .addDisabled)
+
+        // #45: add/remove this channel from a user collection. Deferred so
+        // this dialog fully dismisses before the picker presents (chained
+        // confirmationDialogs race on tvOS otherwise).
+        Button {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showCollectionPicker = true }
+        } label: { Label("Add Channel to Collection", systemImage: "folder.badge.plus") }
+
+        // #45: contextual remove. Viewing a collection -> remove from just
+        // that one; otherwise (and only if it's in any) remove from all.
+        if let cid = ChannelCollectionsStore.shared.activeFilterCollectionID,
+           let coll = ChannelCollectionsStore.shared.collection(id: cid),
+           coll.memberIDs.contains(item.id) {
+            Button(role: .destructive) {
+                ChannelCollectionsStore.shared.removeMember(channelID: item.id, in: cid)
+            } label: { Label("Remove from \(coll.name)", systemImage: "folder.badge.minus") }
+        } else if ChannelCollectionsStore.shared.activeFilterCollectionID == nil,
+                  ChannelCollectionsStore.shared.isInAnyCollection(item.id) {
+            Button(role: .destructive) {
+                ChannelCollectionsStore.shared.removeFromAllCollections(item.id)
+            } label: { Label("Remove from All Collections", systemImage: "folder.badge.minus") }
+        }
+
+        // Program Info and Record for the now-airing program. The context
+        // menu builder runs on EVERY row update (Time Profiler 2026-09-06:
+        // `cardMenuButtons` in 38 of 297 ChannelRow samples during launch,
+        // each scanning the channel's guide array), so the builder reads
+        // only the row's already-computed `liveProgram` and the full guide
+        // lookup (badges, program id) waits until the action fires.
+        let live = liveProgram
+        if let live {
+            Button {
+                let nowAiring = guideStore.liveProgram(for: item.id)
+                // tvOS swallowed the sheet when it was asked to present while the
+                // long-press dialog was still dismissing (trace 2026-09-05 12:32):
+                // let the dialog finish first.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    activeSheet = .programInfo(
+                        ProgramInfoTarget(
+                            channelName: item.name,
+                            title: live.title,
+                            start: live.start,
+                            end: live.end,
+                            description: live.description ?? nowAiring?.description ?? "",
+                            category: item.currentProgramCategory ?? nowAiring?.category ?? "",
+                            programID: nowAiring?.programID,
+                            subTitle: live.subTitle ?? nowAiring?.subTitle,
+                            season: nowAiring?.season,
+                            episode: nowAiring?.episode,
+                            isNew: nowAiring?.isNew ?? false,
+                            isLiveBroadcast: nowAiring?.isLiveBroadcast ?? false,
+                            isPremiere: nowAiring?.isPremiere ?? false,
+                            isFinale: nowAiring?.isFinale ?? false,
+                            isRepeat: nowAiring?.isRepeat ?? false
+                        )
+                    )
+                }
+            } label: { Label("Program Info", systemImage: "info.circle") }
+        }
+
+        // Record the currently-airing program. v1.6.8 (B1 Phase 1):
+        // dropped the `currentProgram != nil && end > now` gate.
+        // For Dispatcharr playlists, `ChannelDisplayItem.currentProgram`
+        // is never populated at load time (the load path leaves
+        // EPG enrichment to the Guide view's per-cell prefetch),
+        // so the gate hid the Record action permanently for users
+        // who hadn't visited the Guide first. Now we always offer
+        // "Record", when EPG is missing we fall back to a generic
+        // title + a 60-minute default duration that the user can
+        // override in `RecordProgramSheet`.
+        if item.streamURL != nil {
+            let hasEPG = live != nil
+            Button {
+                let now = Date()
+                let title = live?.title ?? "\(item.name) live recording"
+                let start = live?.start ?? now
+                let end = (live?.end).flatMap { $0 > now ? $0 : nil } ?? now.addingTimeInterval(3600)
+                let entry = EPGEntry(title: title, description: live?.description ?? "",
+                                     startTime: start, endTime: end)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { activeSheet = .record(entry) }
+            } label: { Label(hasEPG ? "Record from Now" : "Record", systemImage: "record.circle") }
+        }
+    }
+
+    @ViewBuilder
+    private var collectionPickerButtons: some View {
+        ForEach(ChannelCollectionsStore.shared.collections) { c in
+            Button((ChannelCollectionsStore.shared.contains(channelID: item.id, in: c.id) ? "✓ " : "") + c.name) {
+                ChannelCollectionsStore.shared.toggleMember(channelID: item.id, in: c.id)
+            }
+        }
+        Button("New Collection") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showNewCollectionAlert = true }
+        }
+    }
+
+    @ViewBuilder
+    private var newCollectionAlertButtons: some View {
+        TextField("Name", text: $newCollectionName)
+        Button("Add at Beginning") {
+            ChannelCollectionsStore.shared.create(name: newCollectionName, memberIDs: [item.id], placement: .beginning)
+            newCollectionName = ""
+        }
+        Button("Add at End") {
+            ChannelCollectionsStore.shared.create(name: newCollectionName, memberIDs: [item.id], placement: .end)
+            newCollectionName = ""
+        }
+        Button("Cancel", role: .cancel) { newCollectionName = "" }
+    }
+
+    // MARK: - Guide Panel (shared iOS + tvOS)
+
+    /// Upcoming programs filtered to exclude the currently-airing
+    /// program (already shown in the channel card header).
+    ///
+    /// **Primary source: `GuideStore.programs[item.id]`**. Same
+    /// dataset the Guide view reads from. XMLTV populates it on
+    /// all platforms via `ChannelStore.primeXMLTVFromURL`, so
+    /// categories are guaranteed present on Dispatcharr + M3U
+    /// when the feed has them. No cache-layer round-trip.
+    ///
+    /// **Fallback: `upcomingPrograms`** from the legacy
+    /// `fetchUpcoming` closure. Primarily covers Xtream Codes,
+    /// which does per-channel EPG fetches that never populate
+    /// GuideStore. Also catches the transient window on a first
+    /// cold launch where a channel exists but XMLTV hasn't
+    /// parsed yet, in that case we still show SOMETHING rather
+    /// than an empty panel.
+    /// Catch-up: this channel's ALREADY-AIRED programmes from the retained
+    /// guide history, oldest first. Everything retained is listed (the
+    /// per-server Guide History setting bounds the depth); the section
+    /// renders collapsed so the panel still lands on the upcoming
+    /// schedule, Android-parity semantics adapted to SwiftUI.
+    /// Catch-up: resolve an aired programme and present the player,
+    /// silencing any live session first (recordings-pattern teardown).
+    private func watchCatchup(_ entry: EPGEntry) {
+        guard ChannelStore.shared.activeServer != nil,
+              entry.startTime != nil, entry.endTime != nil else { return }
+        PlayWhereRouter.shared.request(title: entry.title, item: .nonLive) {
+            resolveCatchup(entry)
+        }
+    }
+
+    private func resolveCatchup(_ entry: EPGEntry) {
+        guard let server = ChannelStore.shared.activeServer,
+              let start = entry.startTime, let end = entry.endTime else { return }
+        Task { @MainActor in
+            do {
+                let pb = CatchupResumeStore.prepare(try await CatchupSupport.resolve(
+                    server: server,
+                    channel: item,
+                    programTitle: entry.title,
+                    programStart: start,
+                    programEnd: end
+                ), channelID: item.id)
+                // Unified pipeline (task #147): catch-up plays in the
+                // SAME container/chrome as live on every platform (resume,
+                // pinch-to-mini, Options, readout). The legacy mpv cover is
+                // no longer reached, even with the dev mpv engine on.
+                PlayerSession.shared.beginCatchup(pb)
+            } catch {
+                debugLog("[CATCHUP] resolve failed for \(item.name) \(entry.title): \(error)")
+                catchupErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// Aired + upcoming rows for the expanded panel, pre-formatted. A
+    /// dictionary hit while the channel's guide slice (same array buffer),
+    /// the fallback list and the clock boundaries are unchanged; otherwise
+    /// built synchronously (slice publish while open, Xtream fallback).
+    /// Semantics are the old `airedPrograms` / `futurePrograms` passes.
+    private var currentSchedule: ListSchedule {
+        ListScheduleCache.shared.schedule(
+            channelID: item.id,
+            source: guideStore.programs[item.id] ?? [],
+            fallback: upcomingPrograms,
+            catchupDays: item.catchupDays,
+            now: Date()
+        )
+    }
+
+    /// Expand / collapse. Expanding builds the panel's rows OFF the main
+    /// thread first (iPad 137 ms expand, 2026-10-07: per-row DateFormatter
+    /// in `DVRFormat.day`, `Text(_:style:)` date formatting, and the
+    /// filter/sort/map over the whole resident list all ran inside the
+    /// render turn), then flips `isExpanded` in one pass. A re-expand with
+    /// an unchanged slice is a cache hit and flips immediately.
+    private func toggleExpanded(animated: Bool) {
+        if isExpanded {
+            commitExpanded(false, animated: animated, tapStart: nil)
+            return
+        }
+        guard !isPreparingSchedule else { return }
+        let tapStart = CFAbsoluteTimeGetCurrent()
+        let channelID = item.id
+        let channelName = item.name
+        let days = item.catchupDays
+        let source = guideStore.programs[channelID] ?? []
+        let fallback = upcomingPrograms
+        if ListScheduleCache.shared.lookup(channelID: channelID, source: source,
+                                           fallback: fallback, catchupDays: days,
+                                           now: Date()) != nil {
+            commitExpanded(true, animated: animated, tapStart: tapStart)
+            return
+        }
+        isPreparingSchedule = true
+        Task { @MainActor in
+            let built: (ListSchedule, Double) = await Task.detached(priority: .userInitiated) {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let schedule = ListScheduleCache.shared.schedule(
+                    channelID: channelID, source: source, fallback: fallback,
+                    catchupDays: days, now: Date())
+                return (schedule, (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            }.value
+            debugLog(String(format: "[LIST] expand rows built %.1fms off-main, %d rows (%@)",
+                            built.1, built.0.aired.count + built.0.future.count, channelName))
+            isPreparingSchedule = false
+            commitExpanded(true, animated: animated, tapStart: tapStart)
+        }
+    }
+
+    private func commitExpanded(_ value: Bool, animated: Bool, tapStart: CFAbsoluteTime?) {
+        let commitStart = CFAbsoluteTimeGetCurrent()
+        if let tapStart, commitStart - tapStart > 0.002 {
+            debugLog(String(format: "[LIST] expand tap-to-commit %.1fms (%@)",
+                            (commitStart - tapStart) * 1000, item.name))
+        }
+        if animated {
+            withAnimation(.spring(response: 0.25)) { isExpanded = value }
+        } else {
+            var t = Transaction()
+            t.disablesAnimations = true
+            withTransaction(t) { isExpanded = value }
+        }
+        // Measures this main-thread turn (state flip + panel render) up to
+        // the run loop's next wait.
+        ListExpandCost.measure(start: commitStart, channel: item.name, expanded: value)
+        // Skip the network fetch when GuideStore already has programmes
+        // for this channel: the expanded panel prefers GuideStore, so the
+        // fetch would be redundant work. Still fires for Xtream + cold-
+        // launch-before-XMLTV cases (GuideStore empty).
+        if value, fetchUpcoming != nil, currentSchedule.future.isEmpty {
+            isLoadingUpcoming = true
+            Task {
+                upcomingPrograms = await fetchUpcoming?() ?? []
+                isLoadingUpcoming = false
+            }
+        }
+    }
+
+    /// Small summary + action popover shown when the user long-presses
+    /// an upcoming-program row. Replaces the SwiftUI `.contextMenu` that
+    /// kept docking at the screen bottom on iPhone (#23 feedback).
+    ///
+    /// Structured as a tiny VStack, header (title + time range) then
+    /// one or two actions (Set / Cancel Reminder, Record). `.buttonStyle(.plain)`
+    /// + explicit padding match the visual weight of an iOS context
+    /// menu without relying on the system-provided one. Dismissed by
+    /// tapping any action (which sets `activePopoverEntryID = nil`)
+    /// or by tapping outside the popover (SwiftUI default).
+    @ViewBuilder
+    /// Action sheet items for an expanded programme row: Watch (catch-up)
+    /// for aired ones, Program Info, reminder, Record.
+    private func programActionSheetButtons(for entry: EPGEntry) -> some View {
+        if let start = entry.startTime, let end = entry.endTime,
+           end <= Date(), item.canReplay(start: start, end: end) {
+            Button("Watch") { watchCatchup(entry) }
+        }
+        Button("Program Info") {
+            let start = entry.startTime ?? Date()
+            let end = entry.endTime ?? start.addingTimeInterval(3600)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                activeSheet = .programInfo(
+                    ProgramInfoTarget(
+                        channelName: item.name, title: entry.title, start: start, end: end,
+                        description: entry.description, category: entry.category,
+                        programID: entry.programID, subTitle: entry.subTitle,
+                        season: entry.season, episode: entry.episode,
+                        isNew: entry.isNew, isLiveBroadcast: entry.isLiveBroadcast,
+                        isPremiere: entry.isPremiere, isFinale: entry.isFinale, isRepeat: entry.isRepeat)
+                )
+            }
+        }
+        if let start = entry.startTime, start > Date() {
+            let key = ReminderManager.programKey(channelName: item.name, title: entry.title, start: start)
+            if ReminderManager.shared.hasReminder(forKey: key) {
+                Button("Cancel Reminder", role: .destructive) { ReminderManager.shared.cancelReminder(forKey: key) }
+            } else {
+                Button("Set Reminder") {
+                    ReminderManager.shared.scheduleReminder(programTitle: entry.title, channelName: item.name, startTime: start)
+                }
+            }
+        }
+        if let end = entry.endTime, end > Date() {
+            Button(entry.startTime.map { $0 <= Date() } ?? false ? "Record from Now" : "Record") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { activeSheet = .record(entry) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func programActionPopover(for entry: EPGEntry) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header, program title + time range. Mirrors the old
+            // context-menu preview's data without the extra padding
+            // that made it look like a second card when docked at
+            // the bottom.
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.title)
+                    .scaledFont(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.textPrimary)
+                    .lineLimit(2)
+                if let start = entry.startTime {
+                    HStack(spacing: 4) {
+                        Text(start, style: .time)
+                        if let end = entry.endTime {
+                            Text("–")
+                            Text(end, style: .time)
+                        }
+                    }
+                    .scaledFont(.system(size: 12).subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            // Actions, info + reminder + record. Program Info is
+            // always available (unlike reminder/record which gate on
+            // future/live state) so it's the first button; users can
+            // inspect a past-aired program's metadata too.
+            VStack(spacing: 0) {
+                popoverActionButton(
+                    title: "Program Info",
+                    systemImage: "info.circle",
+                    isDestructive: false
+                ) {
+                    let start = entry.startTime ?? Date()
+                    let end = entry.endTime ?? start.addingTimeInterval(3600)
+                    activePopoverEntryID = nil
+                    // Slight delay so the popover dismiss animation
+                    // finishes before the sheet presents, iOS
+                    // sometimes swallows the sheet without this,
+                    // matching the pattern used for Record below.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        activeSheet = .programInfo(
+                            ProgramInfoTarget(
+                                channelName: item.name,
+                                title: entry.title,
+                                start: start,
+                                end: end,
+                                description: entry.description,
+                                category: entry.category,
+                                programID: entry.programID,
+                                subTitle: entry.subTitle,
+                                season: entry.season,
+                                episode: entry.episode,
+                                isNew: entry.isNew,
+                                isLiveBroadcast: entry.isLiveBroadcast,
+                                isPremiere: entry.isPremiere,
+                                isFinale: entry.isFinale,
+                                isRepeat: entry.isRepeat
+                            )
+                        )
+                    }
+                }
+                if let start = entry.startTime, start > Date() {
+                    let key = ReminderManager.programKey(
+                        channelName: item.name,
+                        title: entry.title,
+                        start: start
+                    )
+                    if ReminderManager.shared.hasReminder(forKey: key) {
+                        popoverActionButton(
+                            title: "Cancel Reminder",
+                            systemImage: "bell.slash",
+                            isDestructive: true
+                        ) {
+                            ReminderManager.shared.cancelReminder(forKey: key)
+                            activePopoverEntryID = nil
+                        }
+                    } else {
+                        popoverActionButton(
+                            title: "Set Reminder",
+                            systemImage: "bell.badge",
+                            isDestructive: false
+                        ) {
+                            ReminderManager.shared.scheduleReminder(
+                                programTitle: entry.title,
+                                channelName: item.name,
+                                startTime: start
+                            )
+                            activePopoverEntryID = nil
+                        }
+                    }
+                }
+                if let end = entry.endTime, end > Date() {
+                    popoverActionButton(
+                        title: "Record",
+                        systemImage: "record.circle",
+                        isDestructive: false
+                    ) {
+                        activePopoverEntryID = nil
+                        // Slight delay so the popover dismiss animation
+                        // finishes before the sheet presents, without
+                        // this iOS sometimes swallows the sheet.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            activeSheet = .record(entry)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 240, idealWidth: 280, maxWidth: 320)
+    }
+
+    /// One row inside `programActionPopover`. Full-width tap target
+    /// with icon + label, matching the visual rhythm of a system
+    /// context-menu row (system uses UITableView cells internally;
+    /// this is the SwiftUI approximation).
+    private func popoverActionButton(
+        title: String,
+        systemImage: String,
+        isDestructive: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .scaledFont(.system(size: 15, weight: .medium))
+                    .frame(width: 22)
+                Text(title)
+                    .scaledFont(.system(size: 15))
+                Spacer()
+            }
+            .foregroundColor(isDestructive ? .statusLive : .accentPrimary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// One aired program row above the "Previously aired" divider.
+    /// Replayable entries (inside the channel's archive window) carry the
+    /// rewind badge and tap straight into catch-up playback; the rest are
+    /// dimmed reference rows.
+    /// Program Info for one schedule entry (expanded row).
+    /// (@ViewBuilder removed: this mutates `activeSheet`, it doesn't build a
+    /// view — with the attribute the assignment type-checked as () → "type
+    /// '()' cannot conform to 'View'".)
+    private func presentProgramInfo(for entry: EPGEntry) {
+        let start = entry.startTime ?? Date()
+        let end = entry.endTime ?? start.addingTimeInterval(3600)
+        activeSheet = .programInfo(
+            ProgramInfoTarget(
+                channelName: item.name, title: entry.title, start: start, end: end,
+                description: entry.description, category: entry.category,
+                programID: entry.programID, subTitle: entry.subTitle,
+                season: entry.season, episode: entry.episode,
+                isNew: entry.isNew, isLiveBroadcast: entry.isLiveBroadcast,
+                isPremiere: entry.isPremiere, isFinale: entry.isFinale, isRepeat: entry.isRepeat))
+    }
+
+    /// List View Program Info button on an expanded schedule entry: All
+    /// Programs on every entry, Current Programs only on the one airing now.
+    /// Same glyph, size and target as the collapsed row's button.
+    @ViewBuilder
+    private func scheduleProgramInfoButton(_ entry: EPGEntry) -> some View {
+        let now = Date()
+        let airing = (entry.startTime.map { $0 <= now } ?? false) && (entry.endTime.map { $0 > now } ?? false)
+        if programInfoInList, GuideProgramInfoButton.shows(mode: programInfoButtonMode, isLive: airing) {
+            Button {
+                presentProgramInfo(for: entry)
+            } label: {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 18, weight: .medium))  // glyph in a fixed box: not text, stays fixed
+                    .foregroundColor(.textSecondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Program Info")
+        }
+    }
+
+    private func airedEntryRow(_ row: ListScheduleRow) -> some View {
+        let entry = row.entry
+        let replayable = row.replayable
+        return HStack(spacing: 0) {
+        Button {
+            debugLog("[CATCHUP] tap \(item.name) days=\(item.catchupDays) replayable=\(replayable) \(entry.title) \(entry.startTime.map { DVRFormat.dateRange($0, entry.endTime ?? $0) } ?? "")")
+            if replayable { watchCatchup(entry) }
+        } label: {
+            HStack(spacing: 6) {
+                if replayable {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .scaledFont(.system(size: 11))
+                        .foregroundColor(.accentPrimary)
+                }
+                Text(entry.title)
+                    .scaledFont(.labelSmall)
+                    .foregroundColor(replayable ? .textPrimary : Color.contrastText(.textTertiary))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if entry.startTime != nil, let endText = row.endText {
+                    HStack(spacing: 3) {
+                        // Day before the times once it is not today
+                        // (Logan 2026-09-05: a week of history reads as
+                        // one long day otherwise).
+                        if let dayText = row.dayText {
+                            Text(dayText)
+                                .foregroundColor(Color.contrastText(.textSecondary))
+                            Text("·")
+                        }
+                        Text(row.startText)
+                        Text("-")
+                        Text(endText)
+                    }
+                    .scaledFont(.system(size: 11).subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                }
+            }
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!replayable)
+        scheduleProgramInfoButton(entry)
+        }
+    }
+
+    /// Aired rows above a "Previously aired" divider. On iOS this scrolls
+    /// inside the guide panel with the upcoming rows; on tvOS it sits
+    /// above the upcoming ScrollView.
+    @ViewBuilder
+    private func airedSection(_ airedPrograms: [ListScheduleRow]) -> some View {
+        // Catch-up: retained history shown without a disclosure tap
+        // (Logan 2026-09-09, matching Android): the aired rows come
+        // first, then a centered "Previously aired" divider, then the
+        // upcoming schedule. Replayable entries tap straight into
+        // playback; older-than-retention entries (or channels with no
+        // archive) render as plain reference rows.
+        if !airedPrograms.isEmpty {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(airedPrograms) { entry in
+                    airedEntryRow(entry)
+                }
+                // Up arrows on both sides of the label say "everything
+                // above this line already aired" (Logan 2026-09-09).
+                HStack(spacing: 8) {
+                    Rectangle().fill(Color.borderSubtle).frame(height: 1)
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up")
+                            .scaledFont(.system(size: 9, weight: .semibold))
+                        Text("Previously aired")
+                            .scaledFont(.labelSmall.subtext())
+                        Image(systemName: "arrow.up")
+                            .scaledFont(.system(size: 9, weight: .semibold))
+                    }
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                    .fixedSize()
+                    Rectangle().fill(Color.borderSubtle).frame(height: 1)
+                }
+                .padding(.vertical, 6)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 4)
+            .fullScreenCover(item: $playingCatchup) { pb in
+                PlayerView(
+                    urls: [pb.url],
+                    title: pb.title,
+                    headers: pb.headers,
+                    isLive: false,
+                    isDVR: false,
+                    catchup: pb
+                )
+            }
+            .alert("Catch-up Unavailable",
+                   isPresented: Binding(
+                        get: { catchupErrorMessage != nil },
+                        set: { if !$0 { catchupErrorMessage = nil } })) {
+                Button("OK", role: .cancel) { catchupErrorMessage = nil }
+            } message: {
+                Text(catchupErrorMessage ?? "")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var guidePanel: some View {
+        // Computed ONCE per body (iPad expand hang, Logan 2026-10-07): the
+        // rows used to read `futurePrograms` / `airedPrograms` (a filter,
+        // sort and map over the channel's whole resident list) in every
+        // row's `isLast` check, so expanding a 300-program channel ran that
+        // pass 300 times on the main thread.
+        // Since 2026-10-07 the rows come pre-built (formatted strings,
+        // badges, replay gate) from `ListScheduleCache`.
+        let schedule = currentSchedule
+        let future = schedule.future
+        let aired = schedule.aired
+        let futureLastID = schedule.futureLastID
+        Divider()
+            .background(Color.borderSubtle)
+            .padding(.horizontal, 14)
+
+
+        if fetchUpcoming != nil {
+            if isLoadingUpcoming {
+                HStack(spacing: 6) {
+                    ProgressView().scaleEffect(0.7)
+                    Text("Loading schedule…")
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+            } else if future.isEmpty {
+                airedSection(aired)
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar.badge.exclamationmark")
+                        .scaledFont(.system(size: 12))
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                    Text("No upcoming schedule available")
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 10)
+            } else {
+                // iOS: the panel scrolls inside the card (max height as
+                // Android's 360) and opens on the first upcoming row, so
+                // the aired rows above the "Previously aired" divider are
+                // reached by scrolling up within the panel (Logan
+                // 2026-09-09). At the panel's edges the gesture hands off
+                // to the outer list.
+                ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                // Lazy (iPad expand hang): only the rows on screen are
+                // built, not every aired and upcoming row with its own
+                // confirmation dialog.
+                LazyVStack(spacing: 0) {
+                airedSection(aired)
+                LazyVStack(spacing: 0) {
+                    ForEach(future) { entry in
+                        // Rebind to a local constant so SwiftUI's ForEach
+                        // diffing can't swap the captured reference between
+                        // when the user starts a long-press and when the
+                        // contextMenu/preview closures are evaluated.
+                        // Without this, the preview occasionally rendered a
+                        // different program than the one the user pressed
+                        // (e.g. user long-pressed "Moeder Natuur 07:10" but
+                        // the dialog previewed "Timmy tijd 06:05–06:10").
+                        let rowEntry = entry
+                        let rowProgram = entry.entry
+                        // Long-press + popover replaces `.contextMenu` here
+                        // because SwiftUI's `.contextMenu(menuItems:preview:)`
+                        // on iPhone has a documented "docks the preview +
+                        // menu at the screen bottom" failure mode when the
+                        // source view is inside a nested scroll container
+                        // (our expanded guidePanel inside a ChannelRow
+                        // inside a List). Research turned up no SwiftUI
+                        // API that controls the context-menu preview
+                        // position, Apple's own apps use UIKit
+                        // `UIContextMenuInteraction` directly. `.popover`
+                        // with `.presentationCompactAdaptation(.popover)`
+                        // gives us the native popover on iPhone (iOS 16.4+)
+                        // and always anchors to the attached view via
+                        // `attachmentAnchor: .rect(.bounds)`, which is
+                        // exactly "where the user long-pressed" per #23
+                        // feedback.
+                        epgEntryRow(row: rowEntry, isLast: rowEntry.id == futureLastID)
+                            // No horizontal outer padding, rows now
+                            // extend to the card's inner edge, so the
+                            // parent card's category gradient can't
+                            // "bleed" through the gaps between rows
+                            // (#22 feedback: "I can see my category
+                            // color between future programs at the
+                            // edges which looks unfinished"). Rows
+                            // still get 2 pt vertical breathing room
+                            // so they read as individual cards rather
+                            // than one run-on block.
+                            .padding(.vertical, 2)
+                            .background(
+                                // ZStack layering, the previous
+                                // version used two chained `.background`
+                                // modifiers to stack solid-fill + gradient.
+                                // That was a SwiftUI ordering bug: stacked
+                                // `.background` modifiers each go further
+                                // back than the previous, so the "solid
+                                // fill to block parent gradient bleed"
+                                // modifier ended up IN FRONT of the per-
+                                // program gradient, hiding it completely.
+                                // Three rounds of debugging chased the
+                                // data layer for something that was a
+                                // render ordering bug. ZStack has
+                                // unambiguous paint order: first child at
+                                // the back, last child at the front.
+                                ZStack {
+                                    Rectangle()
+                                        .fill(Color.cardBackground)
+                                    if tintChannelCards,
+                                       CategoryColor.isEnabled,
+                                       !rowProgram.category.isEmpty,
+                                       let bucket = CategoryColor.bucket(for: rowProgram.category) {
+                                        LinearGradient(
+                                            stops: [
+                                                .init(color: CategoryColor.tint(bucket.baseColor, 0.30), location: 0.0),
+                                                .init(color: CategoryColor.tint(bucket.baseColor, 0.18), location: 0.22),
+                                                .init(color: CategoryColor.tint(bucket.baseColor, 0.06), location: 0.45),
+                                                .init(color: .clear,                          location: 0.65),
+                                            ],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    }
+                                }
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture { /* no-op; prevents accidental parent-scroll triggers */ }
+                            .onLongPressGesture(minimumDuration: 0.25) {
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                activePopoverEntryID = rowEntry.id
+                            }
+                            // Native action sheet (Logan 2026-09-05), the
+                            // same items the tvOS long press offers.
+                            .confirmationDialog(
+                                rowProgram.title,
+                                isPresented: Binding(
+                                    get: { activePopoverEntryID == rowEntry.id },
+                                    set: { if !$0 { activePopoverEntryID = nil } }
+                                ),
+                                titleVisibility: .visible
+                            ) {
+                                programActionSheetButtons(for: rowProgram)
+                            }
+                    }
+                }
+                .id("upcoming-top")
+                }
+                }
+                .frame(maxHeight: 360)
+                .onAppear {
+                    DispatchQueue.main.async { proxy.scrollTo("upcoming-top", anchor: .top) }
+                }
+                }
+                .padding(.bottom, 4)
+            }
+        }
+    }
+
+    // MARK: - Now Playing Helpers
+
+    /// Compact time-remaining badge shown beside the current program title.
+    /// Uses a plain Date() snapshot, accurate when the row appears, no per-row
+    /// TimelineView overhead that causes batch re-renders during scroll.
+    private func nowPlayingTimeRemaining(end: Date) -> some View {
+        let remaining = max(0, end.timeIntervalSince(Date()))
+        let mins = Int(remaining / 60)
+        let label = mins < 60 ? "\(mins)m" : "\(mins / 60)h\(mins % 60 > 0 ? " \(mins % 60)m" : "")"
+        return Text(label)
+            .scaledFont(.system(size: isWide ? 11 : 9, weight: .medium, design: .monospaced).subtext())
+            .foregroundColor(Color.contrastText(.textSecondary))
+            .lineLimit(1)
+            .fixedSize()
+    }
+
+    /// Thin progress bar showing how far through the current program we are.
+    private func nowPlayingProgressBar(start: Date, end: Date) -> some View {
+        let total = end.timeIntervalSince(start)
+        let elapsed = Date().timeIntervalSince(start)
+        let fraction = total > 0 ? min(1, max(0, elapsed / total)) : 0
+
+        return GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.accentPrimary.opacity(0.15))
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.accentPrimary.opacity(0.7))
+                    .frame(width: geo.size.width * fraction)
+            }
+        }
+        .frame(height: 3)
+    }
+
+    // MARK: - EPG Entry Row
+    /// Shared row used inside the guide ScrollView (direct on iOS, wrapped in focusable Button on tvOS).
+    @ViewBuilder
+    private func reminderMenu(for entry: EPGEntry) -> some View {
+        if let start = entry.startTime, start > Date() {
+            let key = ReminderManager.programKey(channelName: item.name, title: entry.title, start: start)
+            if ReminderManager.shared.hasReminder(forKey: key) {
+                Button(role: .destructive) {
+                    ReminderManager.shared.cancelReminder(forKey: key)
+                } label: {
+                    Label("Cancel Reminder", systemImage: "bell.slash")
+                }
+            } else {
+                Button {
+                    ReminderManager.shared.scheduleReminder(
+                        programTitle: entry.title,
+                        channelName: item.name,
+                        startTime: start
+                    )
+                } label: {
+                    Label("Set Reminder", systemImage: "bell")
+                }
+            }
+        }
+    }
+
+    /// Feed badges + season/episode line for an expanded-schedule row.
+    /// Renders nothing when the program carries neither.
+    @ViewBuilder
+    private func epgEntryMetaRow(_ row: ListScheduleRow) -> some View {
+        let seLabel = row.seLabel
+        let flags = row.flags
+        if showEpgBadges, seLabel != nil || !flags.isEmpty {
+            HStack(spacing: 6) {
+                SeasonEpisodePill(label: seLabel, compact: true)
+                EPGFlagsRow(flags: flags, compact: true)
+            }
+            .padding(.top, 1)
+        }
+    }
+
+    private func epgEntryRow(row: ListScheduleRow, isLast: Bool) -> some View {
+        let entry = row.entry
+        return VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Rectangle()
+                    .fill(Color.borderSubtle)
+                    .frame(width: 2)
+                    .cornerRadius(1)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.title)
+                        .scaledFont(.bodySmall)
+                        .foregroundColor(.textPrimary)
+                        .lineLimit(1)
+                    if !entry.description.isEmpty {
+                        Text(entry.description)
+                            .scaledFont(.labelSmall.subtext())
+                            .foregroundColor(Color.contrastText(.textSecondary))
+                            .lineLimit(2)
+                    }
+                    if entry.startTime != nil {
+                        HStack(spacing: 4) {
+                            // Day prefix once the programme is not today
+                            // (tomorrow's schedule, or history).
+                            if let dayText = row.dayText {
+                                Text(dayText)
+                                    .foregroundColor(Color.contrastText(.textSecondary))
+                                Text("·")
+                            }
+                            Text(row.startText)
+                            if let endText = row.endText {
+                                Text("–")
+                                Text(endText)
+                            }
+                        }
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textTertiary))
+                    }
+                    epgEntryMetaRow(row)
+                }
+                Spacer()
+
+                // Bell indicator for programs with active reminders
+                if let start = entry.startTime, start > Date(),
+                   ReminderManager.shared.hasReminder(
+                       forKey: ReminderManager.programKey(channelName: item.name, title: entry.title, start: start)
+                   ) {
+                    Image(systemName: "bell.fill")
+                        .scaledFont(.system(size: 12))
+                        .foregroundColor(.accentPrimary)
+                        .padding(.trailing, 4)
+                }
+                scheduleProgramInfoButton(entry)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+
+            if !isLast {
+                Divider()
+                    .background(Color.borderSubtle.opacity(0.5))
+                    .padding(.leading, 42)
+            }
+        }
+    }
+}
+
+// MARK: - EPG Row Button Style (tvOS only)
+
+// MARK: - Pressable EPG Row (iOS only)
+// Wraps an EPG entry row with a short long-press gesture (0.35s) and
+// visual press feedback (dimming + slight scale). Replaces .contextMenu
+// which doesn't reliably trigger inside nested ScrollViews.
+private struct PressableEPGRow<Row: View>: View {
+    let entry: EPGEntry
+    let isLast: Bool
+    let isFuture: Bool
+    let channelName: String
+    @ViewBuilder let rowContent: () -> Row
+    let onLongPress: () -> Void
+
+    @State private var isPressed = false
+
+    var body: some View {
+        rowContent()
+            .contentShape(Rectangle())
+            .opacity(isPressed ? 0.5 : 1.0)
+            .scaleEffect(isPressed ? 0.98 : 1.0)
+            .animation(.easeInOut(duration: 0.12), value: isPressed)
+            .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                if isFuture {
+                    isPressed = pressing
+                }
+            }, perform: {
+                guard isFuture else { return }
+                let generator = UIImpactFeedbackGenerator(style: .medium)
+                generator.impactOccurred()
+                onLongPress()
+            })
+    }
+}
+
+
+// MARK: - Marquee Text
+struct MarqueeText: View {
+    let text: String
+    let font: AstralFont
+    let color: Color
+    /// When false, text is static (truncated). Saves CPU/GPU during scroll.
+    var isActive: Bool = true
+
+    @State private var offset: CGFloat = 0
+    @State private var textWidth: CGFloat = 0
+    @State private var containerWidth: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { geo in
+            Text(text)
+                .scaledFont(font)
+                .foregroundColor(color)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .background(
+                    GeometryReader { textGeo in
+                        Color.clear.onAppear {
+                            textWidth = textGeo.size.width
+                            containerWidth = geo.size.width
+                        }
+                    }
+                )
+                .offset(x: offset)
+        }
+        .clipped()
+        .onChange(of: text) { _, _ in offset = 0; textWidth = 0 }
+        .onChange(of: isActive) { _, active in
+            if !active { withAnimation(.easeInOut(duration: 0.2)) { offset = 0 } }
+        }
+        .task(id: isActive ? textWidth : -1) {
+            guard isActive else { return }
+            await runMarquee()
+        }
+    }
+
+    @MainActor
+    private func runMarquee() async {
+        offset = 0
+        let dist = textWidth - containerWidth
+        guard dist > 8 else { return }
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.linear(duration: Double(dist) / 40)) { offset = -dist }
+            try? await Task.sleep(for: .seconds(Double(dist) / 40 + 0.8))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.4)) { offset = 0 }
+            try? await Task.sleep(for: .seconds(1.5))
+        }
+    }
+}
+
+/// Makes a view unfocusable only while `blocked`; otherwise adds nothing, so
+/// a Button keeps its own single focusable and its style's ring.
+private struct TVFocusBlock: ViewModifier {
+    let blocked: Bool
+    func body(content: Content) -> some View {
+        if blocked { content.focusable(false) } else { content }
+    }
+}
+
+// MARK: - tvOS Group Pill
+// Each pill owns its own @FocusState so it can apply a scale+glow effect
+// instead of the system's default white focus ring.
+
+// MARK: - Cached Channel Logo Image
+
+/// In-memory logo cache, prevents AsyncImage from re-fetching on every scroll.
+final class LogoCache: @unchecked Sendable {
+    static let shared = LogoCache()
+    private let cache = NSCache<NSString, UIImage>()
+    private init() { cache.countLimit = 500 }
+    func image(for key: String) -> UIImage? { cache.object(forKey: key as NSString) }
+    func store(_ img: UIImage, for key: String) { cache.setObject(img, forKey: key as NSString) }
+}
+
+/// v1.6.23, auth-aware logo fetcher. Dispatcharr-API channel logos
+/// live behind `/api/channels/logos/<id>/cache/`, which requires the
+/// server's `X-API-Key` (or `Authorization: ApiKey ...` / `Bearer`
+/// per the per-server auth mode added in v1.6.20). The previous
+/// implementation used a bare `URLSession.shared.data(from: url)`
+/// with no headers, so every Dispatcharr-API logo fetch returned
+/// 401/403, the image bytes were unparseable, and every channel
+/// rendered the placeholder icon (jexhammer + Archie iPad sim repro,
+/// v1.6.23 reports). The fix: detect URLs that match the active
+/// server's host and inject `server.authHeaders`. Public CDN URLs
+/// (TMDB, EPG-side logos baked into the M3U) don't match the host
+/// and pass through unauthenticated, preserving today's behaviour.
+enum LogoFetcher {
+    /// Returns the auth headers to apply when fetching `url`, or
+    /// `nil` when no server matches (CDN passthrough).
+    @MainActor
+    static func headers(for url: URL) -> [String: String]? {
+        guard let host = url.host?.lowercased() else { return nil }
+        guard let server = ChannelStore.shared.activeServer else { return nil }
+        let candidates = [server.effectiveBaseURL, server.normalizedBaseURL, server.normalizedLocalURL]
+        for raw in candidates {
+            guard let candidateHost = URL(string: raw)?.host?.lowercased() else { continue }
+            if candidateHost == host { return server.authHeaders }
+        }
+        return nil
+    }
+
+    /// SSRF gate for logo fetches. Channel logos come from untrusted feed
+    /// data (M3U `tvg-logo`, Xtream `stream_icon`, Dispatcharr logo JSON),
+    /// so a malicious playlist could point them at `127.0.0.1`, link-local
+    /// `169.254.x`, or a LAN IP to probe the user's network. Allow the
+    /// active server's own host(s) (LAN or WAN, the trust boundary) and
+    /// otherwise defer to `VODService.validateAbsoluteURL` with no server
+    /// host, which permits public hosts but rejects loopback / link-local
+    /// / RFC-1918 targets. Mirrors the gate VOD posters already use.
+    @MainActor
+    static func isAllowedTarget(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        if let server = ChannelStore.shared.activeServer {
+            let candidates = [server.effectiveBaseURL, server.normalizedBaseURL, server.normalizedLocalURL]
+            for raw in candidates {
+                if let candidateHost = URL(string: raw)?.host?.lowercased(), candidateHost == host {
+                    return true
+                }
+            }
+        }
+        return VODService.validateAbsoluteURL(url, serverHost: nil) != nil
+    }
+
+    /// Fetch logo bytes with the right auth headers (if any).
+    ///
+    /// Uses `HTTPRouter` (not bare URLSession) so plain-HTTP servers
+    /// like jexhammer's `http://dispatcharr.goip.de:59192` (which
+    /// URLSession refuses with -1022 ATS) fall back to `NWHTTPClient`
+    /// just like every other API call. Without that fallback, logos
+    /// 404 silently for any user whose Dispatcharr lives on a
+    /// non-IP-literal HTTP host (HSTS-preloaded TLDs, custom domains
+    /// without TLS).
+    static func fetch(_ url: URL) async throws -> Data {
+        let (allowed, headers) = await MainActor.run {
+            (Self.isAllowedTarget(url), Self.headers(for: url))
+        }
+        // Reject SSRF targets (loopback / link-local / non-server LAN IPs).
+        // CachedLogoImage's catch shows the placeholder, same as any fetch
+        // failure.
+        guard allowed else { throw URLError(.unsupportedURL) }
+        var request = URLRequest(url: url)
+        if let headers = headers {
+            for (key, value) in headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
+        let (data, _) = try await HTTPRouter.data(for: request)
+        return data
+    }
+}
+
+/// Drop-in replacement for AsyncImage that caches logos in memory.
+struct CachedLogoImage: View {
+    let url: URL?
+    let width: CGFloat
+    let height: CGFloat
+    /// Corner radius of the CELL OR CARD this logo sits in. The logo is
+    /// clipped to it when Settings > Appearance > "Rounded corners on logos
+    /// and artwork" is on, and to a square when it is off. Leave at 0 for a
+    /// container that is not rounded (the guide's channel column cell), and
+    /// the logo stays square either way. See `LogoCorners`.
+    var containerRadius: CGFloat = 0
+    /// WIDTH-driven sizing (the Live TV list rows). The logo's box becomes
+    /// the full slot width by `width / aspect`, and `height` only CAPS it:
+    /// a box taller than the cap shrinks to the cap instead. Without this
+    /// the badge sized the logo from the row height, so the same 16:9 source
+    /// drew bigger in a row with more text than in a short one (Logan
+    /// 2026-09-16, iPhone, MLB group). Off for the guide column, whose rows
+    /// are a uniform height already.
+    var sizedByWidth: Bool = false
+    /// Read the GUIDE corner toggle instead of the List one. The guide's
+    /// channel column is the only surface on the guide flag (Logan
+    /// 2026-09-16, the single toggle split in two).
+    var usesGuideCorners: Bool = false
+
+    @State private var uiImage: UIImage?
+    /// Sampled once per image by `LogoTileTest`: true for opaque artwork
+    /// that reaches its own corners, false for a logo that floats on
+    /// transparency. Drives the shared rounding rule below.
+    @State private var isTile: Bool = false
+    @Environment(\.astralRoundedLogoCorners) private var roundedCorners
+    @Environment(\.astralRoundedGuideCorners) private var roundedGuideCorners
+
+    /// Whichever of the two Appearance toggles governs this surface.
+    private var cornersEnabled: Bool {
+        usesGuideCorners ? roundedGuideCorners : roundedCorners
+    }
+
+    /// The slot the image is fitted into. Callers (ChannelBadge included)
+    /// pass a DEFINITE height: `.frame(maxHeight: .infinity)` cannot work in
+    /// a self-sizing row, which proposes an unspecified height and collapses
+    /// the slot (Logan 2026-09-16, iPhone list row).
+    ///
+    /// Under `sizedByWidth` the height is DERIVED from the image's own
+    /// aspect instead, with `height` as the cap, so every logo of the same
+    /// aspect draws at the same size whatever its row contains.
+    private var slot: CGSize {
+        guard sizedByWidth else { return CGSize(width: width, height: height) }
+        // Before the bitmap lands, reserve a 16:9 box (still capped), which
+        // is what nearly every channel logo turns out to be; the box settles
+        // to the true aspect on decode without moving the row, whose height
+        // the text column owns.
+        let aspect = uiImage.flatMap { img -> CGFloat? in
+            guard img.size.width > 0, img.size.height > 0 else { return nil }
+            return img.size.width / img.size.height
+        } ?? (16.0 / 9.0)
+        return CGSize(width: width, height: min(height, width / max(aspect, 0.01)))
+    }
+
+    /// The image's OWN drawn bounds inside `slot` under `.fit`. The clip and
+    /// the radius cap both key off this, not off the slot: clipping the slot
+    /// would round empty letterbox space, and capping on the slot would let a
+    /// short wide logo become a pill.
+    private func fitted(_ image: UIImage) -> CGSize {
+        LogoCorners.fitted(image: image.size, in: slot)
+    }
+
+    /// The radius actually drawn, through the ONE shared rule: a fitted
+    /// image that fills the slot edge to edge is a tile and takes the
+    /// container's radius (capped); one that floats inside it stays square.
+    private func radius(for fittedSize: CGSize) -> CGFloat {
+        LogoCorners.imageRadius(container: containerRadius,
+                                fitted: fittedSize,
+                                isTile: isTile,
+                                enabled: cornersEnabled)
+    }
+
+    /// One sizing rule for both the image and the placeholder.
+    private func sized(_ content: some View) -> some View {
+        content.frame(width: width, height: height)
+    }
+
+    /// Samples the corner alpha on a background task and records the
+    /// verdict once, keyed by URL, so no later appearance re-reads pixels.
+    private func sampleOffMain(_ image: UIImage, key: String) async {
+        let verdict = await Task.detached(priority: .utility) {
+            LogoTileTest.sample(image)
+        }.value
+        LogoTileTest.record(verdict, for: key)
+        if isTile != verdict { isTile = verdict }
+    }
+
+    var body: some View {
+        sized(
+            Group {
+                if let img = uiImage {
+                    // Fit by hand rather than with .aspectRatio(.fit) so the
+                    // clip hugs the ART's bounds instead of the slot's.
+                    let box = fitted(img)
+                    Image(uiImage: img).resizable()
+                        .frame(width: box.width, height: box.height)
+                        .clipShape(RoundedRectangle(cornerRadius: radius(for: box),
+                                                    style: .continuous))
+                } else {
+                    ZStack {
+                        // The placeholder tile follows the same rule: it is a
+                        // stand-in for the logo, so it takes the container's
+                        // radius, capped at the 6 it has always drawn so an
+                        // empty slot never looks rounder than the art would.
+                        // The placeholder IS an opaque tile, so it rounds
+                        // with the container, capped at the 6 it has always
+                        // drawn so an empty slot never looks rounder than
+                        // real art would.
+                        RoundedRectangle(cornerRadius: min(LogoCorners.radius(container: containerRadius,
+                                                                              imageShorterSide: min(slot.width, slot.height),
+                                                                              isTile: true,
+                                                                              enabled: cornersEnabled), 6),
+                                         style: .continuous)
+                            .fill(Color.accentPrimary.opacity(0.12))
+                        NoPosterPlaceholder(compact: true)
+                    }
+                }
+            }
+        )
+        .task(id: url?.absoluteString) {
+            guard let url else { return }
+            let key = url.absoluteString
+            if let cached = LogoCache.shared.image(for: key) {
+                // Re-appearing cell: the verdict is already known for any
+                // logo this session has drawn, so a fast flick never samples
+                // pixels on the main actor. An unknown one (image cached by
+                // another surface) is sampled off-main below.
+                if let known = LogoTileTest.cached(key) {
+                    isTile = known
+                    uiImage = cached
+                } else {
+                    uiImage = cached
+                    await sampleOffMain(cached, key: key)
+                }
+                return
+            }
+            do {
+                let data = try await LogoFetcher.fetch(url)
+                // GH #61: decode accepts SVG logos in addition to bitmaps.
+                // Decode AND corner sampling both run off the main actor:
+                // together they were the 100 to 220 ms main-runloop hangs
+                // right after launch (Logan 2026-09-16).
+                let decoded: UIImage? = await Task.detached(priority: .utility) {
+                    AstralImageDecoding.decode(data)
+                }.value
+                guard let img = decoded else { return }
+                LogoCache.shared.store(img, for: key)
+                uiImage = img
+                await sampleOffMain(img, key: key)
+            } catch {}
+        }
+    }
+}
+
+// MARK: - Scroll chrome box
+//
+// The two iPhone scroll-driven chrome flags, out of ChannelListView's
+// `@State` and into one `@Observable` box (Logan 2026-09-16). Observation
+// tracks reads PER VIEW BODY: writing here re-renders only the views that
+// read the property, so the flick that used to rebuild every channel row
+// now touches the header inset and the tab-bar modifier alone. Writing from
+// a scroll callback is not a read, so the list is never invalidated.
+@Observable
+@MainActor
+final class ListScrollChrome {
+    /// Filter pills collapsed (position based, 80 / 20 hysteresis).
+    var isCollapsed: Bool = false
+    /// Tab bar tucked away (direction based, see TabBarScrollTracker).
+    var isTabBarAway: Bool = false
+
+    // Deferred flips (Logan 2026-09-16, iPhone flick hiccup on the 11-channel
+    // group). Publishing either flag while the list is DECELERATING removes
+    // or restores the header's `safeAreaInset` under a 0.2 s animation, and
+    // the List relayouts for every frame of it while UIScrollView is still
+    // animating its own deceleration: the iPhone log showed 40 x
+    // [HANG] main runloop turn 120-230 ms through one flick, several landing
+    // directly on [CHROME] collapse=true / tabBarAway=true. The target value
+    // is stashed instead and published when the scroll phase reaches .idle,
+    // so the inset change never competes with deceleration. A flip while the
+    // finger is still down (tracking) is applied immediately as before.
+    @ObservationIgnored var pendingCollapsed: Bool?
+    @ObservationIgnored var pendingTabBarAway: Bool?
+    /// True between the finger lifting and the scroll coming to rest.
+    @ObservationIgnored var isDecelerating = false
+
+    /// What the scroll observer should compare against: the stashed target
+    /// when there is one, otherwise the published value.
+    var targetCollapsed: Bool { pendingCollapsed ?? isCollapsed }
+    var targetTabBarAway: Bool { pendingTabBarAway ?? isTabBarAway }
+
+    func applyCollapsed(_ value: Bool, deferred: Bool) {
+        debugLog("[CHROME] collapse=\(value)\(deferred ? " (deferred to idle)" : "")")
+        guard !deferred else { pendingCollapsed = value; return }
+        pendingCollapsed = nil
+        guard isCollapsed != value else { return }
+        ChromeEventTrace.note("collapse=\(value)")
+        withAnimation(.easeInOut(duration: 0.2)) { isCollapsed = value }
+    }
+
+    func applyTabBarAway(_ value: Bool, deferred: Bool) {
+        debugLog("[CHROME] tabBarAway=\(value)\(deferred ? " (deferred to idle)" : "")")
+        guard !deferred else { pendingTabBarAway = value; return }
+        pendingTabBarAway = nil
+        guard isTabBarAway != value else { return }
+        ChromeEventTrace.note("tabBarAway=\(value)")
+        // No withAnimation: the bar is its own chrome layer and the system
+        // animates the toolbar change. Wrapping it animated the List's
+        // bottom inset along with it.
+        isTabBarAway = value
+    }
+
+    /// Scroll came to rest: publish anything held back during deceleration.
+    func flushPending() {
+        isDecelerating = false
+        if let value = pendingCollapsed {
+            pendingCollapsed = nil
+            if isCollapsed != value {
+                debugLog("[CHROME] collapse=\(value) applied at scroll idle")
+                ChromeEventTrace.note("collapse=\(value)-idle")
+                withAnimation(.easeInOut(duration: 0.2)) { isCollapsed = value }
+            }
+        }
+        if let value = pendingTabBarAway {
+            pendingTabBarAway = nil
+            if isTabBarAway != value {
+                debugLog("[CHROME] tabBarAway=\(value) applied at scroll idle")
+                ChromeEventTrace.note("tabBarAway=\(value)-idle")
+                isTabBarAway = value
+            }
+        }
+    }
+}
+
+/// The last scroll-chrome flip that actually ran, so the [HANG] run loop
+/// observer can NAME what the long turn was doing (Logan 2026-09-16). Main
+/// thread only: written from the scroll callbacks, read from the run loop
+/// observer, both of which run on main.
+enum ChromeEventTrace {
+    nonisolated(unsafe) private static var lastEvent: String?
+    nonisolated(unsafe) private static var lastAt: CFAbsoluteTime = 0
+
+    static func note(_ event: String) {
+        lastEvent = event
+        lastAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    /// " chrome=<event> +<n>ms" when a chrome flip ran in the last two
+    /// seconds, empty otherwise.
+    static func hangContext(now: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> String {
+        guard let lastEvent, lastAt > 0 else { return "" }
+        let dt = now - lastAt
+        guard dt >= 0, dt < 2 else { return "" }
+        return " chrome=\(lastEvent) +\(Int(dt * 1000))ms"
+    }
+}
+
+/// The phone header's `safeAreaInset` content. Exists purely so the collapse
+/// flag is read in a LEAF body instead of in ChannelListView's.
+private struct PhoneChromeInset<Content: View>: View {
+    let chrome: ListScrollChrome
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if usesPhoneLiveTVLayout && !chrome.isCollapsed {
+            content()
+        }
+    }
+}
+
+// MARK: - Live TV Logo Size
+//
+// Settings > Live TV > Logo Size (Discord request 2026-10-06, identical spec
+// on Android). The SAME ladder, labels and default as Settings > Multiview >
+// Logo Size, plus a 2.5% stop below 5% (Live TV only, Multiview keeps its
+// ladder). Here the value is read relative to the default: 10% draws the
+// logo at exactly today's size, 5% at half, 2.5% at a quarter, 25% at two and
+// a half times. Stored as a Double under the same key: an Int written by the
+// first build of this setting reads back as the same Double, no migration.
+// The multiplier applies on top of the "logos grow when numbers or names are
+// hidden" rule. Surfaces with a fixed cell (the guide's channel column) cap
+// the grown logo at the room the cell has; the list rows grow with it.
+let liveTVLogoSizeKey = "ui.channelLogoSize"
+let liveTVLogoSizeDefault: Double = Double(multiviewLogoSizeDefault)
+let liveTVLogoSizeChoices: [Double] = [2.5] + multiviewLogoSizeChoices.map(Double.init)
+
+enum LiveTVLogoSize {
+    /// The multiplier for a stored percent, snapped to the nearest stop.
+    static func factor(_ percent: Double) -> CGFloat {
+        let snapped = liveTVLogoSizeChoices.min(by: { abs($0 - percent) < abs($1 - percent) })
+            ?? liveTVLogoSizeDefault
+        return CGFloat(snapped) / CGFloat(liveTVLogoSizeDefault)
+    }
+
+    /// Settings label for a stop: "2.5%", "10%".
+    static func label(_ value: Double) -> String {
+        value == value.rounded() ? "\(Int(value))%" : "\(value)%"
+    }
+}
+
+// MARK: - ChannelBadge
+//
+// ONE shared leading column for every surface that draws a channel's
+// identity: the Live TV list rows (iPhone, iPad, tvOS) and the guide's
+// channel column on both platforms (Logan 2026-09-16). Before this there
+// were four hand-rolled stacks and they disagreed about order, width and
+// rounding; there is now a single component, and Android is getting the
+// identical one.
+//
+// Fixed vertical order with DEDICATED positions (Logan 2026-09-16, rev 2:
+// the name moved above the number so the two text lines read title-first):
+//
+//     logo      (top, all remaining height)
+//     name      (under the logo; GUIDE only)
+//     number    (last line)
+//
+// tvOS is the exception: there the number sits in its own column at the
+// cell's LEFT edge and the logo/name column follows it, so the name gets
+// every point the number does not need.
+//
+// A hidden line contributes ZERO height and the logo takes what it frees.
+// The list row keeps the channel name in its own text column, so it passes
+// `showName: false`.
+//
+// The surface supplies the slot (width and max height), its container
+// radius and its point sizes; the badge owns everything inside. The logo is
+// always FITTED (never cropped), centered, and clipped to its fitted bounds
+// through the one shared rounding rule in `LogoCorners`.
+struct ChannelBadge: View {
+    let logoURL: URL?
+    let number: String
+    let name: String
+
+    var showLogo: Bool = true
+    var showNumber: Bool = true
+    /// Guide column only. The Live TV list draws the name in its text column.
+    var showName: Bool = false
+
+    /// The slot this surface gives the badge. `width` is exact (the badge
+    /// only ever widens it to keep the number on one line); `maxHeight` is
+    /// the total the three lines share, the logo taking the remainder.
+    let width: CGFloat
+    let maxHeight: CGFloat
+
+    /// Rendered point sizes BEFORE Text Size (the badge applies it for
+    /// measurement; `scaledFont` applies it for drawing).
+    var numberFontSize: CGFloat
+    var nameFontSize: CGFloat = 0
+
+    /// Corner radius of the CELL OR CARD this badge sits in. 0 for a
+    /// container that is not rounded (the guide's channel column cell), and
+    /// the logo stays square whatever the toggle says.
+    var containerRadius: CGFloat = 0
+
+    /// Gap between the stacked lines.
+    var lineGap: CGFloat = 4
+
+    /// tvOS only: gap between the leading column and the logo column.
+    var columnGap: CGFloat = 14
+
+    /// Floor for the logo, so a short row never collapses the art.
+    var minimumLogoHeight: CGFloat = 0
+
+    /// LIST rows: size the logo from the column WIDTH, with the height left
+    /// over only as a cap (see `CachedLogoImage.sizedByWidth`). The guide
+    /// column leaves this off: its rows are a uniform height, so sizing from
+    /// the height there is already consistent row to row.
+    var logoSizedByWidth: Bool = false
+
+    /// GUIDE column: clip on the "Rounded corners in Guide view" toggle
+    /// rather than the List one. See `CachedLogoImage.usesGuideCorners`.
+    var usesGuideCorners: Bool = false
+
+    /// Settings > Live TV > Logo Size multiplier (see `LiveTVLogoSize`).
+    /// The logo box is scaled around its center; the slot is unchanged.
+    var logoScale: CGFloat = 1
+    /// The most room a GROWN logo may take: the full width and the full
+    /// height the lines share (the badge subtracts its own text lines).
+    /// Nil caps growth at the stock slot, so only shrinking shows.
+    var logoRoom: CGSize? = nil
+
+    /// Characters the number must fit, published by the list / guide from
+    /// the widest number on screen. See `ChannelNumberColumn`.
+    @Environment(\.astralChannelNumberChars) private var numberChars
+    @Environment(\.astralTextScale) private var textScale
+
+    /// Text Size multiplier used for MEASUREMENT only, never below 1 so a
+    /// container designed at 100% does not shrink at 85%.
+    private var measureScale: CGFloat { max(1, textScale) }
+
+    /// Width the widest expected number ("1500.5" and friends) needs on one
+    /// line at the current Text Size. The column can never be narrower, so
+    /// the number never truncates.
+    private var numberWidth: CGFloat {
+        guard showNumber else { return 0 }
+        return ChannelNumberColumn.width(characters: numberChars,
+                                         fontSize: numberFontSize * measureScale)
+    }
+
+    /// Height the number line costs, including its gap. Zero when hidden.
+    private var numberBlock: CGFloat {
+        guard showNumber else { return 0 }
+        return ChannelNumberColumn.lineHeight(fontSize: numberFontSize * measureScale) + lineGap
+    }
+
+    /// Height the name line costs, including its gap. Zero when hidden.
+    ///
+    /// Through the memoized `ChannelRowTextColumn.lineHeight`, not a fresh
+    /// `UIFont`: this runs on every badge body evaluation, so building a font
+    /// here cost a measurable slice of each guide remote press (1.8.40).
+    private var nameBlock: CGFloat {
+        guard showName, nameFontSize > 0 else { return 0 }
+        let line = ChannelRowTextColumn.lineHeight(nameFontSize * measureScale, weight: .medium)
+        return line + lineGap
+    }
+
+    /// The badge's actual width: never narrower than the number needs.
+    private var slotWidth: CGFloat { max(width, numberWidth) }
+
+    /// The logo box after Logo Size: scaled, and when grown, capped at
+    /// `logoRoom` less the text lines (`textCost`).
+    private func scaledLogo(width w: CGFloat, height h: CGFloat, textCost: CGFloat) -> CGSize {
+        guard logoScale != 1 else { return CGSize(width: w, height: h) }
+        var out = CGSize(width: w * logoScale, height: h * logoScale)
+        if logoScale > 1 {
+            let capW = max(w, logoRoom?.width ?? w)
+            let capH = max(h, (logoRoom?.height ?? 0) - textCost)
+            out = CGSize(width: min(out.width, capW), height: min(out.height, capH))
+        } else {
+            // Below 10% (down to 2.5%): never smaller than a legible floor,
+            // and never larger than the stock box.
+            let floor: CGFloat = 8
+            out = CGSize(width: min(w, max(out.width, floor)), height: min(h, max(out.height, floor)))
+        }
+        return out
+    }
+
+    /// The logo's slot: the badge's width by whatever height the number and
+    /// name lines leave.
+    private var logoHeight: CGFloat {
+        max(minimumLogoHeight, maxHeight - numberBlock - nameBlock)
+    }
+
+    /// tvOS: width of the leading column. The number owns it; with numbers
+    /// hidden there is no leading column at all and the logo column IS the
+    /// badge. Status glyphs live in the surface's own top band now (Logan
+    /// 2026-09-16), so they never take width here.
+    private var leadingColumnWidth: CGFloat {
+        showNumber ? numberWidth : 0
+    }
+
+    /// tvOS: width left for the logo column once the leading column has its
+    /// share. No leading column, the logo column IS the badge.
+    private var logoColumnWidth: CGFloat {
+        guard leadingColumnWidth > 0 else { return slotWidth }
+        return max(0, slotWidth - leadingColumnWidth - columnGap)
+    }
+
+    /// tvOS: the logo's height. Only the name costs height here, since the
+    /// number sits beside the logo rather than under it.
+    private var tvLogoHeight: CGFloat {
+        max(minimumLogoHeight, maxHeight - nameBlock)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if showLogo {
+                let box = scaledLogo(width: slotWidth, height: logoHeight,
+                                     textCost: numberBlock + nameBlock)
+                CachedLogoImage(url: logoURL,
+                                width: box.width,
+                                height: box.height,
+                                containerRadius: containerRadius,
+                                sizedByWidth: logoSizedByWidth,
+                                usesGuideCorners: usesGuideCorners)
+            }
+            // Name BEFORE number (Logan 2026-09-16): logo, name, number.
+            // The two blocks cost the same height either way, so only the
+            // order and the gap conditions change.
+            if showName, nameFontSize > 0 {
+                Text(name)
+                    .scaledFont(.system(size: nameFontSize, weight: .medium))
+                    .lineLimit(1)
+                    .foregroundColor(.textPrimary)
+                    .padding(.top, showLogo ? lineGap : 0)
+            }
+            if showNumber {
+                Text(number)
+                    .scaledFont(.system(size: numberFontSize, weight: .bold, design: .monospaced))
+                    .lineLimit(1)
+                    // The column is sized from the widest expected number, so
+                    // this can never shrink the badge or clip a digit.
+                    .fixedSize(horizontal: true, vertical: false)
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                    .padding(.top, (showLogo || (showName && nameFontSize > 0)) ? lineGap : 0)
+            }
+        }
+        .frame(width: slotWidth)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// v1.6.13.x: Captures the absolute Y of a view's frame top
+/// (`proxy.frame(in: .global).minY`) from a `GeometryReader`
+/// placed in a `.background` so the chip-row's mini-player
+/// push-down inset can be computed dynamically (no per-device
+/// hard-coded padding). The reduce keeps the latest value rather
+/// than summing siblings, only one reader is in play at a time
+/// within any given branch of the body.
+///
+/// We capture the absolute frame Y rather than `safeAreaInsets.top`
+/// because the chip-row VStack lives inside a NavigationStack
+/// content area, `safeAreaInsets.top` returns 0 in that context
+/// (the chrome is consumed by the NavigationStack itself), but
+/// the absolute frame Y correctly reports the screen-space
+/// position to compare against the mini's `.ignoresSafeArea()`-
+/// rooted bottom edge.
+private struct NaturalTopPreference: PreferenceKey {
+    // `static let` (not `var`) so Swift 6 strict-concurrency
+    // doesn't flag the protocol-required `defaultValue` requirement
+    // as nonisolated mutable shared state. The protocol asks for a
+    // gettable property; an immutable `let` satisfies it.
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// v1.6.13.x: Per-idiom `.searchable` modifier so iPad gets the
+/// new button-revealed drawer (`isPresented:` binding) while iPhone
+/// keeps the classic always-visible drawer (no binding), the
+/// system needs the binding form to programmatically hide the
+/// drawer, but iPhone's pull-down-to-reveal idiom doesn't apply
+/// when a binding is present, so the two surfaces use distinct
+/// modifier overloads.
+private struct PerIdiomSearchableModifier: ViewModifier {
+    @Binding var text: String
+    /// Phone: the header row's search icon presents the field.
+    var presented: Binding<Bool> = .constant(false)
+    let iPhoneDisplayMode: SearchFieldPlacement.NavigationBarDrawerDisplayMode
+
+    func body(content: Content) -> some View {
+        if !usesPhoneLiveTVLayout {
+            // No-op off the phone layout. iPhone and iPad (since
+            // 2026-10-04) present the system field from the header's
+            // search circle through `presented`.
+            content
+        } else {
+            content.searchable(
+                text: $text,
+                isPresented: presented,
+                placement: .navigationBarDrawer(displayMode: iPhoneDisplayMode),
+                prompt: "Search channels"
+            )
+        }
+    }
+}
+
+/// Background-sync indicator for the iPhone / iPad Live TV header: a
+/// slowly spinning refresh glyph, NOT a button (pull-to-refresh stays the
+/// manual trigger). Replaces the old "Syncing | Tap for Info" pill.
+struct PhoneHeaderSyncSpinner: View {
+    var size: CGFloat = 15
+    @State private var spin = false
+
+    var body: some View {
+        Image(systemName: "arrow.clockwise")
+            .scaledFont(.system(size: size, weight: .semibold))
+            .foregroundColor(Color.contrastText(.textTertiary))
+            .rotationEffect(.degrees(spin ? 360 : 0))
+            .animation(.linear(duration: 1.1).repeatForever(autoreverses: false),
+                       value: spin)
+            .onAppear { spin = true }
+            .allowsHitTesting(false)
+            .accessibilityLabel("Syncing")
+    }
+}
+
+// MARK: - Phone group drawer width (fit to content, no layout feedback loop)
+//
+// The drawer used to be a fixed 272pt, so long provider group names always
+// truncated and short lists wasted space (Logan 2026-09-18: it should grow
+// AND shrink to fit). The width is measured straight from the group titles
+// with UIFont metrics at the row's own point size times the app Text Size
+// (the same multiplier `.scaledFont` applies), NEVER through a
+// GeometryReader / PreferenceKey feeding @State that drives sibling layout:
+// that shape has caused an infinite layout loop in this app before
+// (`feedback_swiftui_preference_layout_loop`). It is recomputed only when
+// the token list or the text scale changes, so nothing is written during
+// scroll.
+
+/// Every horizontal metric the drawer layout uses, in ONE place, so the
+/// fitted-width math and the views that draw the row can never drift apart
+/// (they did: the measurement reserved a lumped "56pt pin column" and no
+/// safety margin, so the widest title fitted its available width to within
+/// a fraction of a point and SwiftUI truncated it anyway).
+private enum PhoneDrawerMetrics {
+    /// Row label point size (`PhoneGroupDrawerRow`), at text scale 1.
+    static let rowFontSize: CGFloat = 15
+    /// Leading status glyph point size (Favorites / Recently Watched).
+    static let rowIconSize: CGFloat = 13
+    /// Spacing of both HStacks in the row (outer row, and label + glyph).
+    static let rowSpacing: CGFloat = 8
+    /// `Spacer(minLength:)` after the label, inside the select button.
+    static let labelSpacerMin: CGFloat = 4
+    /// Trailing pin button frame (square, also its hit target).
+    static let pinButtonSide: CGFloat = 44
+    /// `listRowInsets` on every drawer row.
+    static let rowInsetLeading: CGFloat = 18
+    static let rowInsetTrailing: CGFloat = 4
+    /// Header row: horizontal padding, gap before the circle, circle side.
+    static let headerHPadding: CGFloat = 18
+    static let headerGap: CGFloat = 12
+    static let headerCircleSide: CGFloat = 34
+    static let headerFontSize: CGFloat = 12
+    static let headerTracking: CGFloat = 1.2
+    /// Row minimum height / `defaultMinListRowHeight`.
+    static let rowMinHeight: CGFloat = 34
+    /// Slack added to the fitted width so sub-point differences between
+    /// UIKit measurement and SwiftUI's own line breaking never truncate.
+    static let safety: CGFloat = 4
+    /// Never narrower than this, however short the group names are.
+    static let minWidth: CGFloat = 200
+    /// Room always left between the drawer and the far screen edge. The
+    /// drawer otherwise fits the longest group name, like the tvOS
+    /// GuideGroupSidebarPane (fitted content plus padding, no fixed cap).
+    static let screenGutter: CGFloat = 16
+
+    /// Everything a row reserves horizontally OUTSIDE the label text:
+    /// list row insets, the gap before the pin, the pin square and the
+    /// label's trailing `Spacer` minimum.
+    static var rowChrome: CGFloat {
+        rowInsetLeading + rowInsetTrailing
+            + labelSpacerMin + rowSpacing + pinButtonSide
+    }
+
+    /// Actual rendered width of a leading status glyph plus its gap.
+    @MainActor
+    static func leadingIconWidth(scale: CGFloat) -> CGFloat {
+        let cfg = UIImage.SymbolConfiguration(pointSize: rowIconSize * scale,
+                                              weight: .regular)
+        let widest = ["star.fill", "clock.arrow.circlepath"].reduce(CGFloat(0)) {
+            max($0, UIImage(systemName: $1, withConfiguration: cfg)?.size.width ?? 0)
+        }
+        // Fall back to a generous square if the symbol is unavailable.
+        return (widest > 0 ? widest : rowIconSize * scale * 1.4) + rowSpacing
+    }
+}
+
+/// Width the "CHANNEL GROUPS" header row needs with its Manage Groups
+/// circle, so the drawer can never squeeze that button.
+private func phoneDrawerHeaderWidth(scale: CGFloat) -> CGFloat {
+    let M = PhoneDrawerMetrics.self
+    let title = "CHANNEL GROUPS"
+    let font = UIFont.systemFont(ofSize: M.headerFontSize * scale, weight: .bold)
+    let width = (title as NSString).size(withAttributes: [.font: font]).width
+    // `.tracking` adds its value after every character, the last included.
+    let tracking = M.headerTracking * CGFloat(title.count)
+    return (M.headerHPadding * 2) + width.rounded(.up) + tracking
+        + M.headerGap + M.headerCircleSide + M.safety
+}
+
+/// Fitted drawer width: the wider of the longest group row and the header
+/// row, clamped between `PhoneDrawerMetrics.minWidth` (or the header row, if that is
+/// larger) and ~85 percent of the screen. Longer names truncate with a tail
+/// ellipsis (rows are `lineLimit(1)`).
+@MainActor
+func phoneGroupDrawerFittedWidth(tokens: [String],
+                                 favoritesToken: String,
+                                 scale: CGFloat) -> CGFloat {
+    let M = PhoneDrawerMetrics.self
+    // Rows go bold when selected, which is the widest they ever draw.
+    let font = UIFont.systemFont(ofSize: M.rowFontSize * scale, weight: .bold)
+    let iconWidth = M.leadingIconWidth(scale: scale)
+    var widestRow: CGFloat = 0
+    var widestTitle = ""
+    var widestText: CGFloat = 0
+    for token in tokens {
+        let title = ChannelListView.groupTitle(token)
+        // `.size(withAttributes:)` can land a fraction under what SwiftUI
+        // lays out, and a fractional shortfall truncates the whole word.
+        var w = (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        let text = w
+        if token == favoritesToken || token == ChannelListView.recentlyWatchedToken {
+            w += iconWidth
+        }
+        let rowWidth = w + M.rowChrome + M.safety
+        if rowWidth > widestRow {
+            widestRow = rowWidth
+            widestTitle = title
+            widestText = text
+        }
+    }
+    let header = phoneDrawerHeaderWidth(scale: scale)
+    let screenW = UIScreen.main.bounds.width
+    // Logan 2026-10-04: the drawer always fits the longest group name on
+    // iPhone and iPad (tvOS parity), capped only by the screen less a gutter.
+    let ceiling = (screenW > 0 ? screenW : 390) - M.screenGutter
+    let floor = max(M.minWidth, header)
+    let final = min(max(widestRow, floor), max(floor, ceiling))
+    let clamped = widestRow > ceiling ? "ceiling" : (widestRow < floor ? "floor" : "none")
+    debugLog("[DRAWER] longest=\"\(widestTitle)\" text=\(Int(widestText)) chrome=\(Int(M.rowChrome + M.safety)) row=\(Int(widestRow)) header=\(Int(header)) final=\(Int(final)) clamp=\(clamped)")
+    return final
+}
+
+/// Phone group drawer (sidebar mode). A long press lifts a row to reorder.
+struct PhoneGroupDrawer: View {
+    let tokens: [String]
+    let selected: String
+    let favoritesToken: String
+    let defaultToken: String
+    let onSelect: (String) -> Void
+    /// New order of the REAL groups (favorites / All excluded).
+    let onReorder: ([String]) -> Void
+    let onManage: () -> Void
+    /// Thumbtack tapped on a row: toggle this group as the default Live TV
+    /// group, the same toggle a long press on a pill performs.
+    let onSetDefault: (String) -> Void
+    @State private var order: [String] = []
+    @Environment(\.astralTextScale) private var textScale
+    /// Fitted drawer width. Recomputed only when the token list or the text
+    /// scale changes; never from a measured-layout feedback loop.
+    @State private var fittedWidth: CGFloat = PhoneDrawerMetrics.minWidth
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("CHANNEL GROUPS")
+                    .scaledFont(.system(size: PhoneDrawerMetrics.headerFontSize, weight: .bold))
+                    .tracking(PhoneDrawerMetrics.headerTracking)
+                    .foregroundColor(Color.contrastText(.textTertiary))
+                Spacer()
+                Button(action: onManage) {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.system(size: 16, weight: .semibold))  // glyph in a fixed box: not text, stays fixed
+                        .foregroundColor(.textPrimary)
+                        .frame(width: PhoneDrawerMetrics.headerCircleSide,
+                               height: PhoneDrawerMetrics.headerCircleSide)
+                        .background(Circle().fill(Color.textPrimary.opacity(0.08)))
+                }
+                .accessibilityLabel("Manage Groups")
+            }
+            .padding(.horizontal, PhoneDrawerMetrics.headerHPadding)
+            .padding(.top, 12)
+            .padding(.bottom, 4)
+
+            // No gesture hint here (Logan 2026-09-18): the tappable pin is
+            // self-explanatory. The tvOS sidebar keeps its own hint.
+
+            List {
+                ForEach(order, id: \.self) { token in
+                    PhoneGroupDrawerRow(
+                        token: token,
+                        isSelected: token == selected,
+                        isDefault: token == defaultToken
+                            || (token == "All" && defaultToken.isEmpty),
+                        favoritesToken: favoritesToken,
+                        onSelect: { onSelect(token) },
+                        onSetDefault: { onSetDefault(token) }
+                    )
+                    // Tight rows (Logan 2026-09-05): provider playlists carry
+                    // hundreds of groups, the default List spacing was a
+                    // lot of scrolling.
+                    .listRowInsets(EdgeInsets(top: 0,
+                                              leading: PhoneDrawerMetrics.rowInsetLeading,
+                                              bottom: 0,
+                                              trailing: PhoneDrawerMetrics.rowInsetTrailing))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .moveDisabled(token.hasPrefix("collection:"))
+                }
+                .onMove { from, to in
+                    order.move(fromOffsets: from, toOffset: to)
+                    onReorder(order.filter { !$0.hasPrefix("collection:") })
+                }
+                Color.clear.frame(height: 90).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .environment(\.defaultMinListRowHeight, PhoneDrawerMetrics.rowMinHeight)
+        }
+        .padding(.top, 2)
+        .frame(width: fittedWidth)
+        .onAppear {
+            order = tokens
+            recomputeWidth()
+        }
+        .onChange(of: tokens) { _, t in
+            if t != order { order = t }
+            recomputeWidth()
+        }
+        .onChange(of: textScale) { _, _ in recomputeWidth() }
+    }
+
+    /// Measured from the titles, not from the rendered layout. Applied with
+    /// animations disabled so an open drawer never animates its width.
+    private func recomputeWidth() {
+        let w = phoneGroupDrawerFittedWidth(tokens: order.isEmpty ? tokens : order,
+                                            favoritesToken: favoritesToken,
+                                            scale: textScale)
+        guard abs(w - fittedWidth) > 0.5 else { return }
+        var t = Transaction()
+        t.disablesAnimations = true
+        withTransaction(t) { fittedWidth = w }
+    }
+}
+
+/// One drawer row: the row itself selects the group, and a borderless
+/// thumbtack button at the trailing edge sets or clears the default Live TV
+/// group without selecting the row or closing the drawer.
+///
+/// No long press here (Logan 2026-09-18): it collided with the List's own
+/// hold-and-drag reorder, so a reorder also pinned the moved group. The row
+/// is back to the plain Button it shipped as, and `.onMove` is untouched.
+private struct PhoneGroupDrawerRow: View {
+    let token: String
+    let isSelected: Bool
+    let isDefault: Bool
+    let favoritesToken: String
+    let onSelect: () -> Void
+    let onSetDefault: () -> Void
+
+    var body: some View {
+        HStack(spacing: PhoneDrawerMetrics.rowSpacing) {
+            Button(action: onSelect) {
+                HStack(spacing: PhoneDrawerMetrics.rowSpacing) {
+                    if token == favoritesToken {
+                        Image(systemName: "star.fill")
+                            .scaledFont(.system(size: PhoneDrawerMetrics.rowIconSize))
+                    } else if token == ChannelListView.recentlyWatchedToken {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .scaledFont(.system(size: PhoneDrawerMetrics.rowIconSize))
+                    }
+                    Text(ChannelListView.groupTitle(token))
+                        .scaledFont(.system(size: PhoneDrawerMetrics.rowFontSize,
+                                            weight: isSelected ? .bold : .medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: PhoneDrawerMetrics.labelSpacerMin)
+                }
+                .foregroundColor(isSelected ? .accentPrimary : .textPrimary)
+                .frame(minHeight: PhoneDrawerMetrics.rowMinHeight)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            // Borderless so the List does not treat a tap here as a row tap:
+            // the drawer stays open and the selection does not change.
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                onSetDefault()
+            } label: {
+                Image(systemName: isDefault ? "pin.fill" : "pin")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(isDefault
+                                     ? Color.accentPrimary
+                                     : Color.contrastText(.textTertiary).opacity(0.45))
+                    .frame(width: PhoneDrawerMetrics.pinButtonSide,
+                           height: PhoneDrawerMetrics.pinButtonSide)
+                    .contentShape(Rectangle())
+                    .animation(.easeOut(duration: 0.18), value: isDefault)
+                    // 44x44 touch target on a 34pt row: the negative padding
+                    // keeps the tight row height (Logan 2026-09-05) while the
+                    // button still hit-tests its full square.
+                    .padding(.vertical, -5)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(isDefault ? "Clear default group" : "Set as default group")
+        }
+        .frame(minHeight: PhoneDrawerMetrics.rowMinHeight)
+    }
+}
+
+/// Phone Group Selection: "sidebar" (default) or "pills". Separate from the
+/// Apple TV's `useGroupSidebar` so each device keeps its own choice.
+let phoneGroupSelectorKey = "phoneGroupSelector"
+
+/// iPhone and iPad share the bottom-bar Live TV layout (Logan 2026-10-04):
+/// header row, group drawer, Group Selection setting, collapse on scroll.
+/// The iPad app on a Mac reports .pad and follows the iPad.
+var usesPhoneLiveTVLayout: Bool {
+    let idiom = UIDevice.current.userInterfaceIdiom
+    return idiom == .phone || idiom == .pad
+}
+
+/// KEPT badge (Logan 2026-10-04): the channel is held open by "Keep Recent
+/// Channels Live". Same pill as the program badges (LIVE, NEW), in the app
+/// accent. Observes only the kept set, so it comes and goes with it.
+struct KeptChannelBadge: View {
+    let channelID: String
+    var compact: Bool = true
+    @ObservedObject private var kept = KeptLiveChannels.shared
+    @ObservedObject private var theme: ThemeManager = .shared
+
+    var body: some View {
+        if kept.ids.contains(channelID) {
+            EPGFlagBadge(flag: EPGFlag(label: "KEPT", color: theme.accent), compact: compact)
+                .accessibilityLabel("Kept live")
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+/// [LIST] expand cost: main-thread time from the expand/collapse tap to the
+/// end of the run loop turn that rendered it (after the Core Animation
+/// commit), so it covers the schedule panel build, not just the handler.
+@MainActor
+enum ListExpandCost {
+    static func measure(start: CFAbsoluteTime, channel: String, expanded: Bool) {
+        let observer = CFRunLoopObserverCreateWithHandler(
+            nil, CFRunLoopActivity.beforeWaiting.rawValue, false, CFIndex.max
+        ) { _, _ in
+            let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            debugLog(String(format: "[LIST] %@ cost %.1fms (%@)",
+                            expanded ? "expand" : "collapse", ms, channel))
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+    }
+}
+
+
+// MARK: - List expanded schedule (prebuilt rows)
+
+/// One expanded-schedule row with everything the row view used to compute
+/// in `body` (time strings, day prefix, badges, replay gate) done up front.
+struct ListScheduleRow: Identifiable {
+    let entry: EPGEntry
+    let id: String
+    /// "Tomorrow", "Sep 5", ... ; nil when the program starts today.
+    let dayText: String?
+    let startText: String
+    let endText: String?
+    let seLabel: String?
+    let flags: [EPGFlag]
+    /// Aired rows: inside the channel's catch-up window.
+    let replayable: Bool
+}
+
+struct ListSchedule {
+    let aired: [ListScheduleRow]
+    let future: [ListScheduleRow]
+    let futureLastID: String?
+    /// First instant the row split, replay gate or day labels can change
+    /// (a program ends, an aired row leaves the archive, midnight).
+    let validUntil: Date
+}
+
+/// Per-channel memo of the List view's expanded schedule. Thread-safe so
+/// the expand tap can build off the main thread; `body` then reads a hit.
+/// The slice is compared with `==`, which is O(1) when the array buffer is
+/// unchanged (Swift arrays short-circuit on buffer identity).
+final class ListScheduleCache: @unchecked Sendable {
+    static let shared = ListScheduleCache()
+
+    private struct Slot {
+        let source: [GuideProgram]
+        let fallback: [EPGEntry]
+        let catchupDays: Int
+        let schedule: ListSchedule
+    }
+    private let lock = NSLock()
+    private var slots: [String: Slot] = [:]
+
+    func lookup(channelID: String, source: [GuideProgram], fallback: [EPGEntry],
+                catchupDays: Int, now: Date) -> ListSchedule? {
+        lock.lock(); defer { lock.unlock() }
+        guard let slot = slots[channelID],
+              now < slot.schedule.validUntil,
+              slot.catchupDays == catchupDays,
+              slot.source == source,
+              slot.fallback == fallback else { return nil }
+        return slot.schedule
+    }
+
+    func schedule(channelID: String, source: [GuideProgram], fallback: [EPGEntry],
+                  catchupDays: Int, now: Date) -> ListSchedule {
+        if let hit = lookup(channelID: channelID, source: source, fallback: fallback,
+                            catchupDays: catchupDays, now: now) {
+            return hit
+        }
+        let built = Self.build(source: source, fallback: fallback,
+                               catchupDays: catchupDays, now: now)
+        lock.lock()
+        if slots.count > 64 { slots.removeAll(keepingCapacity: true) }
+        slots[channelID] = Slot(source: source, fallback: fallback,
+                                catchupDays: catchupDays, schedule: built)
+        lock.unlock()
+        return built
+    }
+
+    /// Same selection as the former `ChannelRow.airedPrograms` /
+    /// `futurePrograms`, plus the formatting the rows did in `body`.
+    static func build(source: [GuideProgram], fallback: [EPGEntry],
+                      catchupDays: Int, now: Date) -> ListSchedule {
+        let cal = Calendar.current
+        // `Text(date, style: .time)` renders the short time style.
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateStyle = .none
+        timeFormatter.timeStyle = .short
+        // `DVRFormat.day` built a DateFormatter per call; same output with
+        // one formatter per template.
+        let monthDay = DateFormatter()
+        monthDay.setLocalizedDateFormatFromTemplate("MMM d")
+        let monthDayYear = DateFormatter()
+        monthDayYear.setLocalizedDateFormatFromTemplate("MMM d yyyy")
+        func dayText(_ date: Date) -> String? {
+            if cal.isDateInToday(date) { return nil }
+            if cal.isDateInTomorrow(date) { return "Tomorrow" }
+            if cal.isDateInYesterday(date) { return "Yesterday" }
+            return cal.isDate(date, equalTo: now, toGranularity: .year)
+                ? monthDay.string(from: date) : monthDayYear.string(from: date)
+        }
+        func entry(_ p: GuideProgram) -> EPGEntry {
+            EPGEntry(title: p.title, description: p.description,
+                     startTime: p.start, endTime: p.end,
+                     category: p.category, programID: p.programID,
+                     subTitle: p.subTitle, season: p.season,
+                     episode: p.episode, isNew: p.isNew,
+                     isLiveBroadcast: p.isLiveBroadcast,
+                     isPremiere: p.isPremiere, isFinale: p.isFinale,
+                     isRepeat: p.isRepeat)
+        }
+        var validUntil = cal.startOfDay(for: cal.date(byAdding: .day, value: 1, to: now) ?? now.addingTimeInterval(86_400))
+        let windowSeconds = Double(min(catchupDays, 30)) * 86_400
+        func row(_ e: EPGEntry) -> ListScheduleRow {
+            var replayable = false
+            if let start = e.startTime, let end = e.endTime {
+                replayable = ChannelDisplayItem.canReplay(catchupDays: catchupDays,
+                                                          start: start, end: end, now: now)
+                if end > now {
+                    validUntil = min(validUntil, end)
+                    // An upcoming row leaves the list (moves to the header)
+                    // the moment it starts.
+                    if start > now { validUntil = min(validUntil, start) }
+                } else if catchupDays > 0 {
+                    let expiry = end.addingTimeInterval(windowSeconds)
+                    if expiry > now { validUntil = min(validUntil, expiry) }
+                }
+            }
+            return ListScheduleRow(
+                entry: e,
+                id: e.id,
+                dayText: e.startTime.flatMap(dayText),
+                startText: e.startTime.map { timeFormatter.string(from: $0) } ?? "",
+                endText: e.endTime.map { timeFormatter.string(from: $0) },
+                seLabel: seasonEpisodeLabel(season: e.season, episode: e.episode),
+                flags: epgFlagBadges(isLiveBroadcast: e.isLiveBroadcast,
+                                     isNew: e.isNew, isPremiere: e.isPremiere,
+                                     isFinale: e.isFinale, isRepeat: e.isRepeat),
+                replayable: replayable
+            )
+        }
+
+        let aired: [ListScheduleRow] = source
+            .filter { $0.end <= now }
+            // Catch-up channels list only what the archive can still play
+            // (Logan 2026-09-05); channels without an archive keep their
+            // reference rows.
+            .filter { catchupDays <= 0 || ChannelDisplayItem.canReplay(catchupDays: catchupDays, start: $0.start, end: $0.end, now: now) }
+            .sorted { $0.start < $1.start }
+            .map { row(entry($0)) }
+
+        let future: [ListScheduleRow]
+        if !source.isEmpty {
+            // Upcoming only (2026-10-13, Android parity): the program
+            // airing now lives in the row header, never repeated here.
+            // The airing program is not a row, but its end still moves it
+            // into the aired list.
+            for p in source where p.start <= now && p.end > now {
+                validUntil = min(validUntil, p.end)
+            }
+            future = source
+                .filter { $0.end > now && $0.start > now }
+                .sorted { $0.start < $1.start }
+                .map { row(entry($0)) }
+        } else {
+            future = fallback
+                .filter { e in
+                    if let start = e.startTime, start <= now { return false }
+                    guard let end = e.endTime else { return true }
+                    return end > now
+                }
+                .map(row)
+        }
+        return ListSchedule(aired: aired, future: future,
+                            futureLastID: future.last?.id, validUntil: validUntil)
+    }
+}

@@ -1,0 +1,139 @@
+name: Build unsigned Astral IPA
+
+# Builds the Astral_iOS scheme completely unsigned and packages the .app
+# into a Payload IPA designed to be signed later on-device with Feather
+# (or esign / AltStore). No Apple developer account is needed to build.
+#
+# Trigger manually from the Actions tab (upload_method picks where the IPA
+# lands), or automatically on version tags (artifacts always).
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_method:
+        description: Where to put the result
+        default: artifacts
+        type: choice
+        options: [artifacts, filebin, both]
+      xcode_version:
+        description: Xcode to build with (latest-stable picks the newest non-beta on the runner)
+        default: latest-stable
+        type: string
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Archive + package unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ inputs.xcode_version || 'latest-stable' }}
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          pod --version
+
+      - name: Install CocoaPods
+        run: |
+          pod --version || sudo gem install cocoapods --no-document
+          pod install --repo-update || pod install
+          test -d Pods/Pods.xcodeproj || {
+            echo "::error::pod install did not produce Pods/Pods.xcodeproj - workspace build would fail"
+            exit 1
+          }
+
+      - name: Archive (unsigned)
+        run: |
+          set -euo pipefail
+          # Fail fast with a readable error if the workspace or scheme drifts.
+          xcodebuild -list -workspace Astral.xcworkspace
+          xcodebuild -list -workspace Astral.xcworkspace | grep -q "Astral_iOS" \
+            || { echo "::error::Scheme 'Astral_iOS' not found in Astral.xcworkspace"; exit 1; }
+          mkdir -p build
+          xcodebuild \
+            -workspace Astral.xcworkspace \
+            -scheme Astral_iOS \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/Astral.xcarchive \
+            -derivedDataPath build/DerivedData \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build/xcodebuild.log
+
+      - name: Upload xcodebuild log on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
+          if-no-files-found: warn
+
+      - name: Package unsigned IPA
+        run: |
+          APP="build/Astral.xcarchive/Products/Applications/Astral.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find build/Astral.xcarchive/Products -maxdepth 2 -name "Astral.app" -type d -print -quit 2>/dev/null)
+          fi
+          test -n "$APP" || { echo "::error::Astral.app missing from archive"; exit 1; }
+          test -f "$APP/Info.plist" || { echo "::error::Info.plist missing"; exit 1; }
+          test -x "$APP/Astral" || { echo "::error::Main executable missing"; exit 1; }
+
+          VERSION=$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Info.plist")
+
+          rm -rf Payload *.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/Astral.app
+          IPA="Astral-${VERSION}-unsigned.ipa"
+          ditto -c -k --keepParent Payload "$IPA"
+          rm -rf Payload
+          ls -lh "$IPA"
+          echo "IPA_NAME=$IPA" >> "$GITHUB_ENV"
+
+          {
+            echo "### Astral unsigned IPA ready to sign"
+            echo "- **File:** \`$IPA\` (\`app.crzx.astral\`)"
+            echo "- **Size:** $(du -h "$IPA" | cut -f1)"
+            echo "- Import into Feather/esign and sign with your identity/profile."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        if: ${{ inputs.upload_method != 'filebin' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Astral-unsigned
+          path: ${{ env.IPA_NAME }}
+          if-no-files-found: error
+
+      - name: Upload to filebin.net
+        if: ${{ inputs.upload_method == 'filebin' || inputs.upload_method == 'both' }}
+        run: |
+          BIN="astral-${{ github.run_id }}"
+          echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
+          curl -fsS -X POST -H "Content-Type: application/octet-stream" \
+            --data-binary "@${IPA_NAME}" \
+            "https://filebin.net/$BIN/${IPA_NAME}" >/dev/null
+          echo "- https://filebin.net/$BIN/$IPA_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"

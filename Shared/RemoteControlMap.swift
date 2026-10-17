@@ -1,0 +1,343 @@
+import Foundation
+
+/// TV remote button mapping. One map per CONTEXT (player vs guide),
+/// sharing the exact JSON wire schema with the Android build so the two
+/// stay in lockstep:
+///
+/// ```json
+/// { "version": 1, "preset": "default",
+///   "player": { "okShort": "toggleControls", ... },
+///   "guide":  { "ffwd": "pageDown", ... } }
+/// ```
+///
+/// Design invariants (do not relax without a plan change):
+/// - Back/Menu is NEVER a slot: the Back / mini-player / guide-ladder model
+///   is device-verified canon and stays hardcoded.
+/// - Guide SHORT arrows are focus navigation, never mappable.
+/// - Unknown slots/actions in a stored blob are IGNORED on read (forward
+///   compat); missing slots fall back to `RemoteControlMap.default`'s
+///   assignment at RESOLVE time, so a partial blob never strands a button.
+///
+/// This is a faithful Swift port of the Android `RemoteControlMap.kt`
+/// (core/remote). Keep the wire strings identical across platforms.
+
+// MARK: - Slots
+
+/// Stable wire ids. Which slots a platform/context actually offers is decided
+/// by the settings UI + resolver, not by this enum.
+enum RemoteSlot: String, CaseIterable {
+    case okShort, okLong
+    case upShort, upLong
+    case downShort, downLong
+    case leftShort, leftLong
+    case rightShort, rightLong
+    case playPause, ffwd, rewind
+    case channelUp, channelDown
+    /// Back / Menu, GUIDE map only (Discord request, Logan 2026-10-15). The
+    /// double-Back rules (top channel with a mini up, stop Radio Mode) and
+    /// the single-Back Radio Mode deferral stay fixed outside the map. There
+    /// is no held Back: tvOS owns Menu while held. A "backLong" key synced
+    /// from another device has no slot, so the loader ignores it.
+    case backShort
+
+    var wire: String { rawValue }
+    static func fromWire(_ s: String) -> RemoteSlot? { RemoteSlot(rawValue: s) }
+}
+
+// MARK: - Actions
+
+/// Actions available while the fullscreen live player is frontmost.
+enum PlayerRemoteAction: String, CaseIterable {
+    case channelUp, channelDown
+    case lastChannel
+    case recentChannels
+    case toggleControls
+    case showProgramInfo
+    case optionsMenu
+    case playPause
+    case seekForward, seekBackward
+    case restartProgram, jumpToLive
+    case minimizeToGuide
+    case channelList
+    case subtitles, audioTracks
+    case aspectRatio, record
+    case sleepTimer, openSearch
+    /// Fixed hold-Back behavior (stop with NO mini promotion); dispatched by
+    /// the app's long-Back path, deliberately NOT offered as a mappable choice
+    /// in settings (Back semantics stay hardcoded).
+    case stopPlayback
+    case none
+
+    var wire: String { rawValue }
+    static func fromWire(_ s: String) -> PlayerRemoteAction? { PlayerRemoteAction(rawValue: s) }
+}
+
+/// Actions available while the TV guide is frontmost.
+enum GuideRemoteAction: String, CaseIterable {
+    case pageUp, pageDown
+    case timelineBack, timelineForward
+    case jumpToNow, jumpToTop
+    case focusGroupPills
+    case resumePlayer, closeMiniPlayer
+    case programInfo, openSearch
+    /// Guide Select / Left / Right rows (Logan 2026-09-14, Android parity).
+    /// `navigate` = the key's built-in guide behavior (short arrows: the
+    /// LOCKED timeline rule; Select: tune; holds: plain engine repeat).
+    case navigate
+    /// Open the docked group sidebar (Sidebar Menu mode); in Top Group Pills
+    /// mode it lands on the group pills instead.
+    case openGroupSidebar
+    /// Focused-cell actions: tune the channel, open the Program Info sheet,
+    /// open the record sheet.
+    case play, programDetails, record
+    /// Back (short) built-in behavior: the guide's top-channel ladder
+    /// (top channel, then close). Only offered on the Back rows.
+    case backLadder
+    case none
+
+    var wire: String { rawValue }
+    static func fromWire(_ s: String) -> GuideRemoteAction? { GuideRemoteAction(rawValue: s) }
+}
+
+enum RemotePreset: String {
+    case `default`
+    case custom
+
+    var wire: String { rawValue }
+
+    /// Only wires this build has ever written are honored. Anything else
+    /// (notably any pre-release preset-picker blobs) is nil and the whole
+    /// stored map is DISCARDED at decode.
+    static func fromWire(_ s: String) -> RemotePreset? { RemotePreset(rawValue: s) }
+}
+
+// MARK: - Map
+
+struct RemoteControlMap: Equatable {
+    let preset: RemotePreset
+    let player: [RemoteSlot: PlayerRemoteAction]
+    let guide: [RemoteSlot: GuideRemoteAction]
+
+    init(preset: RemotePreset = .default,
+         player: [RemoteSlot: PlayerRemoteAction] = [:],
+         guide: [RemoteSlot: GuideRemoteAction] = [:]) {
+        self.preset = preset
+        self.player = player
+        self.guide = guide
+    }
+
+    // MARK: Resolve with fallback
+
+    /// Resolve with fallback to the default map so a partial/legacy blob never
+    /// leaves a button dead. Explicit `.none` is respected.
+    func playerAction(_ slot: RemoteSlot) -> PlayerRemoteAction {
+        player[slot] ?? RemoteControlMap.default.player[slot] ?? .none
+    }
+
+    func guideAction(_ slot: RemoteSlot) -> GuideRemoteAction {
+        guide[slot] ?? RemoteControlMap.default.guide[slot] ?? .none
+    }
+
+    /// First slot currently mapped to `action`, for dynamic hint copy.
+    func playerSlot(for action: PlayerRemoteAction) -> RemoteSlot? {
+        RemoteSlot.allCases.first { playerAction($0) == action }
+    }
+
+    func guideSlot(for action: GuideRemoteAction) -> RemoteSlot? {
+        RemoteSlot.allCases.first { guideAction($0) == action }
+    }
+
+    // MARK: Encode
+
+    func toJSON() -> String {
+        var playerObj: [String: String] = [:]
+        for (slot, action) in player { playerObj[slot.wire] = action.wire }
+        var guideObj: [String: String] = [:]
+        for (slot, action) in guide { guideObj[slot.wire] = action.wire }
+        let obj: [String: Any] = [
+            "version": RemoteControlMap.schemaVersion,
+            "preset": preset.wire,
+            "player": playerObj,
+            "guide": guideObj,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+              let str = String(data: data, encoding: .utf8) else { return "{}" }
+        return str
+    }
+
+    func toData() -> Data { Data(toJSON().utf8) }
+
+    // MARK: Constants
+
+    static let schemaVersion = 1
+
+    /// The PRE-initiative control scheme, kept verbatim so any regression can
+    /// be reverted by pointing `default` back at it. NOT user-selectable.
+    static let legacyScheme = RemoteControlMap(
+        preset: .default,
+        player: [
+            .upShort: .channelUp,
+            .downShort: .channelDown,
+            .leftShort: .seekBackward,
+            .rightShort: .seekForward,
+            .okShort: .toggleControls,
+            .okLong: .none,
+            .playPause: .playPause,
+            .ffwd: .seekForward,
+            .rewind: .seekBackward,
+            .channelUp: .channelUp,
+            .channelDown: .channelDown,
+        ],
+        guide: [
+            .leftLong: .timelineBack,
+            .rightLong: .closeMiniPlayer,
+            .okLong: .programInfo,
+            .playPause: .resumePlayer,
+        ]
+    )
+
+    /// The app's standard control scheme (matches Android DEFAULT exactly):
+    /// OK = show controls, Up/Down = channel surf, hold-Up = recently watched,
+    /// hold-Down = search, Right = previous-channel zap, hold-Right = program
+    /// info, hold-Left in the guide pages into already-aired programmes.
+    static let `default` = RemoteControlMap(
+        preset: .default,
+        player: [
+            .okShort: .toggleControls,
+            .okLong: .none,
+            .upShort: .channelUp,
+            .downShort: .channelDown,
+            .upLong: .recentChannels,
+            .downLong: .openSearch,
+            .leftShort: .channelList,
+            .leftLong: .minimizeToGuide,
+            .rightShort: .lastChannel,
+            .rightLong: .showProgramInfo,
+            .playPause: .playPause,
+            .ffwd: .seekForward,
+            .rewind: .seekBackward,
+            .channelUp: .channelUp,
+            .channelDown: .channelDown,
+        ],
+        guide: [
+            .ffwd: .pageDown,
+            .rewind: .pageUp,
+            .channelUp: .pageUp,
+            .channelDown: .pageDown,
+            .okShort: .play,
+            .okLong: .programInfo,
+            .leftShort: .navigate,
+            .leftLong: .timelineBack,
+            .rightShort: .navigate,
+            .rightLong: .closeMiniPlayer,
+            .playPause: .resumePlayer,
+            .backShort: .backLadder,
+        ]
+    )
+
+    /// The guide rows shown under Settings > Remote Control > In the TV
+    /// Guide, in display order.
+    static let guideKeySlots: [RemoteSlot] = [
+        .okShort, .okLong, .leftShort, .leftLong, .rightShort, .rightLong,
+        .backShort,
+    ]
+
+    /// What a guide slot ACTUALLY does, given the Group Selection mode.
+    ///
+    /// Sidebar Menu mode must always have a way into the sidebar (GH #72:
+    /// in an empty group it is the only way out). Before these rows existed
+    /// the mode hard-owned hold-Left, whatever the map said. That stays the
+    /// default: in sidebar mode, when NO guide key row is mapped to
+    /// `openGroupSidebar`, Left (hold) resolves to it. As soon as the user
+    /// puts Open sidebar on some row (for example Left), Left (hold) runs its
+    /// own mapped action.
+    func effectiveGuideAction(_ slot: RemoteSlot, useGroupSidebar: Bool) -> GuideRemoteAction {
+        let raw = guideAction(slot)
+        guard useGroupSidebar, slot == .leftLong, raw != .openGroupSidebar else { return raw }
+        if Self.guideKeySlots.contains(where: { guideAction($0) == .openGroupSidebar }) {
+            return raw
+        }
+        return .openGroupSidebar
+    }
+
+    // MARK: Decode
+
+    /// Tolerant decode: unknown slots/actions are skipped, malformed input
+    /// falls back to `default`. Never throws.
+    static func fromJSON(_ raw: String?) -> RemoteControlMap {
+        guard let raw = raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .default
+        }
+        guard let data = raw.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return .default
+        }
+        let presetWire = (obj["preset"] as? String) ?? RemotePreset.default.wire
+        guard let preset = RemotePreset.fromWire(presetWire) else {
+            // Unknown preset wire (e.g. a pre-release picker blob): discard the
+            // whole stored map so stale slot layouts don't strand the user.
+            return .default
+        }
+        // preset=default means "track the app's standard scheme": ignore any
+        // stored slot dump (older builds persisted the full resolved map, which
+        // would otherwise pin those users to that build's defaults forever).
+        // Stored slots are only authoritative for CUSTOM.
+        if preset == .default { return .default }
+        return RemoteControlMap(
+            preset: preset,
+            player: decodeContext(obj["player"] as? [String: Any],
+                                  firstWins: firstOccurrences(in: raw, context: "player")) { PlayerRemoteAction.fromWire($0) },
+            guide: decodeContext(obj["guide"] as? [String: Any],
+                                 firstWins: firstOccurrences(in: raw, context: "guide")) { GuideRemoteAction.fromWire($0) }
+        )
+    }
+
+    static func fromData(_ data: Data?) -> RemoteControlMap {
+        guard let data = data, let str = String(data: data, encoding: .utf8) else { return .default }
+        return fromJSON(str)
+    }
+
+    /// One press, one action (Logan 2026-10-15). A JSON object cannot hold
+    /// two values for one press once parsed (JSONSerialization keeps only
+    /// one), so older or hand-edited blobs with a repeated press key are
+    /// detected on the RAW text: the first occurrence wins and every later
+    /// one is dropped with a log line. Returns press wire -> first action
+    /// wire for the presses that were repeated.
+    private static func firstOccurrences(in raw: String, context: String) -> [String: String] {
+        guard let ctxRange = raw.range(of: "\"\(context)\"\\s*:\\s*\\{[^}]*\\}",
+                                       options: .regularExpression) else { return [:] }
+        let body = String(raw[ctxRange])
+        guard let pairRegex = try? NSRegularExpression(
+            pattern: "\"([A-Za-z]+)\"\\s*:\\s*\"([A-Za-z]+)\"") else { return [:] }
+        var first: [String: String] = [:]
+        var repeated: [String: String] = [:]
+        let ns = body as NSString
+        for m in pairRegex.matches(in: body, range: NSRange(location: 0, length: ns.length)) {
+            let key = ns.substring(with: m.range(at: 1))
+            let value = ns.substring(with: m.range(at: 2))
+            if let kept = first[key] {
+                debugLog("[REMOTE] duplicate action for \(key) dropped (\(context): kept \(kept), dropped \(value))")
+                repeated[key] = kept
+            } else {
+                first[key] = value
+            }
+        }
+        return repeated
+    }
+
+    private static func decodeContext<A>(
+        _ obj: [String: Any]?,
+        firstWins: [String: String] = [:],
+        _ action: (String) -> A?
+    ) -> [RemoteSlot: A] {
+        guard let obj = obj else { return [:] }
+        var out: [RemoteSlot: A] = [:]
+        for (key, value) in obj {
+            guard let slot = RemoteSlot.fromWire(key) else { continue }
+            let chosen = firstWins[key] ?? (value as? String)
+            guard let wire = chosen, let act = action(wire) else { continue }
+            out[slot] = act
+        }
+        return out
+    }
+}

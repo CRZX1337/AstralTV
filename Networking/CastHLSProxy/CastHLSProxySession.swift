@@ -1,0 +1,1011 @@
+//
+//  CastHLSProxySession.swift
+//  Astral
+//
+//  Phone-side cast HLS proxy session (GH #33 web-receiver rework): owns
+//  the URLSession ingest of a live channel's raw MPEG-TS stream, feeds
+//  CastFMP4Remuxer, and publishes the output through CastHLSProxyServer
+//  as sliding-window live HLS the web receiver can actually pace (a
+//  progressive fMP4 URL stutters every 10-15 s for want of a manifest
+//  clock; device-verified on the Android build of this same design).
+//
+//  One channel at a time: `startChannel` tears down the previous ingest
+//  and (via the store's generation machinery) rolls a playlist
+//  discontinuity; the listening socket and URL survive channel flips, so
+//  the receiver keeps polling the same playlist. A fresh cast session
+//  gets a fresh server + store (new port, sequence reset).
+//
+
+import Foundation
+import AVFoundation
+
+enum CastHLSProxyError: Error, CustomStringConvertible {
+    /// The phone has no Wi-Fi/LAN IPv4 address to serve on (a Chromecast
+    /// cannot fetch from a cellular interface).
+    case noLANAddress
+    /// The listening socket never became ready.
+    case serverFailed
+    /// The ingest gave up after consecutive connect failures.
+    case ingestUnreachable
+    /// Segments never materialized inside the ready window.
+    case timedOut
+    /// The upstream answered an HTTP error before a single byte of media
+    /// (503 = the server could not start this feed, e.g. a broken output
+    /// profile); the sender retries once without the profile parameter.
+    case upstreamUnavailable(Int)
+    /// Dispatcharr connection-limit refusal, or the server ending the
+    /// stream again right after the automatic reconnect. Final: never
+    /// reconnected (LiveStopNotice).
+    case stopped(LiveStopNotice)
+
+    var description: String {
+        switch self {
+        case .stopped(let notice): return "\(notice.title). \(notice.message)"
+        case .noLANAddress: return "no Wi-Fi LAN address to serve the cast proxy on"
+        case .serverFailed: return "local HTTP server failed to start"
+        case .ingestUnreachable: return "stream unreachable"
+        case .timedOut: return "the stream never started"
+        case .upstreamUnavailable(let code): return "the server refused the stream (HTTP \(code))"
+        }
+    }
+}
+
+/// Not MainActor: the sender calls `startChannel` from its MainActor
+/// context, but all the work (socket bind, ingest, waits) runs off it.
+final class CastHLSProxySession: @unchecked Sendable {
+
+    static let shared = CastHLSProxySession()
+
+    /// loadMedia is gated on this much MEDIA DURATION so the receiver
+    /// starts a safe distance BEHIND the live edge (an empty live playlist
+    /// is a hard receiver error, not a retry), and on at least
+    /// `readyMinSegments` segments so a single long segment cannot satisfy
+    /// it on its own.
+    ///
+    /// A duration, not a segment count (2026-09-12). Two ~4 s segments
+    /// started the receiver 8 s from the edge and the Google TV Streamer
+    /// ran the buffer dry 8 s in, then re-synced to the live edge instead
+    /// of fetching the next segment and stalled on the skip. A 3-SEGMENT
+    /// gate fixed that but overshot the other way: our cuts land on
+    /// keyframes, and a real broadcast feed's first three segments were
+    /// 5.005 s, 4.338 s and 3.170 s, so the gate held the load for 11.5 s
+    /// after the ingest connected (iPhone proxy log 14:22:07.382 init
+    /// ready, 14:22:18.879 load sent). Nine seconds of media is three of
+    /// our 3 s targets, is what the receiver page also starts behind the
+    /// edge, and is reached by two segments on a feed like that.
+    private static let readyMediaTicks: Int64 = 9 * CastFMP4Remuxer.ticksPerSecond
+    ///
+    /// FOUR segments, not two (2026-09-12, second pass): Shaka sizes its
+    /// live seek range from the span of the playlist window it parses
+    /// (hls_parser.js determineDuration_ -> getLiveDuration_) minus the
+    /// presentation delay the receiver configures (4 s). A two- or
+    /// three-segment window leaves a seek range barely wider than one
+    /// segment, and the playhead then lives on its edge for the whole
+    /// session. Four segments give the receiver a window it can hold a
+    /// playhead inside from the first load.
+    private static let readyMinSegments = 4
+
+    /// Bound on the wait for `readyMediaTicks`: nine seconds of media plus
+    /// provider join latency; past this the channel is declared
+    /// uncastable and the user told. First terminal error wins.
+    private static let readyTimeout: TimeInterval = 32.0
+
+    /// The ready bound, for the sender's user-facing "no data" message.
+    static var readyTimeoutSeconds: Int { Int(readyTimeout) }
+
+    /// A slow provider can eat the whole `readyTimeout` in one failed
+    /// connect (15 s request timeout + backoff) and then recover on the
+    /// reconnect; the timeout exists to catch channels that NEVER start,
+    /// not ones that just healed. Every (re)connect therefore guarantees
+    /// at least this much runway from the moment bytes start flowing
+    /// (two ~4 s segments + remux latency).
+    private static let postConnectGrace: TimeInterval = 15.0
+
+    /// Consecutive failed (re)connects before the ingest gives up.
+    /// Backoff 1/2/4/8/8 s; the receiver stalls at the live edge in the
+    /// meantime, which is the honest presentation of the outage.
+    private static let maxConsecutiveFailures = 5
+
+    /// Per-8-segments log rollup cadence.
+    private static let logEverySegments = 8
+
+    /// Serializes control (start/stop/reconnect bookkeeping) and ingest
+    /// data; the remuxer is single-caller on this queue.
+    private let queue = DispatchQueue(label: "com.astral.casthls.session")
+    private var server: CastHLSProxyServer?
+    private var store: CastHLSSegmentStore?
+    private var ingest: IngestConnection?
+    private var remuxer: CastFMP4Remuxer?
+    /// Terminal ingest failure (unsupported codec, connect exhaustion),
+    /// observed by `startChannel`'s ready wait. First error wins.
+    private var terminalError: Error?
+    /// `startChannel` already handed the playlist to the sender, so a
+    /// terminal stop after this point is reported through
+    /// `onTerminalAfterReady` instead of the ready wait.
+    private var readyReturned = false
+    /// Clean-end reconnect ladder; only a VERIFIED session-limit reading
+    /// stops the ingest (Logan 2026-09-15).
+    private var cleanEndPolicy = LiveCleanEndPolicy()
+    /// When the ingest connection now feeding the receiver was opened.
+    private var liveSessionStartedAt = Date()
+    /// Called (off main) with the user-facing text when the ingest stops
+    /// for good after the receiver was loaded. Set by the cast sender.
+    var onTerminalAfterReady: (@Sendable (String) -> Void)?
+    /// Called (off main, on the session queue) each time a remuxer of the
+    /// current channel decides its video path, the passthrough fallback
+    /// after a transcode failure included, so the sender's cast card can
+    /// show or clear its transcode note. Set by the cast sender.
+    var onVideoDecision: (@Sendable (CastVideoPlanOutcome) -> Void)?
+    private var activeURL: URL?
+    private var currentGeneration = 0
+    private var consecutiveFailures = 0
+    private var everConnected = false
+    /// Most recent ingest (re)connect; extends `startChannel`'s ready
+    /// wait by `postConnectGrace` so a slow first connect + healthy
+    /// reconnect is not misreported as "never started".
+    private var lastIngestConnectAt: Date?
+    /// Monotonic token; a scheduled reconnect from a superseded channel
+    /// or a stopped session must not fire.
+    private var ingestEpoch = 0
+    /// Receiver decodes AC-3: the remuxer then passes AC-3 / E-AC-3
+    /// through instead of running the AudioToolbox transcode.
+    private var allowAC3Passthrough = false
+    /// Receiver cannot decode AC-3 and the sender's audio plan is
+    /// `transcode-aac`: the remuxer decodes AC-3 / E-AC-3 on the phone and
+    /// serves AAC-LC stereo in the audio rendition instead of refusing.
+    private var transcodeAC3 = false
+    /// Segment cadence of the current channel (`.composite` for the
+    /// phone-composited Multiview).
+    private var segmentProfile = CastSegmentProfile.standard
+    /// Newest published segment: its generation, its end on the
+    /// generation's media timeline (seconds, the receiver's `t` for a
+    /// receiver loaded on that generation) and when it was published.
+    private var lastPublished: (generation: Int, endSeconds: Double, at: CFAbsoluteTime)?
+    /// The sender's video plan for the current channel (receiver caps plus
+    /// the Developer switches); the remuxer applies it at the source SPS.
+    private var videoPlan = CastVideoPlan.passthrough
+    /// Set when the on-phone video transcode fails: every later remuxer of
+    /// this proxy session passes the source through. Cleared by `stop()`.
+    private var videoTranscodeDisabledReason: String?
+
+    // Per-generation log rollup state.
+    private var segmentsLogged = 0
+    private var rollupBytes = 0
+    private var rollupTicks: Int64 = 0
+    /// Timeline snapshot handed over by `CastFMP4Remuxer.onSegmentComposition`,
+    /// which fires immediately before `onDemuxedMediaSegments` on the same
+    /// ingest queue. Held on the session (not in a captured local) so Swift 6
+    /// concurrency checking has a single owner for it.
+    private var pendingComposition: (video: Int, audio: Int,
+                                     vdts: Double, vpts: Double, apts: Double,
+                                     start: Double)?
+
+    // Stats surface for the cast Options sheet (task #267): the latest
+    // completed per-8-segment rollup is STORED, not just logged, plus a
+    // per-channel segment total and the codec descriptions.
+    private var totalSegmentsProduced = 0
+    private var lastRollupKbps: Int?
+    private var lastRollupAvgSegmentSeconds: Double?
+    private var videoCodecDescription: String?
+    /// Last non-nil remuxer audio path, so the card doesn't blank for
+    /// the sub-second PMT re-parse window on every reconnect splice.
+    private var audioPathCache: String?
+
+    /// Point-in-time proxy stats for the cast Options sheet's Stream
+    /// Info card. Value-typed so it crosses to the MainActor reader.
+    struct Stats: Sendable {
+        let ingestHost: String
+        let port: UInt16
+        let generation: Int
+        let segmentsProduced: Int
+        let videoCodec: String?
+        let audioPath: String?
+        let lastRollupKbps: Int?
+        let lastRollupAvgSegmentSeconds: Double?
+    }
+
+    /// The live point of what the proxy is producing, on the current
+    /// generation's media timeline: the newest published segment's end plus
+    /// the wall time since it was published (the ingest keeps producing
+    /// while the next cut builds). With the generation the receiver was
+    /// loaded on (`receiverRequestCounts().generation`) the sender turns the
+    /// receiver's reported position into "seconds behind the live point".
+    func liveEdgeEstimate() -> (generation: Int, seconds: Double, sinceLastSegment: Double)? {
+        onQueueBounded(timeout: 0.3, what: "liveEdge") { () -> (Int, Double, Double)? in
+            guard let p = self.lastPublished, p.generation == self.currentGeneration else { return nil }
+            let since = max(0, CFAbsoluteTimeGetCurrent() - p.at)
+            return (p.generation, p.endSeconds + since, since)
+        } ?? nil
+    }
+
+    /// Audio codec + mode for the sender's one-line cast log. nil when no
+    /// proxy session is up.
+    /// Stale-receiver check (incident 2026-09-25 15:26): reset the request
+    /// counters at an accepted load, and read them back 10 s later.
+    func markReceiverLoad() {
+        _ = onQueueBounded(timeout: 1.0, what: "markReceiverLoad") {
+            self.server?.requestCounters.mark(generation: self.currentGeneration)
+        }
+    }
+
+    func receiverRequestCounts() -> CastHLSRequestCounters.Snapshot? {
+        onQueueBounded(timeout: 1.0, what: "receiverRequestCounts") {
+            self.server?.requestCounters.snapshot
+        } ?? nil
+    }
+
+    func audioSummary() -> (codec: String?, mode: String)? {
+        onQueueBounded(timeout: 1.0, what: "audioSummary") { () -> (codec: String?, mode: String)? in
+            guard let remuxer = self.remuxer else { return nil }
+            let codec = remuxer.audioCodecsAttribute
+            let mode: String
+            if codec == nil {
+                mode = "none"
+            } else if codec == "mp4a.40.2", remuxer.audioPathDescription?.contains("->") == true {
+                mode = "transcode"
+            } else {
+                mode = "passthrough"
+            }
+            return (codec, mode)
+        } ?? nil
+    }
+
+    /// Called ~1 Hz from the MAIN actor (the remote-session sheet's stats
+    /// poll). Incident 2026-09-25 14:04: a plain `queue.sync` here turns
+    /// any stall of the session queue (ingest callbacks, remuxer, splice)
+    /// into a frozen main thread, which is exactly the whole-app silence
+    /// seen after the gen=2 splice. Main now waits at most 50 ms and falls
+    /// back to the last snapshot.
+    func statsSnapshot() -> Stats? {
+        let fresh = onQueueBounded(timeout: 0.05, what: "statsSnapshot") { () -> Stats? in
+            guard let server = self.server, let url = self.activeURL else { return nil }
+            if let path = self.remuxer?.audioPathDescription { self.audioPathCache = path }
+            return Stats(
+                ingestHost: URLComponents(url: url, resolvingAgainstBaseURL: false)?.host ?? "?",
+                port: server.boundPort,
+                generation: self.currentGeneration,
+                segmentsProduced: self.totalSegmentsProduced,
+                videoCodec: self.videoCodecDescription,
+                audioPath: self.audioPathCache,
+                lastRollupKbps: self.lastRollupKbps,
+                lastRollupAvgSegmentSeconds: self.lastRollupAvgSegmentSeconds)
+        }
+        boundedLock.lock()
+        defer { boundedLock.unlock() }
+        switch fresh {
+        case .some(let value): lastStats = value; return value
+        case .none: return lastStats
+        }
+    }
+
+    private let boundedLock = NSLock()
+    private var lastStats: Stats?
+    /// Bounded hops still waiting on `queue`, keyed by caller; a stalled
+    /// queue gets at most one queued probe per caller, not one per second.
+    private var boundedInFlight: Set<String> = []
+    private var stallLogged = false
+
+    /// Run `body` on `queue` and wait at most `timeout` for it (incident
+    /// 2026-09-25). Returns nil when the queue did not answer in time (the
+    /// block still runs later; its result is dropped) and logs the stall
+    /// once per stall, so a future freeze names the session queue instead
+    /// of going silent. Never call it from `queue` itself.
+    private func onQueueBounded<T>(timeout: TimeInterval, what: String,
+                                   _ body: @escaping () -> T) -> T? {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        boundedLock.lock()
+        if boundedInFlight.contains(what) {
+            boundedLock.unlock()
+            return nil
+        }
+        boundedInFlight.insert(what)
+        boundedLock.unlock()
+        let done = DispatchSemaphore(value: 0)
+        let box = BoundedResultBox<T>()
+        let began = Date()
+        queue.async { [self] in
+            box.value = body()
+            boundedLock.lock()
+            boundedInFlight.remove(what)
+            let wasStalled = stallLogged
+            stallLogged = false
+            boundedLock.unlock()
+            if wasStalled {
+                log(String(format: "session queue answered %@ after %.0f ms",
+                           what, Date().timeIntervalSince(began) * 1000))
+            }
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .success { return box.value }
+        boundedLock.lock()
+        let first = !stallLogged
+        stallLogged = true
+        boundedLock.unlock()
+        if first {
+            log("session queue STALLED: \(what) got no answer in \(Int(timeout * 1000)) ms "
+                + "(caller not blocked; spindump com.astral.casthls.session)")
+        }
+        return nil
+    }
+
+    private func log(_ message: String) {
+        debugLog("[CAST-HLS] \(message)")
+    }
+
+    // MARK: Link line (device log 2026-09-25 17:04)
+
+    /// Ingest bytes since the link timer started, touched on `queue`.
+    private var linkIngestBytes: Int64 = 0
+    private var linkTimer: DispatchSourceTimer?
+    private var linkSamples: [Double] = []
+    private var linkLastIngest: Int64 = 0
+    private var linkLastServed: Int64 = 0
+    private var linkSilentSeconds = 0
+    private var linkStalls = 0
+    private var linkTicks = 0
+
+    /// Runs on `queue`. One `[CAST-HLS] link:` line every 10 s while the
+    /// proxy serves a receiver.
+    private func startLinkLogLocked() {
+        guard linkTimer == nil else { return }
+        linkSamples = []
+        linkLastIngest = linkIngestBytes
+        linkLastServed = server?.linkCounters.servedBytes ?? 0
+        linkSilentSeconds = 0
+        linkStalls = 0
+        linkTicks = 0
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 1, repeating: 1)
+        t.setEventHandler { [weak self] in self?.linkTickLocked() }
+        linkTimer = t
+        t.resume()
+    }
+
+    private func stopLinkLogLocked() {
+        linkTimer?.cancel()
+        linkTimer = nil
+    }
+
+    private func linkTickLocked() {
+        guard let server, let store else { return }
+        let delta = linkIngestBytes - linkLastIngest
+        linkLastIngest = linkIngestBytes
+        linkSamples.append(Double(max(0, delta)) * 8 / 1000)
+        if delta == 0 {
+            linkSilentSeconds += 1
+            // Same 2 s threshold as the TS remuxer's ingest-silence stall.
+            if linkSilentSeconds == 2 { linkStalls += 1 }
+        } else {
+            linkSilentSeconds = 0
+        }
+        linkTicks += 1
+        guard linkTicks % 10 == 0 else { return }
+        let c = server.linkCounters
+        let runway = store.runwayAfter(seq: c.highestVideoSeq)
+        let avg = linkSamples.reduce(0, +) / Double(max(1, linkSamples.count))
+        let minimum = linkSamples.min() ?? 0
+        let servedKbps = Double(max(0, c.servedBytes - linkLastServed)) * 8 / 1000 / 10
+        linkLastServed = c.servedBytes
+        log(String(format: "link: ingest %.0f kbps avg/%.0f kbps min over 10 s, stalls %d, reservoir %d segs/%.1f s, served %.0f kbps to %@",
+                   avg, minimum, linkStalls, runway.count, runway.seconds, servedKbps, c.peer ?? "none"))
+        linkSamples = []
+        linkStalls = 0
+    }
+
+    /// Point the proxy at `rawTSURL` (the SAME URL + headers the local
+    /// player would use) and wait until the playlist has two segments.
+    /// Returns the DEMUXED MASTER playlist URL to hand to the cast load:
+    /// separate video and audio renditions, one SourceBuffer each, so the
+    /// audio can declare ac-3 / ec-3 honestly on a receiver that answers
+    /// isTypeSupported false for any muxed video/mp4 carrying those codecs
+    /// but TRUE for audio/mp4 with them. Its CLOSED-CAPTIONS=NONE also
+    /// keeps Shaka's caption parser off the video segments; loading a
+    /// media playlist directly is a known fatal.
+    ///
+    /// Throws `CastUnsupportedCodecError` for a mux the proxy cannot
+    /// serve and `CastHLSProxyError` for infrastructure failures.
+    func startChannel(rawTSURL: URL, headers: [String: String],
+                      allowAC3Passthrough: Bool = false,
+                      transcodeAC3: Bool = false,
+                      receiverDecodesAVCLevel42: Bool? = nil,
+                      videoPlan: CastVideoPlan = .passthrough,
+                      segmentProfile: CastSegmentProfile = .standard) async throws -> URL {
+        // The Chromecast fetches over the LAN; 127.0.0.1 would only ever
+        // work for the phone itself.
+        guard let lanIP = Self.wifiLANAddress() else {
+            log("start refused: no Wi-Fi LAN address")
+            throw CastHLSProxyError.noLANAddress
+        }
+        let (port, isChannelChange): (UInt16, Bool) = try queue.sync {
+            let store: CastHLSSegmentStore
+            let server: CastHLSProxyServer
+            if let existingStore = self.store, let existingServer = self.server, existingServer.boundPort != 0 {
+                // Channel change / reconnect reuses server + port + ring:
+                // the receiver's cached playlist still promises the old
+                // channel's last segments, so they stay fetchable until
+                // ring eviction, and the new generation splices in behind
+                // a discontinuity with no sequence gap.
+                store = existingStore
+                server = existingServer
+            } else {
+                store = CastHLSSegmentStore(log: { [weak self] in self?.log($0) })
+                server = CastHLSProxyServer(store: store, log: { [weak self] in self?.log($0) })
+                _ = try server.start()
+                self.store = store
+                self.server = server
+            }
+            let isChannelChange = self.activeURL != nil
+            self.allowAC3Passthrough = allowAC3Passthrough
+            self.transcodeAC3 = transcodeAC3
+            self.videoPlan = videoPlan
+            self.segmentProfile = segmentProfile
+            store.setReceiverDecodesAVCLevel42(receiverDecodesAVCLevel42)
+            self.stopIngestLocked()
+            self.activeURL = rawTSURL
+            self.terminalError = nil
+            self.readyReturned = false
+            self.cleanEndPolicy.reset()
+            self.liveSessionStartedAt = Date()
+            self.consecutiveFailures = 0
+            self.everConnected = false
+            self.lastIngestConnectAt = nil
+            self.currentGeneration = store.beginGeneration()
+            self.totalSegmentsProduced = 0
+            self.lastRollupKbps = nil
+            self.lastRollupAvgSegmentSeconds = nil
+            self.videoCodecDescription = nil
+            self.audioPathCache = nil
+            self.lastPublished = nil
+            self.log("server on \(lanIP):\(server.boundPort); "
+                + "\(isChannelChange ? "channel change" : "session start") "
+                + "gen=\(self.currentGeneration) ingest=\(Self.sanitize(rawTSURL))"
+                + (segmentProfile == .composite ? " profile=composite (1 s cuts, nearest TARGETDURATION)" : ""))
+            self.beginBackgroundKeepaliveIfNeeded()
+            self.startLinkLogLocked()
+            self.startIngestLocked(url: rawTSURL, headers: headers)
+            return (server.boundPort, isChannelChange)
+        }
+        _ = isChannelChange
+
+        // Ready wait: first terminal error wins; otherwise poll for the
+        // segment gate. 100 ms granularity is invisible next to ~3 s
+        // segment cadence.
+        let deadline = Date(timeIntervalSinceNow: Self.readyTimeout)
+        while true {
+            // A superseding channel flip cancels this task; the flip's own
+            // startChannel already re-pointed the ingest, so just leave.
+            if Task.isCancelled { throw CancellationError() }
+            // Bounded hop (incident 2026-09-25): a stalled session queue must
+            // not pin a Swift cooperative thread; retry on the next tick.
+            guard let (err, ready, connectedAt) = onQueueBounded(timeout: 0.5, what: "readyWait", {
+                () -> (Error?, (segments: Int, mediaTicks: Int64), Date?) in
+                (self.terminalError, self.store?.currentReadyState ?? (segments: 0, mediaTicks: 0),
+                 self.lastIngestConnectAt)
+            }) else {
+                if Date() >= deadline { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                continue
+            }
+            // A (re)connect is progress: guarantee `postConnectGrace` of
+            // runway from the moment bytes started flowing, else a slow
+            // first connect eats the whole budget and a healthy reconnect
+            // gets killed as "never started" (seen live 2026-08-14).
+            let effectiveDeadline = max(deadline,
+                connectedAt.map { $0.addingTimeInterval(Self.postConnectGrace) } ?? deadline)
+            if Date() >= effectiveDeadline { break }
+            if let err {
+                stopIfStillActive(rawTSURL)
+                throw err
+            }
+            if ready.segments >= Self.readyMinSegments,
+               ready.mediaTicks >= Self.readyMediaTicks {
+                let seconds = Double(ready.mediaTicks) / Double(CastFMP4Remuxer.ticksPerSecond)
+                queue.sync { readyReturned = true }
+                log(String(format: "ready with %d segments, %.2fs media (gate %.0fs / %d segments)",
+                           ready.segments, seconds,
+                           Double(Self.readyMediaTicks) / Double(CastFMP4Remuxer.ticksPerSecond),
+                           Self.readyMinSegments))
+                return URL(string: "http://\(lanIP):\(port)/demuxed.m3u8")!
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        // A channel that cannot start must not leave a dead ingest
+        // pinning the provider connection.
+        stopIfStillActive(rawTSURL)
+        throw CastHLSProxyError.timedOut
+    }
+
+    /// Full teardown: ingest, ring, server socket, background keepalive.
+    /// Called when the cast session ends (or a start fails).
+    func stop() {
+        queue.sync {
+            let hadSession = activeURL != nil || server != nil
+            activeURL = nil
+            stopIngestLocked()
+            videoTranscodeDisabledReason = nil
+            store?.close()
+            store = nil
+            stopLinkLogLocked()
+            server?.stop()
+            server = nil
+            endBackgroundKeepaliveIfNeeded()
+            if hadSession { log("proxy stopped") }
+        }
+    }
+
+    private func stopIfStillActive(_ url: URL) {
+        let stillActive = queue.sync { activeURL == url }
+        if stillActive { stop() }
+    }
+
+    // MARK: background keepalive
+
+    /// Casting users pocket the phone; the proxy is the receiver's media
+    /// server and must outlive the app's foreground time. The codebase's
+    /// existing mechanism is the audio background mode plus the
+    /// AudioSessionRefCount guard, so the proxy holds a refcount for its
+    /// lifetime (the cast sender also disables the SDK's
+    /// suspend-on-background). Device verification of long background
+    /// runs is part of the P2 checklist.
+    private var keepaliveHeld = false
+
+    /// The silent render itself lives in the shared `BackgroundKeepalive`
+    /// engine (shared so other external-playback pipelines can hold it
+    /// too); the proxy is one
+    /// named holder of it for the session's lifetime.
+    private static let keepaliveHolder = "cast-hls-proxy"
+
+    private func beginBackgroundKeepaliveIfNeeded() {
+        guard !keepaliveHeld else { return }
+        keepaliveHeld = true
+        BackgroundKeepalive.acquire(Self.keepaliveHolder)
+    }
+
+    private func endBackgroundKeepaliveIfNeeded() {
+        guard keepaliveHeld else { return }
+        keepaliveHeld = false
+        BackgroundKeepalive.release(Self.keepaliveHolder)
+    }
+
+    // MARK: ingest
+
+    private func stopIngestLocked() {
+        ingestEpoch += 1
+        ingest?.cancel()
+        ingest = nil
+        remuxer?.release()
+        remuxer = nil
+    }
+
+    /// Runs on `queue`. Builds a fresh remuxer per connection: a TS join
+    /// lands mid-GOP with an unknown clock phase, so the remuxer
+    /// realigns (sync scan, wait for SPS/PPS + keyframe) and the store
+    /// presents the restart as a playlist discontinuity.
+    private func startIngestLocked(url: URL, headers: [String: String]) {
+        let epoch = ingestEpoch
+        let gen = currentGeneration
+        segmentsLogged = 0
+        rollupBytes = 0
+        rollupTicks = 0
+
+        var plan = videoPlan
+        if let reason = videoTranscodeDisabledReason {
+            plan.disabledReason = "transcode failed earlier this session: \(reason)"
+        }
+        // Transcoder output hops back onto this queue; a delivery for a
+        // superseded ingest is dropped (the remuxer is gone or released).
+        let delivery: CastIngestDelivery = { [weak self] block in
+            guard let self else { return }
+            self.queue.async {
+                guard self.ingestEpoch == epoch else { return }
+                block()
+            }
+        }
+        store?.setProfile(generation: gen, segmentProfile)
+        let remuxer = CastFMP4Remuxer(targetSegmentTicks: segmentProfile.targetSegmentTicks,
+                                      allowAC3Passthrough: allowAC3Passthrough,
+                                      transcodeAC3: transcodeAC3,
+                                      videoPlan: plan,
+                                      videoDelivery: delivery,
+                                      log: { [weak self] in self?.log($0) })
+        remuxer.onVideoTranscodeFailed = { [weak self] reason in
+            // Runs on `queue`; the next `feed` throws and the ingest
+            // reconnects with a passthrough remuxer.
+            self?.videoTranscodeDisabledReason = reason
+        }
+        remuxer.onVideoDecision = { [weak self] outcome in
+            guard let self, self.ingestEpoch == epoch else { return }
+            self.onVideoDecision?(outcome)
+        }
+        remuxer.onDemuxedInitSegments = { [weak self] video, audio in
+            guard let self, self.ingestEpoch == epoch else { return }
+            self.store?.setVideoTranscoded(generation: gen, remuxer.videoIsTranscoded)
+            self.store?.setDemuxedInitSegments(generation: gen, video: video, audio: audio)
+            // The playlist's CODECS attribute must name the audio the
+            // segments actually carry (AAC, ac-3 or ec-3).
+            self.store?.setAudioCodecsAttribute(remuxer.audioCodecsAttribute)
+            let from = remuxer.sourceVideoInfo.map { " from \($0.codec.displayName)" } ?? ""
+            let transcoded = remuxer.videoIsTranscoded ? ", transcoded\(from)" : ""
+            if let video, let hevc = CastHLSSegmentStore.hevcCodecString(from: video) {
+                self.videoCodecDescription = "HEVC (\(hevc))\(transcoded)"
+            } else if let video, let avc = CastHLSSegmentStore.avcCodecString(from: video) {
+                self.videoCodecDescription = "H.264 (\(avc))\(transcoded)"
+            } else if video == nil {
+                self.videoCodecDescription = "none (audio only)"
+            }
+            self.log("demuxed init ready gen=\(gen) "
+                + (video == nil ? "audio-only " : "")
+                + "vinit=\(video?.count ?? 0) B ainit=\(audio?.count ?? 0) B")
+        }
+        // Per-segment timeline snapshot, stashed by the composition
+        // callback (which fires first) and logged below once the store has
+        // handed back the sequence number the playlist will advertise.
+        // Added 2026-09-12: with sequenceMode=false the receiver aligns
+        // the playlist timeline (t=) against the segments' own timestamps
+        // (vdts/vpts/apts), and on the 15:10:03 Google TV Streamer session
+        // those disagreed by 16 ms with no way to see it from either log.
+        pendingComposition = nil
+        remuxer.onSegmentComposition = { [weak self] video, audio, vdts, vpts, apts, start in
+            guard let self, self.ingestEpoch == epoch else { return }
+            self.pendingComposition = (video, audio, vdts, vpts, apts, start)
+        }
+        remuxer.onDemuxedMediaSegments = { [weak self] video, audio, durationTicks, audioDurationTicks in
+            guard let self, self.ingestEpoch == epoch else { return }
+            // The store's generation gate is the authority; this epoch
+            // check just spares dead work after a teardown race.
+            let segmentBytes = video.count + (audio?.count ?? 0)
+            let publishedSeq = self.store?.addSegment(generation: gen,
+                                                      durationTicks: durationTicks,
+                                                      videoData: video.isEmpty ? nil : video, // empty = audio-only (GH #90)
+                                                      audioData: audio,
+                                                      audioDurationTicks: audioDurationTicks)
+            if let c = self.pendingComposition {
+                self.pendingComposition = nil
+                let dur = Double(durationTicks) / Double(CastFMP4Remuxer.ticksPerSecond)
+                if publishedSeq != nil {
+                    self.lastPublished = (gen, c.start + dur, CFAbsoluteTimeGetCurrent())
+                }
+                // buffStart is max(vpts, apts): Chromium reports a
+                // two-track SourceBuffer's buffered range as the
+                // INTERSECTION of the tracks, so the later of the two
+                // earliest presentation times is where the range actually
+                // begins. A video-only segment reports apts=-1.000 and
+                // buffStart falls back to vpts.
+                let buffStart = max(c.vpts, c.apts)
+                self.log("seg=\(publishedSeq.map(String.init) ?? "?") "
+                    + "t=\(String(format: "%.2f", c.start))s "
+                    + "dur=\(String(format: "%.2f", dur))s "
+                    + "vdts=\(String(format: "%.3f", c.vdts)) "
+                    + "vpts=\(String(format: "%.3f", c.vpts)) "
+                    + "apts=\(String(format: "%.3f", c.apts)) "
+                    + "buffStart=\(String(format: "%.3f", buffStart)) "
+                    + "video=\(c.video) audio=\(c.audio) \(segmentBytes) B "
+                    + "vseg=\(video.count) B "
+                    + "aseg=\(audio?.count ?? 0) B")
+            }
+            self.segmentsLogged += 1
+            self.totalSegmentsProduced += 1
+            self.rollupBytes += segmentBytes
+            self.rollupTicks += durationTicks
+            if self.segmentsLogged % Self.logEverySegments == 0 {
+                let seconds = Double(self.rollupTicks) / Double(CastFMP4Remuxer.ticksPerSecond)
+                let kbps = seconds > 0 ? Int(Double(self.rollupBytes) * 8 / seconds / 1000) : 0
+                self.lastRollupKbps = kbps
+                self.lastRollupAvgSegmentSeconds = seconds / Double(Self.logEverySegments)
+                self.log("segments=\(self.segmentsLogged) last\(Self.logEverySegments): "
+                    + "avgDur=\(String(format: "%.2f", seconds / Double(Self.logEverySegments)))s "
+                    + "bytes=\(self.rollupBytes) bitrate=\(kbps)kbps")
+                self.rollupBytes = 0
+                self.rollupTicks = 0
+            }
+        }
+        self.remuxer = remuxer
+
+        let connection = IngestConnection(
+            url: url,
+            headers: headers,
+            queue: queue,
+            onConnected: { [weak self] in
+                guard let self, self.ingestEpoch == epoch else { return }
+                if self.everConnected {
+                    self.log("ingest reconnected (attempt \(self.consecutiveFailures + 1))")
+                } else {
+                    self.log("ingest connected")
+                }
+                self.everConnected = true
+                self.consecutiveFailures = 0
+                self.lastIngestConnectAt = Date()
+            },
+            onData: { [weak self] data in
+                guard let self, self.ingestEpoch == epoch, let remuxer = self.remuxer else { return }
+                self.linkIngestBytes += Int64(data.count)
+                do {
+                    try remuxer.feed(data)
+                } catch let error as CastVideoTranscodeError {
+                    // Fallback: a fresh remuxer, built with the plan
+                    // disabled, passes the source through from the next IDR.
+                    self.log("\(error); reconnecting with passthrough")
+                    self.scheduleReconnectLocked(url: url, headers: headers, closingEpoch: epoch)
+                } catch let error as CastUnsupportedCodecError {
+                    // Terminal by design: video other than H.264 / HEVC
+                    // has no path, and the audio transcode covers MP2 always and AC-3/E-AC-3
+                    // only under the sender's transcode-aac plan (and needs
+                    // a platform decoder). Surfaced to the
+                    // sender's ready wait as the cast failure.
+                    self.log("unsupported codec, refusing to cast: \(error.codecName)")
+                    self.terminalError = error
+                    self.stopIngestLocked()
+                } catch {
+                    // Mid-stream codec failure (e.g. the audio converter
+                    // choking on garbage): reconnect with a fresh remuxer
+                    // and transcoder rather than killing the proxy.
+                    self.log("ingest stream error: \(error)")
+                    self.scheduleReconnectLocked(url: url, headers: headers, closingEpoch: epoch)
+                }
+            },
+            onFinished: { [weak self] failureReason, errorBody in
+                guard let self, self.ingestEpoch == epoch else { return }
+                if let failureReason { self.log("ingest ended: \(failureReason)") }
+                // Dispatcharr connection limit: final, reconnecting would only
+                // keep competing for the user's sessions.
+                if let failureReason, let body = errorBody,
+                   let code = Int(failureReason.replacingOccurrences(of: "http=", with: "")),
+                   let notice = DispatcharrConnectionLimit.fromResponse(code: code, body: body) {
+                    self.log("[LIMIT] ingest \(notice.kind.rawValue): refused, no reconnect")
+                    self.stopForNoticeLocked(notice)
+                    return
+                }
+                // Clean end: reconnect on the escalating ladder, and from
+                // the second end on ask Dispatcharr whether this account is
+                // really at its session limit with a newer session
+                // elsewhere. Only that verified answer stops the cast.
+                if failureReason == "stream ended" {
+                    let firstEnd = self.cleanEndPolicy.isFirstEnd
+                    let sessionStartedAt = self.liveSessionStartedAt
+                    let delay = self.cleanEndPolicy.nextDelay()
+                    self.log("[RECONNECT] ingest ended cleanly; reconnect attempt "
+                        + "\(self.cleanEndPolicy.attempts) in \(Int(delay))s")
+                    if !firstEnd {
+                        Task { @MainActor [weak self] in
+                            let verdict = await DispatcharrSessionLimitVerifier.verify(
+                                sessionStartedAt: sessionStartedAt)
+                            guard let self else { return }
+                            self.queue.async {
+                                self.log("[VERIFY] clean end check: \(verdict.logText)")
+                                guard case .atLimit = verdict else { return }
+                                self.stopForNoticeLocked(.streamEnded)
+                            }
+                        }
+                    }
+                    self.scheduleCleanEndReconnectLocked(url: url, headers: headers,
+                                                         closingEpoch: epoch, delay: delay)
+                    return
+                }
+                // HTTP 503 before a single byte means the server could not
+                // start this feed at all. Terminal right away rather than
+                // after the backoff ladder, so the user is told while they
+                // are still waiting instead of at the ready deadline.
+                if !self.everConnected, failureReason == "http=503" {
+                    self.terminalError = CastHLSProxyError.upstreamUnavailable(503)
+                    self.stopIngestLocked()
+                    return
+                }
+                self.scheduleReconnectLocked(url: url, headers: headers, closingEpoch: epoch)
+            })
+        ingest = connection
+        connection.start()
+    }
+
+    /// Runs on `queue`. Reconnect after a clean end on the policy delay,
+    /// without spending the connect-failure budget (nothing failed).
+    private func scheduleCleanEndReconnectLocked(url: URL, headers: [String: String],
+                                                 closingEpoch: Int, delay: TimeInterval) {
+        guard ingestEpoch == closingEpoch, terminalError == nil else { return }
+        stopIngestLocked()
+        let reconnectEpoch = ingestEpoch
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.ingestEpoch == reconnectEpoch, self.activeURL == url,
+                  self.terminalError == nil else { return }
+            guard let store = self.store else { return }
+            self.liveSessionStartedAt = Date()
+            self.currentGeneration = store.beginGeneration()
+            self.startIngestLocked(url: url, headers: headers)
+        }
+    }
+
+    /// Runs on `queue`. Terminal stop for a LiveStopNotice: the ingest is
+    /// released and nothing reconnects.
+    private func stopForNoticeLocked(_ notice: LiveStopNotice) {
+        terminalError = CastHLSProxyError.stopped(notice)
+        stopIngestLocked()
+        if readyReturned, let hook = onTerminalAfterReady {
+            let text = "\(notice.title). \(notice.message)"
+            DispatchQueue.main.async { hook(text) }
+        }
+    }
+
+    /// Runs on `queue`. Bounded backoff, then a NEW generation: the
+    /// reconnected stream's clock will not line up with the old one, so
+    /// the playlist declares the splice instead of hiding it.
+    private func scheduleReconnectLocked(url: URL, headers: [String: String], closingEpoch: Int) {
+        guard ingestEpoch == closingEpoch, terminalError == nil else { return }
+        stopIngestLocked() // bumps ingestEpoch; also releases the transcoder codecs
+        let reconnectEpoch = ingestEpoch
+        consecutiveFailures += 1
+        if consecutiveFailures >= Self.maxConsecutiveFailures {
+            log("ingest gave up after \(consecutiveFailures) consecutive failures")
+            terminalError = CastHLSProxyError.ingestUnreachable
+            return
+        }
+        let backoff = min(8.0, pow(2.0, Double(consecutiveFailures - 1)))
+        log("ingest reconnect in \(Int(backoff * 1000))ms")
+        queue.asyncAfter(deadline: .now() + backoff) { [weak self] in
+            guard let self, self.ingestEpoch == reconnectEpoch, self.activeURL == url else { return }
+            guard let store = self.store else { return }
+            self.currentGeneration = store.beginGeneration()
+            self.startIngestLocked(url: url, headers: headers)
+        }
+    }
+
+    // MARK: LAN address
+
+    /// The device's Wi-Fi IPv4 address (en0 on iPhone/iPad; any other
+    /// non-loopback en* interface covers Ethernet adapters). The active
+    /// route may be cellular while Wi-Fi is still up, and the Chromecast
+    /// can only reach the Wi-Fi side, so this walks interfaces instead
+    /// of asking for the default route's address.
+    static func wifiLANAddress() -> String? {
+        var ifaddrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrs) == 0, let first = ifaddrs else { return nil }
+        defer { freeifaddrs(ifaddrs) }
+        var fallback: String?
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            guard let addr = ifa.ifa_addr, addr.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+            let flags = Int32(ifa.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+            let name = String(cString: ifa.ifa_name)
+            guard name.hasPrefix("en") else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(decoding: host.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) },
+                            as: UTF8.self)
+            guard !ip.hasPrefix("169.254.") else { continue } // link-local
+            if name == "en0" { return ip }
+            if fallback == nil { fallback = ip }
+        }
+        return fallback
+    }
+
+    /// Strip credentials/query from a URL for the log (house rule: no
+    /// identifiers or secrets in shareable logs; DebugLogger's sanitizer
+    /// is the second line of defence).
+    static func sanitize(_ url: URL) -> String {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = components.host else { return url.path }
+        let port = components.port ?? (components.scheme == "https" ? 443 : 80)
+        return "\(components.scheme ?? "http")://\(host):\(port)\(components.path)"
+    }
+
+    // MARK: ingest connection
+
+    /// One HTTP connection reading a live TS stream. The in-flight task
+    /// is cancelled EXPLICITLY on stop: a live body read only returns
+    /// once the socket is torn down, and holding it open pins the
+    /// provider connection (fatal on single-connection accounts).
+    private final class IngestConnection: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let url: URL
+        private let headers: [String: String]
+        private let queue: DispatchQueue
+        private let onConnected: () -> Void
+        private let onData: (Data) -> Void
+        private let onFinished: (String?, Data?) -> Void
+        /// A 429 / 503 whose small JSON body is read before reporting, so
+        /// the session can recognize a connection-limit refusal.
+        private var errorStatus: Int?
+        private var errorBody = Data()
+        private var session: URLSession?
+        private var task: URLSessionDataTask?
+        private var cancelled = false
+        private var connectedSignalled = false
+
+        init(url: URL, headers: [String: String], queue: DispatchQueue,
+             onConnected: @escaping () -> Void,
+             onData: @escaping (Data) -> Void,
+             onFinished: @escaping (String?, Data?) -> Void) {
+            self.url = url
+            self.headers = headers
+            self.queue = queue
+            self.onConnected = onConnected
+            self.onData = onData
+            self.onFinished = onFinished
+        }
+
+        func start() {
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 15
+            // A live stream never "completes"; rely on data flow.
+            config.timeoutIntervalForResource = .infinity
+            let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+            self.session = session
+            var request = URLRequest(url: url)
+            for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+            let task = session.dataTask(with: request)
+            self.task = task
+            task.resume()
+            // Device log 2026-09-25 17:04: log the ingest policy and path
+            // (behavior unchanged: `.default` allows cellular).
+            debugLog("[CAST-HLS] ingest network policy: allowsCellular=\(config.allowsCellularAccess) "
+                + "allowsExpensive=\(config.allowsExpensiveNetworkAccess) "
+                + "allowsConstrained=\(config.allowsConstrainedNetworkAccess) "
+                + "waitsForConnectivity=\(config.waitsForConnectivity); "
+                + NetworkPathLog.shared.currentWithPower)
+        }
+
+        func cancel() {
+            cancelled = true
+            task?.cancel()
+            session?.invalidateAndCancel()
+            task = nil
+            session = nil
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            if let http = response as? HTTPURLResponse,
+               http.statusCode == 429 || http.statusCode == 503 {
+                let code = http.statusCode
+                queue.async { [weak self] in self?.errorStatus = code }
+                completionHandler(.allow)
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                let code = http.statusCode
+                queue.async { [weak self] in
+                    guard let self, !self.cancelled else { return }
+                    self.onFinished("http=\(code)", nil)
+                }
+                completionHandler(.cancel)
+                return
+            }
+            queue.async { [weak self] in
+                guard let self, !self.cancelled, !self.connectedSignalled else { return }
+                self.connectedSignalled = true
+                self.onConnected()
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            queue.async { [weak self] in
+                guard let self, !self.cancelled else { return }
+                if self.errorStatus != nil {
+                    if self.errorBody.count < 8192 { self.errorBody.append(data) }
+                    return
+                }
+                self.onData(data)
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            queue.async { [weak self] in
+                guard let self, !self.cancelled else { return }
+                if let error, (error as NSError).code == NSURLErrorCancelled { return }
+                if let code = self.errorStatus {
+                    self.errorStatus = nil
+                    self.onFinished("http=\(code)", self.errorBody)
+                    return
+                }
+                self.onFinished(error.map { $0.localizedDescription } ?? "stream ended", nil)
+            }
+        }
+    }
+}
+
+/// Result slot for `onQueueBounded`: written on the session queue before
+/// the semaphore signal, read after the wait succeeds.
+private final class BoundedResultBox<T>: @unchecked Sendable {
+    var value: T?
+}

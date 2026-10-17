@@ -1,0 +1,3893 @@
+import CoreGraphics
+// CLI test harness for the cast HLS proxy's pure logic. The repo has no
+// unit-test target (AstralTVUITests is UI-only), so these run via swiftc
+// on macOS against the shipping source files.
+
+import Foundation
+
+var failures = 0
+@MainActor func expect(_ cond: Bool, _ label: String) {
+    if cond {
+        print("PASS \(label)")
+    } else {
+        failures += 1
+        print("FAIL \(label)")
+    }
+}
+@MainActor func expectEq<T: Equatable>(_ a: T, _ b: T, _ label: String) {
+    if a == b {
+        print("PASS \(label)")
+    } else {
+        failures += 1
+        print("FAIL \(label): \(a) != \(b)")
+    }
+}
+
+// MARK: 1. AAC PTS ladder / re-anchor
+
+do {
+    var mapper = CastAudioTranscoder.AACPTSMapper(sampleRate: 44_100)
+    let frame: Int64 = 1024 * 90_000 // divided by 44100 per step, exact each time
+    // Anchor at a non-zero pts; ladder computed from anchor each frame.
+    let anchor: Int64 = 1_234_567
+    var raws: [Int64] = []
+    for n in 0..<1000 { raws.append(anchor + Int64(n) * frame / 44_100) }
+    var lastOut: Int64 = -1
+    var okLadder = true
+    for (n, raw) in raws.enumerated() {
+        let out = mapper.map(raw)
+        let expected = anchor + Int64(n) * frame / 44_100
+        if out != expected { okLadder = false }
+        if out <= lastOut { okLadder = false }
+        lastOut = out
+    }
+    expect(okLadder, "pts ladder exact at 44.1kHz over 1000 frames (no cumulative drift)")
+    // The 1000th frame: 1000*1024/44100 s = 23.219954... s = 2089795.9 ticks.
+    // Ladder value stays anchored (no per-frame rounding accumulation).
+    expectEq(mapper.map(anchor + 1000 * frame / 44_100), anchor + 1000 * frame / 44_100,
+             "ladder frame 1000 computed from anchor")
+    // Re-anchor: a jump of 600ms (54000 ticks) past the ladder re-anchors.
+    let jumped = anchor + 1001 * frame / 44_100 + 54_000
+    expectEq(mapper.map(jumped), jumped, "re-anchor on >500ms jump")
+    // And the next frame steps from the new anchor.
+    expectEq(mapper.map(jumped + frame / 44_100), jumped + frame / 44_100, "post-re-anchor step")
+    // A small deviation (< 500ms) does NOT re-anchor: output stays on ladder.
+    var m2 = CastAudioTranscoder.AACPTSMapper(sampleRate: 48_000)
+    _ = m2.map(0)
+    let step48: Int64 = 1024 * 90_000 / 48_000 // 1920
+    expectEq(m2.map(step48 + 40_000), step48, "jitter under threshold stays on ladder")
+}
+
+// MARK: 2. MPEG audio transcode routing (stream_type 0x03 / 0x04)
+
+/// Stands in for the AudioToolbox transcoder: records what the remuxer
+/// framed and hands back one AAC frame per source frame, so the pure
+/// framing/PTS logic runs off-device.
+final class FakeCastAudioTranscoder: CastAudioTranscoding {
+    let onConfig: (_ asc: [UInt8], _ sampleRate: Int) -> Void
+    let onFrame: (_ data: [UInt8], _ ptsTicks: Int64) -> Void
+    var fedLengths: [Int] = []
+    var fedPTS: [Int64] = []
+    var flushes = 0
+    var released = 0
+    private var configSent = false
+
+    init(onConfig: @escaping (_ asc: [UInt8], _ sampleRate: Int) -> Void,
+         onFrame: @escaping (_ data: [UInt8], _ ptsTicks: Int64) -> Void) {
+        self.onConfig = onConfig
+        self.onFrame = onFrame
+    }
+
+    func feed(_ data: [UInt8], range: Range<Int>, ptsTicks: Int64, info: CastESFrameInfo) throws {
+        if !configSent {
+            configSent = true
+            // AAC-LC stereo at the source rate: freqIndex 3 is 48 kHz.
+            onConfig([0x11, 0x90], info.sampleRate)
+        }
+        fedLengths.append(range.count)
+        fedPTS.append(ptsTicks)
+        onFrame([UInt8](repeating: 0x42, count: 64), ptsTicks)
+    }
+
+    func flush() { flushes += 1 }
+    func release() { released += 1 }
+}
+
+/// One MPEG-1 Layer II frame: 48 kHz stereo, 128 kbps, 384 bytes. The
+/// payload is filler that cannot be mistaken for a syncword.
+func mp2Frame() -> [UInt8] {
+    var f = [UInt8](repeating: 0x21, count: 384)
+    f[0] = 0xFF
+    f[1] = 0xFD // MPEG-1, layer II, no CRC
+    f[2] = 0x84 // 128 kbps, 48 kHz, no padding
+    f[3] = 0x00 // stereo
+    return f
+}
+
+/// A transport stream whose PMT declares `audioStreamType` audio on
+/// pid 0x101 carrying `audioES`, alongside plain H.264 on pid 0x100.
+func mpegAudioFixtureTS(audioStreamType: UInt8, audioES: [UInt8],
+                        audioFrameLen: Int, audioFrameTicks: Int64,
+                        videoFrames: Int) -> Data {
+    var writer = CensusTSWriter()
+    let base: Int64 = 10_000
+    let pat: [UInt8] = [0x00, 0xB0, 13, 0x00, 0x01, 0xC1, 0, 0, 0, 0x01, 0xF0, 0x00, 0, 0, 0, 0]
+    let pmtBody: [UInt8] = [0x00, 0x01, 0xC1, 0, 0,
+                            0xE1, 0x00, 0xF0, 0x00,
+                            0x1B, 0xE1, 0x00, 0xF0, 0x00,
+                            audioStreamType, 0xE1, 0x01, 0xF0, 0x00]
+    let pmt: [UInt8] = [0x02, 0xB0, UInt8(pmtBody.count + 4)] + pmtBody + [0, 0, 0, 0]
+    writer.psi(pid: 0, table: pat)
+    writer.psi(pid: 0x1000, table: pmt)
+    let videoFrameTicks: Int64 = 3_000
+    var nextAudio = 0
+    let audioFrames = audioES.count / audioFrameLen
+    for i in 0..<videoFrames {
+        let dts = base + Int64(i) * videoFrameTicks
+        writer.pes(pid: 0x100, payload: censusPES(streamID: 0xE0,
+                                                  payload: censusVideoAU(keyframe: i % 30 == 0),
+                                                  pts: dts, dts: dts))
+        // One audio PES per two source frames, stamped on the first.
+        while nextAudio < audioFrames, base + Int64(nextAudio) * audioFrameTicks <= dts {
+            let end = min(nextAudio + 2, audioFrames)
+            let bytes = Array(audioES[(nextAudio * audioFrameLen)..<(end * audioFrameLen)])
+            writer.pes(pid: 0x101, payload: censusPES(streamID: 0xC0, payload: bytes,
+                                                      pts: base + Int64(nextAudio) * audioFrameTicks,
+                                                      dts: nil))
+            nextAudio = end
+        }
+    }
+    return writer.bytes
+}
+
+@MainActor func runMPEGTranscodeChecks() {
+    let frameTicks: Int64 = 1152 * CastFMP4Remuxer.ticksPerSecond / 48_000 // 2160
+    var es: [UInt8] = []
+    for _ in 0..<120 { es.append(contentsOf: mp2Frame()) }
+
+    for streamType: UInt8 in [0x03, 0x04] {
+        var fake: FakeCastAudioTranscoder?
+        let remuxer = CastFMP4Remuxer(transcoderFactory: { _, onConfig, onFrame in
+            let t = FakeCastAudioTranscoder(onConfig: onConfig, onFrame: onFrame)
+            fake = t
+            return t
+        })
+        let ts = mpegAudioFixtureTS(audioStreamType: streamType, audioES: es,
+                                    audioFrameLen: 384, audioFrameTicks: frameTicks,
+                                    videoFrames: 90)
+        var threw = false
+        do { try remuxer.feed(ts) } catch { threw = true }
+        let label = String(format: "0x%02X", Int(streamType))
+        expect(!threw, "\(label) MPEG audio is transcoded, not refused")
+        guard let t = fake else {
+            expect(false, "\(label) reached the transcoder")
+            continue
+        }
+        expect(t.fedLengths.count >= 100, "\(label) framed whole MP2 frames into the transcoder")
+        expect(t.fedLengths.allSatisfy { $0 == 384 }, "\(label) every fed frame is one 384-byte syncframe")
+        var stepsOK = true
+        for i in 1..<t.fedPTS.count where t.fedPTS[i] - t.fedPTS[i - 1] != frameTicks { stepsOK = false }
+        expect(stepsOK, "\(label) source frame PTS steps by one MP2 frame duration")
+        expectEq(remuxer.audioPathDescription, "MP2 stereo -> AAC stereo", "\(label) audio path description")
+        expectEq(remuxer.audioCodecsAttribute, "mp4a.40.2", "\(label) playlist CODECS names the encoder output")
+        remuxer.release()
+        expectEq(t.released, 1, "\(label) release tears the codecs down")
+    }
+
+    // AC-3 without receiver passthrough and without the sender's
+    // transcode-aac plan refuses by name, and no transcoder is ever
+    // constructed.
+    var built = false
+    let ac3Remuxer = CastFMP4Remuxer(transcoderFactory: { _, onConfig, onFrame in
+        built = true
+        return FakeCastAudioTranscoder(onConfig: onConfig, onFrame: onFrame)
+    })
+    let ac3TS = mpegAudioFixtureTS(audioStreamType: 0x81, audioES: es,
+                                   audioFrameLen: 384, audioFrameTicks: frameTicks,
+                                   videoFrames: 30)
+    var refusedName: String?
+    do { try ac3Remuxer.feed(ac3TS) } catch let e as CastUnsupportedCodecError { refusedName = e.codecName }
+    catch { refusedName = "other" }
+    expectEq(refusedName, "AC-3 audio", "AC-3 refuses by name without a transcode plan")
+    expect(!built, "no transcoder is constructed for AC-3 without a transcode plan")
+
+    // transcode-aac plan (receiver answered ac-3=no): AC-3 syncframes go
+    // through the transcoder and the rendition declares AAC.
+    var ac3ES: [UInt8] = []
+    var ac3Frame: [UInt8] = [0x0B, 0x77, 0x00, 0x00, 0x1C, 0x40, 0xE1] // 48 kHz 384 kbps 5.1
+    ac3Frame.append(contentsOf: [UInt8](repeating: 0, count: 1536 - ac3Frame.count))
+    for _ in 0..<60 { ac3ES.append(contentsOf: ac3Frame) }
+    let ac3FrameTicks: Int64 = 1536 * CastFMP4Remuxer.ticksPerSecond / 48_000 // 2880
+    var ac3Fake: FakeCastAudioTranscoder?
+    var ac3Source: CastAudioSourceCodec?
+    var ac3Logs: [String] = []
+    let transcodeRemuxer = CastFMP4Remuxer(transcodeAC3: true, log: { ac3Logs.append($0) },
+                                           transcoderFactory: { source, onConfig, onFrame in
+        ac3Source = source
+        let t = FakeCastAudioTranscoder(onConfig: onConfig, onFrame: onFrame)
+        ac3Fake = t
+        return t
+    })
+    let ac3TranscodeTS = mpegAudioFixtureTS(audioStreamType: 0x81, audioES: ac3ES,
+                                            audioFrameLen: 1536, audioFrameTicks: ac3FrameTicks,
+                                            videoFrames: 90)
+    var ac3Threw = false
+    do { try transcodeRemuxer.feed(ac3TranscodeTS) } catch { ac3Threw = true }
+    expect(!ac3Threw, "AC-3 with transcode-aac is transcoded, not refused")
+    expect(ac3Source == .ac3, "AC-3 transcoder built for the AC-3 source")
+    expect((ac3Fake?.fedLengths.count ?? 0) >= 50, "framed whole AC-3 syncframes into the transcoder")
+    expect(ac3Fake?.fedLengths.allSatisfy { $0 == 1536 } ?? false, "every fed AC-3 frame is one syncframe")
+    expectEq(transcodeRemuxer.audioCodecsAttribute, "mp4a.40.2", "AC-3 transcode: CODECS names AAC")
+    expectEq(transcodeRemuxer.audioPathDescription, "AC-3 5.1 -> AAC stereo", "AC-3 transcode: audio path")
+    expect(ac3Logs.contains("transcoding AC-3 5.1 48000 Hz -> AAC-LC stereo (receiver cannot decode AC-3)"),
+           "AC-3 transcode: logs the transcoding line")
+    let transcodingIdx = ac3Logs.firstIndex { $0.hasPrefix("transcoding AC-3") }
+    let activeIdx = ac3Logs.firstIndex { $0.hasPrefix("audio transcode active: AC-3 6ch 48000Hz") }
+    expect(transcodingIdx != nil && activeIdx != nil && transcodingIdx! < activeIdx!,
+           "AC-3 transcode: transcoding line precedes audio transcode active")
+    let gated = ac3Logs.filter { $0.hasPrefix("transcoded audio gated: ") }
+    let resumed = ac3Logs.filter { $0.hasPrefix("transcoded audio resumed after ") }
+    expect(gated.count == resumed.count, "every gated run of transcoded audio logs its resume")
+    if let g = gated.first {
+        expect(g.hasPrefix("transcoded audio gated: 1 units dropped, pts ")
+               && g.hasSuffix("s below timeline base -0.000s"),
+               "gated line logs the first drop before the timeline base exists: \(g)")
+    }
+    transcodeRemuxer.release()
+
+    // Passthrough wins over the transcode plan when both are set.
+    var passthroughBuilt = false
+    let bothRemuxer = CastFMP4Remuxer(allowAC3Passthrough: true, transcodeAC3: true,
+                                      transcoderFactory: { _, onConfig, onFrame in
+        passthroughBuilt = true
+        return FakeCastAudioTranscoder(onConfig: onConfig, onFrame: onFrame)
+    })
+    do { try bothRemuxer.feed(ac3TranscodeTS) } catch {}
+    expect(!passthroughBuilt, "AC-3 passthrough takes precedence over the transcode plan")
+}
+
+runMPEGTranscodeChecks()
+
+// MARK: 3. master playlist codec string from synthetic avcC
+
+do {
+    var initSeg = Data([0, 0, 0, 0, 0x66, 0x74, 0x79, 0x70]) // noise + ftyp-ish
+    initSeg.append(Data("avcC".utf8))
+    initSeg.append(Data([1, 0x64, 0x00, 0x28, 0xFF, 0xE1])) // ver, profile, compat, level
+    expectEq(CastHLSSegmentStore.avcCodecString(from: initSeg), "avc1.640028",
+             "avc1.PPCCLL derived from avcC")
+    expectEq(CastHLSSegmentStore.avcCodecString(from: Data([1, 2, 3])), nil,
+             "no avcC yields nil")
+}
+
+// MARK: 4. playlist generation across a splice
+
+do {
+    let store = CastHLSSegmentStore()
+    let ticks3s: Int64 = 3 * 90_000
+    let gen1 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen1, video: Data("init1-avcC".utf8), audio: Data("a1".utf8))
+    for _ in 0..<3 {
+        store.addSegment(generation: gen1, durationTicks: ticks3s,
+                         videoData: Data("vseg".utf8), audioData: Data("aseg".utf8))
+    }
+    expectEq(store.currentReadyState.segments, 3, "segment count in generation 1")
+    // The ready gate is a duration, so the store must total media time too.
+    expectEq(store.currentReadyState.mediaTicks, 3 * ticks3s,
+             "media ticks in generation 1")
+
+    let gen2 = store.beginGeneration()
+    expectEq(store.currentReadyState.segments, 0, "generation bump resets ready count")
+    expectEq(store.currentReadyState.mediaTicks, 0, "generation bump resets ready media time")
+    // A stale gen-1 publisher must not claim a sequence number.
+    store.addSegment(generation: gen1, durationTicks: ticks3s,
+                     videoData: Data("stale".utf8), audioData: nil)
+    store.setDemuxedInitSegments(generation: gen2, video: Data("init2".utf8), audio: Data("a2".utf8))
+    for _ in 0..<2 {
+        store.addSegment(generation: gen2, durationTicks: ticks3s,
+                         videoData: Data("vseg2".utf8), audioData: Data("aseg2".utf8))
+    }
+
+    let text = store.videoPlaylistText()
+    let lines = text.split(separator: "\n").map(String.init)
+    expect(lines.contains("#EXT-X-VERSION:7"), "version 7")
+    expect(lines.contains("#EXT-X-MEDIA-SEQUENCE:0"), "media sequence starts at 0 (15-window covers all 5)")
+    expect(lines.contains("#EXT-X-DISCONTINUITY"), "discontinuity tag present at splice")
+    expect(lines.contains("#EXT-X-MAP:URI=\"vinit\(gen1).mp4\""), "old generation MAP present")
+    expect(lines.contains("#EXT-X-MAP:URI=\"vinit\(gen2).mp4\""), "new generation MAP present")
+    expect(!text.contains("ENDLIST"), "no ENDLIST on a live playlist")
+    // Contiguous sequence numbering across the splice: seg0..seg4.
+    for n in 0...4 { expect(lines.contains("vseg\(n).m4s"), "vseg\(n) advertised") }
+    expect(!text.contains("vseg5.m4s"), "stale-generation segment claimed no sequence number")
+    // The discontinuity tag must sit immediately before the new
+    // generation's MAP and its first segment, with nothing in between
+    // (see section 12: no PROGRAM-DATE-TIME, ever).
+    if let di = lines.firstIndex(of: "#EXT-X-DISCONTINUITY") {
+        expectEq(lines[di + 1], "#EXT-X-MAP:URI=\"vinit\(gen2).mp4\"", "discontinuity precedes new MAP")
+    } else {
+        expect(false, "discontinuity index")
+    }
+    expect(lines.contains("#EXTINF:3.000,"), "EXTINF has 3 decimals")
+
+    // Old-generation init + segments stay fetchable until ring eviction.
+    expectEq(store.videoInitSegment(generation: gen1), Data("init1-avcC".utf8), "old init retained")
+    expectEq(store.awaitSegment(seq: 0, rendition: .video, timeout: 0.05), Data("vseg".utf8),
+             "old segment fetchable after splice")
+
+    // Master playlist reflects the CURRENT generation's init (no avcC in
+    // init2, so fallback codec string) and carries the load-bearing tags.
+    let master = store.demuxedMasterPlaylistText()
+    expect(master.contains("CLOSED-CAPTIONS=NONE"), "master carries CLOSED-CAPTIONS=NONE")
+    expect(master.contains("BANDWIDTH="), "master carries BANDWIDTH")
+    expect(master.contains("mp4a.40.2"), "master carries AAC codec")
+    expect(master.contains("video.m3u8"), "master points at the video media playlist")
+}
+
+// MARK: 5. ring eviction with init retention
+
+do {
+    let store = CastHLSSegmentStore()
+    let ticks: Int64 = 3 * 90_000
+    let gen1 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen1, video: Data("i1".utf8), audio: nil)
+    for _ in 0..<3 {
+        store.addSegment(generation: gen1, durationTicks: ticks, videoData: Data([1]), audioData: nil)
+    }
+    let gen2 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen2, video: Data("i2".utf8), audio: nil)
+    // Ring size 18: after 16 gen2 segments (total 19) one gen1 segment evicts.
+    for _ in 0..<16 {
+        store.addSegment(generation: gen2, durationTicks: ticks, videoData: Data([2]), audioData: nil)
+    }
+    expect(store.videoInitSegment(generation: gen1) != nil,
+           "gen1 init retained while a gen1 segment is ringed")
+    // Push the remaining gen1 segments out (21 total > 18 + 3).
+    for _ in 0..<2 {
+        store.addSegment(generation: gen2, durationTicks: ticks, videoData: Data([2]), audioData: nil)
+    }
+    expectEq(store.videoInitSegment(generation: gen1), nil,
+             "gen1 init dropped once no ring entry references it")
+    expect(store.videoInitSegment(generation: gen2) != nil, "current generation init always retained")
+    // The flagged (discontinuity) segment was seg3; it evicts at 22 total.
+    var text = store.videoPlaylistText()
+    expect(!text.contains("#EXT-X-DISCONTINUITY-SEQUENCE"), "discontinuity-sequence absent while tag in ring")
+    for _ in 0..<4 {
+        store.addSegment(generation: gen2, durationTicks: ticks, videoData: Data([2]), audioData: nil)
+    }
+    text = store.videoPlaylistText()
+    expect(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "discontinuity-sequence increments after tag rolls out")
+    expect(!text.contains("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"vinit\(gen2)"),
+           "no stale discontinuity tag once flagged segment evicted")
+
+    // Live-edge hold semantics: newest+1 blocks briefly then nils on
+    // timeout; far future and evicted return nil immediately.
+    let t0 = Date()
+    expectEq(store.awaitSegment(seq: 25, rendition: .video, timeout: 0.3), nil,
+             "newest+1 held until timeout")
+    expect(Date().timeIntervalSince(t0) >= 0.25, "newest+1 actually waited")
+    let t1 = Date()
+    expectEq(store.awaitSegment(seq: 50, rendition: .video, timeout: 5), nil, "far future 404s fast")
+    expectEq(store.awaitSegment(seq: 0, rendition: .video, timeout: 5), nil, "evicted 404s fast")
+    expect(Date().timeIntervalSince(t1) < 0.2, "no hold for far-future/evicted")
+    // Publication wakes a held fetch.
+    let publisher = Thread {
+        Thread.sleep(forTimeInterval: 0.15)
+        store.addSegment(generation: gen2, durationTicks: ticks, videoData: Data([9]), audioData: nil)
+    }
+    publisher.start()
+    expectEq(store.awaitSegment(seq: 25, rendition: .video, timeout: 3), Data([9]),
+             "held fetch resolves on publish")
+}
+
+// MARK: 6. remuxer PTS unwrap helpers
+
+do {
+    var clock = CastFMP4Remuxer.PTSUnwrapper()
+    let nearWrap: Int64 = (1 << 33) - 900
+    expectEq(clock.unwrap(nearWrap), nearWrap, "pre-wrap passthrough")
+    expectEq(clock.unwrap(100), (1 << 33) + 100, "33-bit wraparound unwraps monotonic")
+    let dts64: Int64 = (1 << 33) + 50
+    expectEq(CastFMP4Remuxer.unwrapPTSAgainstDTS(150, dts64), (1 << 33) + 150,
+             "pts unwraps against dts epoch")
+    expectEq(CastFMP4Remuxer.unwrapPTSAgainstDTS((1 << 33) - 100, dts64), (1 << 33) - 100,
+             "pts slightly behind wrap point stays in epoch")
+}
+
+// MARK: 7. AC-3 passthrough sample-entry config + playlist CODECS
+
+do {
+    // Synthesized AC-3 syncframe header: 48 kHz (fscod 0), 384 kbps
+    // (frmsizecod 28 -> bit_rate_code 14), bsid 8, bsmod 0, acmod 7 (3/2)
+    // with LFE -> 5.1, 1536 bytes per frame.
+    var frame: [UInt8] = [0x0B, 0x77, 0x00, 0x00, 0x1C, 0x40, 0xE1]
+    frame.append(contentsOf: [UInt8](repeating: 0, count: 1536 - frame.count))
+    guard let config = CastAudioFrameParser.parseAC3SampleEntryConfig(.ac3, frame, 0) else {
+        expect(false, "AC-3 sample entry config parsed")
+        exit(1)
+    }
+    expectEq(config.fscod, 0, "dac3 fscod")
+    expectEq(config.bsid, 8, "dac3 bsid")
+    expectEq(config.bsmod, 0, "dac3 bsmod")
+    expectEq(config.acmod, 7, "dac3 acmod")
+    expectEq(config.lfeon, 1, "dac3 lfeon")
+    expectEq(config.bitRateCode, 14, "dac3 bit_rate_code")
+    expectEq(config.sampleRate, 48_000, "AC-3 sample rate")
+    expectEq(config.channels, 6, "AC-3 channel count (5.1)")
+    expectEq(config.samplesPerFrame, 1536, "AC-3 samples per frame")
+    expectEq(config.codecsAttribute, "ac-3", "AC-3 CODECS attribute")
+
+    let store = CastHLSSegmentStore()
+    let gen = store.beginGeneration()
+    // No audio init, so the master falls back to the attribute the session
+    // set from the remuxer.
+    store.setDemuxedInitSegments(generation: gen, video: Data("init".utf8), audio: nil)
+    expect(store.demuxedMasterPlaylistText().contains(",mp4a.40.2\""),
+           "master defaults to the AAC codec")
+    store.setAudioCodecsAttribute("ac-3")
+    let master = store.demuxedMasterPlaylistText()
+    expect(master.contains(",ac-3\""), "master names ac-3 for a passthrough")
+    expect(!master.contains("mp4a"), "master drops the AAC codec for a passthrough")
+    store.setAudioCodecsAttribute(nil)
+    let videoOnly = store.demuxedMasterPlaylistText()
+    expect(!videoOnly.contains("mp4a") && !videoOnly.contains("ac-3"),
+           "video-only master names no audio codec")
+
+    // Level clamp (Chromecast Ultra, 2026-09-26): 4.2 is declared as 4.0
+    // unless the receiver answered yes to avc1.64002A.
+    expectEq(CastHLSSegmentStore.declaredAVCCodec("avc1.64002A", receiverDecodesLevel42: nil),
+             "avc1.640028", "unknown caps clamp level 4.2")
+    expectEq(CastHLSSegmentStore.declaredAVCCodec("avc1.4D002A", receiverDecodesLevel42: false),
+             "avc1.4D0028", "no to 4.2 clamps, keeping profile and constraint")
+    expectEq(CastHLSSegmentStore.declaredAVCCodec("avc1.64002A", receiverDecodesLevel42: true),
+             "avc1.64002A", "yes to 4.2 keeps the stream level")
+    expectEq(CastHLSSegmentStore.declaredAVCCodec("avc1.64001F", receiverDecodesLevel42: false),
+             "avc1.64001F", "levels at or below 4.0 are untouched")
+    var avcInit = Data("xxxxavcC".utf8)
+    avcInit.append(contentsOf: [0x01, 0x64, 0x00, 0x2A, 0xFF])
+    let clampStore = CastHLSSegmentStore()
+    let clampGen = clampStore.beginGeneration()
+    clampStore.setDemuxedInitSegments(generation: clampGen, video: avcInit, audio: nil)
+    expect(clampStore.demuxedMasterPlaylistText().contains("CODECS=\"avc1.640028,"),
+           "master declares the clamped level when caps are unknown")
+    clampStore.setReceiverDecodesAVCLevel42(true)
+    expect(clampStore.demuxedMasterPlaylistText().contains("CODECS=\"avc1.64002A,"),
+           "master keeps level 4.2 when the receiver decodes it")
+}
+
+// MARK: 9. segment-run continuity against a real transport stream
+//
+// Added 2026-09-12 after Logan's "launches now but it's frozen" on a
+// Google TV Streamer. The failure was reproduced in a real Chromium
+// MediaSource: the Cast receiver appends our muxed segments in MSE
+// 'sequence' AppendMode (Shaka's HLS default; Chromium logs the
+// multitrack warning on every one of our loads). In that mode Chromium
+// ignores tfdt and re-anchors each append on the PRESENTATION timestamp
+// of the first coded frame, so two properties of the emitted bytes
+// decide whether the receiver plays or freezes:
+//
+//  1. No audio may sit before the first video presentation time. Audio
+//     that does lands before zero and Chromium drops and truncates it
+//     ("Dropping audio frame (DTS -24000us ...)", "Truncating audio
+//     buffer which overlaps append window start"), and the truncated
+//     frame then fails to decode and costs the load a decoder swap.
+//  2. Both tracks must run continuously across consecutive segments, so
+//     no hole can open between appends. In Chromium a run of eight of
+//     these segments buffers as ONE range in both 'segments' and
+//     'sequence' mode; with a segment missing, sequence mode turns the
+//     honest 6 s hole into a 0.147 s one the video renderer never
+//     crosses while the audio plays straight through it.
+//
+// Skips itself when ffmpeg is absent so a machine without Homebrew
+// still runs the rest of the suite.
+
+/// One segment's per-track span, in 90 kHz ticks, read back out of the
+/// moof: tfdt, tfdt + the trun sample durations, and the minimum
+/// presentation time.
+struct TrackSpan {
+    var start: Int64 = 0
+    var end: Int64 = 0
+    var minPTS: Int64 = 0
+}
+
+func be32(_ b: [UInt8], _ o: Int) -> Int64 {
+    (Int64(b[o]) << 24) | (Int64(b[o + 1]) << 16) | (Int64(b[o + 2]) << 8) | Int64(b[o + 3])
+}
+
+func boxType(_ b: [UInt8], _ o: Int) -> String {
+    String(bytes: b[(o + 4)..<(o + 8)], encoding: .ascii) ?? ""
+}
+
+/// Children of a box body, as (type, bodyStart, boxEnd).
+func boxChildren(_ b: [UInt8], _ start: Int, _ end: Int) -> [(String, Int, Int)] {
+    var out: [(String, Int, Int)] = []
+    var o = start
+    while o + 8 <= end {
+        var size = Int(be32(b, o))
+        if size == 0 { size = end - o }
+        if size < 8 || o + size > end { break }
+        out.append((boxType(b, o), o + 8, o + size))
+        o += size
+    }
+    return out
+}
+
+/// Per-track spans of one media segment, keyed by track id.
+func segmentSpans(_ segment: Data) -> [Int: TrackSpan] {
+    let b = [UInt8](segment)
+    var result: [Int: TrackSpan] = [:]
+    for (type, start, end) in boxChildren(b, 0, b.count) where type == "moof" {
+        for (trafType, trafStart, trafEnd) in boxChildren(b, start, end) where trafType == "traf" {
+            var trackID = -1
+            var span = TrackSpan()
+            var total: Int64 = 0
+            var minPTS = Int64.max
+            for (childType, childStart, _) in boxChildren(b, trafStart, trafEnd) {
+                switch childType {
+                case "tfhd":
+                    trackID = Int(be32(b, childStart + 4))
+                case "tfdt":
+                    span.start = b[childStart] == 1
+                        ? (be32(b, childStart + 4) << 32) | be32(b, childStart + 8)
+                        : be32(b, childStart + 4)
+                case "trun":
+                    let version = Int(b[childStart])
+                    let flags = Int(be32(b, childStart) & 0xFF_FFFF)
+                    let count = Int(be32(b, childStart + 4))
+                    var p = childStart + 8
+                    if flags & 0x1 != 0 { p += 4 }   // data offset
+                    if flags & 0x4 != 0 { p += 4 }   // first sample flags
+                    var decode: Int64 = 0
+                    for _ in 0..<count {
+                        var duration: Int64 = 0
+                        if flags & 0x100 != 0 { duration = be32(b, p); p += 4 }
+                        if flags & 0x200 != 0 { p += 4 } // size
+                        if flags & 0x400 != 0 { p += 4 } // flags
+                        if flags & 0x800 != 0 {
+                            let raw = be32(b, p)
+                            // version 1 composition offsets are signed.
+                            let cto = version == 1 ? Int64(Int32(truncatingIfNeeded: raw)) : raw
+                            minPTS = min(minPTS, decode + cto)
+                            p += 4
+                        } else {
+                            minPTS = min(minPTS, decode)
+                        }
+                        decode += duration
+                        total += duration
+                    }
+                default:
+                    break
+                }
+            }
+            if trackID > 0 {
+                span.end = span.start + total
+                span.minPTS = span.start + (minPTS == Int64.max ? 0 : minPTS)
+                result[trackID] = span
+            }
+        }
+    }
+    return result
+}
+
+/// Per-track spans of one CUT, read out of its two rendition segments:
+/// the video rendition carries track 1, the audio rendition track 2.
+func cutSpans(_ video: Data, _ audio: Data?) -> [Int: TrackSpan] {
+    var spans = segmentSpans(video)
+    if let audio { for (id, span) in segmentSpans(audio) { spans[id] = span } }
+    return spans
+}
+
+/// The shared real-transport-stream fixture: H.264 with B-frames plus
+/// AAC-LC in MPEG-TS, built once per machine and cached in the temp dir.
+/// nil when ffmpeg is not installed.
+func continuityFixtureTS() -> Data? {
+    let ffmpeg = "/opt/homebrew/bin/ffmpeg"
+    guard FileManager.default.isExecutableFile(atPath: ffmpeg) else { return nil }
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cast-hls-continuity", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let ts = dir.appendingPathComponent("bframes.ts")
+    if !FileManager.default.fileExists(atPath: ts.path) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = [
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=40",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=40",
+            // B-frames on purpose: the composition offset of the first
+            // sample is what the receiver anchors a sequence-mode append
+            // on, and it is what used to push our audio below zero.
+            "-c:v", "libx264", "-preset", "veryfast", "-bf", "3", "-g", "90", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+            "-f", "mpegts", ts.path,
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+    guard let bytes = try? Data(contentsOf: ts), !bytes.isEmpty else { return nil }
+    return bytes
+}
+
+@MainActor func runSegmentContinuityChecks() {
+    guard let bytes = continuityFixtureTS() else {
+        print("SKIP segment-run continuity (no ffmpeg fixture)")
+        return
+    }
+
+    var segments: [(video: Data, audio: Data?)] = []
+    let remuxer = CastFMP4Remuxer()
+    remuxer.onDemuxedMediaSegments = { v, a, _, _ in segments.append((v, a)) }
+    var offset = 0
+    while offset < bytes.count {
+        let n = min(64 * 1024, bytes.count - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    expect(segments.count >= 6, "a real transport stream yields at least 6 segments (\(segments.count))")
+    guard segments.count >= 6 else { return }
+
+    // One AAC frame at 48 kHz: the largest quantization error the audio
+    // partition can carry at a segment boundary.
+    let frameTicks = 1024 * CastFMP4Remuxer.ticksPerSecond / 48_000
+    var previousVideoEnd: Int64 = -1
+    var previousAudioEnd: Int64 = -1
+    var audioNeverPrecedesVideo = true
+    var videoContiguous = true
+    var audioContiguous = true
+    var audioKeepsUp = true
+    for (index, segment) in segments.enumerated() {
+        let spans = cutSpans(segment.video, segment.audio)
+        guard let video = spans[1], let audio = spans[2] else {
+            expect(false, "segment \(index) carries both trafs")
+            return
+        }
+        if index == 0 {
+            // Property 1: a sequence-mode append anchors on video.minPTS,
+            // so any audio below it is dropped or truncated by Chromium.
+            if audio.start < video.minPTS { audioNeverPrecedesVideo = false }
+        } else {
+            // Property 2: no holes between appends, in either track.
+            if video.start != previousVideoEnd { videoContiguous = false }
+            if audio.start != previousAudioEnd { audioContiguous = false }
+        }
+        // The audio partition trails the video cut by at most a few
+        // frames; more than that and the seam starts accumulating.
+        if video.end - audio.end >= frameTicks * 9 { audioKeepsUp = false }
+        previousVideoEnd = video.end
+        previousAudioEnd = audio.end
+    }
+    expect(audioNeverPrecedesVideo, "no audio before the first video presentation time")
+    expect(videoContiguous, "video runs contiguously across every segment boundary")
+    expect(audioContiguous, "audio runs contiguously across every segment boundary")
+    expect(audioKeepsUp, "audio never trails the video cut by more than the frame quantum")
+}
+
+runSegmentContinuityChecks()
+
+// MARK: 9b. the channel-change splice leaves ONE contiguous range
+//
+// Measured on the Google TV Streamer (session22.txt, 17:23:50 and
+// 17:25:14): at every channel change the receiver reported a 122-123 ms
+// hole in its buffered range ("buffered=[38.072-43.937][44.060-51.358]"),
+// then flapped between seeking and BUFFERING and gap-jumped. The old
+// generation's audio stopped 103 ms before the EXTINF total its playlist
+// declared, because provider audio trails its video in the mux and the
+// audio for the outgoing segment's last ~120 ms was still queued for a
+// segment the channel change threw away. Shaka parses our
+// EXT-X-DISCONTINUITY with sequenceMode false and places the next
+// generation at the accumulated EXTINF position, so that shortfall is a
+// hole in the track INTERSECTION Chromium reports.
+
+/// A transport stream whose AUDIO timestamps trail its video by
+/// `audioLagSeconds` at the same position in the mux, which is what every
+/// measured provider feed looks like (session22.txt, gen 7: a segment
+/// starting at video dts 40.040 carried audio from 39.927). Built by
+/// offsetting the VIDEO input, so no timestamp is negative. 60 fps with
+/// one B-frame of reorder matches the measured feed's 16 to 34 ms
+/// presentation-over-decode offset, which with the 21.33 ms audio frame
+/// quantum is the irreducible part of the seam.
+func audioLagFixtureTS() -> Data? {
+    let ffmpeg = "/opt/homebrew/bin/ffmpeg"
+    guard FileManager.default.isExecutableFile(atPath: ffmpeg) else { return nil }
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cast-hls-continuity", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let ts = dir.appendingPathComponent("audiolag60.ts")
+    if !FileManager.default.fileExists(atPath: ts.path) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = [
+            "-y", "-v", "error",
+            "-itsoffset", "0.12",
+            "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=60:duration=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=30",
+            "-c:v", "libx264", "-preset", "veryfast", "-bf", "1", "-g", "120", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+            "-f", "mpegts", ts.path,
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+    guard let bytes = try? Data(contentsOf: ts), !bytes.isEmpty else { return nil }
+    return bytes
+}
+
+/// One ingest connection: feed `limit` bytes in wire-sized chunks, then
+/// the per-connection teardown the session always runs.
+@MainActor func ingestOneConnection(_ bytes: Data, limit: Int)
+    -> (segments: [(video: Data, audio: Data?)], durations: [Int64]) {
+    var segments: [(video: Data, audio: Data?)] = []
+    var durations: [Int64] = []
+    let remuxer = CastFMP4Remuxer()
+    remuxer.onDemuxedMediaSegments = { v, a, ticks, _ in
+        segments.append((v, a))
+        durations.append(ticks)
+    }
+    var offset = 0
+    while offset < limit {
+        let n = min(64 * 1024, limit - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    remuxer.release()
+    return (segments, durations)
+}
+
+@MainActor func runSpliceContinuityChecks() {
+    guard let bytes = audioLagFixtureTS() else {
+        print("SKIP channel-change splice continuity (no ffmpeg fixture)")
+        return
+    }
+    let frameTicks = 1024 * CastFMP4Remuxer.ticksPerSecond / 48_000
+
+    // The channel change lands mid-segment: the ingest stops partway
+    // through the stream, the session begins a new generation, and a fresh
+    // remuxer serves it (one remuxer per ingest connection).
+    let genA = ingestOneConnection(bytes, limit: Int(Double(bytes.count) * 0.6))
+    let genB = ingestOneConnection(bytes, limit: Int(Double(bytes.count) * 0.4))
+    expect(genA.segments.count >= 3, "generation A produced segments (\(genA.segments.count))")
+    expect(genB.segments.count >= 2, "generation B produced segments (\(genB.segments.count))")
+    guard genA.segments.count >= 3, genB.segments.count >= 2 else { return }
+
+    let playlistEndA = genA.durations.reduce(0, +)
+    let lastSegA = genA.segments[genA.segments.count - 1]
+    let lastA = cutSpans(lastSegA.video, lastSegA.audio)
+    let firstB = cutSpans(genB.segments[0].video, genB.segments[0].audio)
+    guard let videoA = lastA[1], let audioA = lastA[2],
+          let videoB = firstB[1], let audioB = firstB[2] else {
+        expect(false, "both generations carry both trafs at the seam")
+        return
+    }
+    // The old range ends at min(video end, audio end) and the new one
+    // starts at max(video start, audio start), because Chromium reports a
+    // two-track SourceBuffer as the INTERSECTION of its tracks.
+    let oldEnd = min(videoA.end, audioA.end)
+    let newStart = playlistEndA + max(videoB.minPTS, audioB.start)
+    let holeMs = Double(newStart - oldEnd) * 1000.0 / Double(CastFMP4Remuxer.ticksPerSecond)
+    print(String(format: "SPLICE HOLE %.1f ms (playlist end %ld, video end %ld, audio end %ld)",
+                 holeMs, playlistEndA, videoA.end, audioA.end))
+    // The generation's tail must end both tracks together, or the playlist
+    // promises media one of them does not have.
+    expect(abs(videoA.end - audioA.end) <= frameTicks,
+           "the generation tail ends video and audio within one audio frame "
+           + "(video \(videoA.end), audio \(audioA.end))")
+    // ONE contiguous range across the splice: 40 ms is inside what a
+    // single video reorder delay and a single audio frame allow, and far
+    // below the 122 ms hole the receiver flapped on.
+    expect(Double(newStart - oldEnd) < Double(CastFMP4Remuxer.ticksPerSecond) * 0.04,
+           String(format: "the splice hole is %.1f ms, under the 40 ms quantum", holeMs))
+}
+
+runSpliceContinuityChecks()
+
+// MARK: 10. near-future segment fetches are held, not 404ed
+//
+// A 404 makes Shaka drop the segment and re-sync to the live edge, which
+// skips segments; see the continuity notes above for why a skipped
+// segment freezes the picture.
+
+do {
+    let store = CastHLSSegmentStore()
+    let ticks: Int64 = 3 * 90_000
+    let gen = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen, video: Data("i".utf8), audio: nil)
+    for _ in 0..<3 {
+        store.addSegment(generation: gen, durationTicks: ticks, videoData: Data([1]), audioData: nil)
+    }
+    // nextSeq is 3; 3, 4 and 5 are inside the hold window, 6 is not.
+    let held = Date()
+    expectEq(store.awaitSegment(seq: 5, rendition: .video, timeout: 0.3), nil,
+             "two past the edge is held until timeout")
+    expect(Date().timeIntervalSince(held) >= 0.25, "two past the edge actually waited")
+    let fast = Date()
+    expectEq(store.awaitSegment(seq: 6, rendition: .video, timeout: 5), nil,
+             "three past the edge 404s fast")
+    expect(Date().timeIntervalSince(fast) < 0.2, "no hold beyond the future window")
+}
+
+
+// MARK: 11. the audio traf declares its samples as sync samples
+//
+// Chromium's parser reads sample flags from the trun, then the tfhd
+// default, then the trex default. Our audio trun carries no per-sample
+// flags, so the tfhd default is what decides whether the receiver treats
+// an AAC frame as a random access point. Without it Chromium logs, once
+// per frame, "indicated the frame is not a random access point (key
+// frame)" and the first packet after the load's seek fails to decode
+// (Google TV Streamer, 2026-09-12 14:22:20.237 and .246).
+
+/// default_sample_flags of one traf's tfhd, or nil when the box does not
+/// carry the field at all.
+func audioTfhdDefaultSampleFlags(_ segment: Data, trackID: Int64) -> Int64? {
+    let b = [UInt8](segment)
+    for (type, mStart, mEnd) in boxChildren(b, 0, b.count) where type == "moof" {
+        for (t2, tStart, tEnd) in boxChildren(b, mStart, mEnd) where t2 == "traf" {
+            for (t3, pStart, pEnd) in boxChildren(b, tStart, tEnd) where t3 == "tfhd" {
+                guard pEnd - pStart >= 8 else { continue }
+                let boxFlags = (Int64(b[pStart + 1]) << 16) | (Int64(b[pStart + 2]) << 8) | Int64(b[pStart + 3])
+                guard be32(b, pStart + 4) == trackID else { continue }
+                // Optional fields in ISO order; we never set the earlier
+                // ones, but skip them properly so the reader stays honest.
+                var o = pStart + 8
+                if boxFlags & 0x01 != 0 { o += 8 }
+                if boxFlags & 0x02 != 0 { o += 4 }
+                if boxFlags & 0x08 != 0 { o += 4 }
+                if boxFlags & 0x10 != 0 { o += 4 }
+                guard boxFlags & 0x20 != 0, o + 4 <= pEnd else { return nil }
+                return be32(b, o)
+            }
+        }
+    }
+    return nil
+}
+
+do {
+    // Two AAC frames is enough: the flags live in the tfhd, not per sample.
+    let remuxer = CastFMP4Remuxer()
+    var segment = Data()
+    remuxer.onDemuxedMediaSegments = { _, a, _, _ in
+        if segment.isEmpty, let a { segment = a }
+    }
+    if let fixture = continuityFixtureTS() {
+        var offset = 0
+        while offset < fixture.count, segment.isEmpty {
+            let n = min(64 * 1024, fixture.count - offset)
+            try? remuxer.feed(fixture.subdata(in: offset..<(offset + n)))
+            offset += n
+        }
+    }
+    if segment.isEmpty {
+        print("SKIP audio sync-sample flags (no fixture segment)")
+    } else if let flags = audioTfhdDefaultSampleFlags(segment, trackID: 2) {
+        // bit 16 is sample_is_non_sync_sample; it must be clear.
+        expect(flags & 0x0001_0000 == 0, "audio samples are declared sync samples")
+        // bits 25-24 are sample_depends_on; 2 is "does not depend on others".
+        expectEq(Int((flags >> 24) & 0x03), 2, "audio samples depend on no others")
+    } else {
+        expect(false, "the audio tfhd sets default-sample-flags")
+    }
+}
+
+// MARK: 8. AudioSpecificConfig sanitizing for the web receiver's parser
+
+do {
+    // Chromium re-parses the ASC we put in the esds while parsing moov
+    // (media/formats/mp4/aac.cc). Three values there fail the whole init
+    // append with "Append: stream parsing failed", so the builder must
+    // never emit them, whatever the ADTS header said.
+
+    // Plain AAC-LC 48 kHz stereo rides through untouched.
+    let stereo = CastFMP4Remuxer.sanitizedAACConfig(objectType: 2, freqIndex: 3, channelConfig: 2)
+    expectEq(stereo.asc, [0x11, 0x90], "AAC-LC 48k stereo ASC unchanged")
+    expectEq(stereo.sampleRate, 48_000, "48k sample rate")
+    expectEq(stereo.channels, 2, "stereo channel count")
+
+    // channelConfiguration 0 means "layout is in a program config
+    // element", which ffmpeg's AAC encoder emits for layouts outside
+    // Table 1.19 (2.1, 3.1, 6.1, 7.0). Chromium's SkipGASpecificConfig
+    // does RCHECK(channel_config_ != 0), so 0 must never reach the ASC.
+    let pce = CastFMP4Remuxer.sanitizedAACConfig(objectType: 2, freqIndex: 3, channelConfig: 0)
+    expectEq(pce.channelConfig, 2, "PCE-signalled layout (config 0) declared stereo")
+    expectEq(pce.channels, 2, "mp4a channelcount matches the ASC, not max(1, 0)")
+    expectEq(pce.asc, [0x11, 0x90], "config 0 never reaches the ASC")
+
+    // Reserved (13, 14) and escape (15) frequency indexes fail
+    // Chromium's frequency table lookup; 15's 24-bit explicit rate does
+    // not fit a 2-byte ASC at all. All fall back to index 3 / 48 kHz,
+    // which is what the frame-duration math already assumed.
+    for bad in [13, 14, 15, 99] {
+        let c = CastFMP4Remuxer.sanitizedAACConfig(objectType: 2, freqIndex: bad, channelConfig: 2)
+        expectEq(c.freqIndex, 3, "frequency index \(bad) falls back to 48 kHz index")
+        expectEq(c.sampleRate, 48_000, "frequency index \(bad) sample rate")
+    }
+
+    // audioObjectType must land in 1...4; 5 (HE-AAC) and 29 (HE-AACv2)
+    // need extension fields a 2-byte ASC cannot carry.
+    for bad in [0, 5, 29, 31] {
+        let c = CastFMP4Remuxer.sanitizedAACConfig(objectType: bad, freqIndex: 3, channelConfig: 2)
+        expectEq(c.objectType, 2, "object type \(bad) falls back to AAC-LC")
+    }
+    expectEq(CastFMP4Remuxer.sanitizedAACConfig(objectType: 1, freqIndex: 3, channelConfig: 2).objectType, 1,
+             "AAC Main (1) is in range and survives")
+
+    // channelConfiguration 7 is 7.1, so eight channels, not seven.
+    expectEq(CastFMP4Remuxer.sanitizedAACConfig(objectType: 2, freqIndex: 3, channelConfig: 7).channels, 8,
+             "config 7 is 7.1 (8 channels)")
+    // 44.1 kHz mono, to prove the index/rate pairing is not hardcoded.
+    let mono441 = CastFMP4Remuxer.sanitizedAACConfig(objectType: 2, freqIndex: 4, channelConfig: 1)
+    expectEq(mono441.sampleRate, 44_100, "index 4 is 44.1 kHz")
+    expectEq(mono441.channels, 1, "mono channel count")
+
+    // Exhaustive: over every value the 2-bit ADTS profile, 4-bit
+    // frequency index and 3-bit channel configuration fields can carry,
+    // the emitted ASC must decode back to values Chromium accepts.
+    var allSafe = true
+    for aot in 0...31 {
+        for fi in 0...15 {
+            for ch in 0...7 {
+                let c = CastFMP4Remuxer.sanitizedAACConfig(objectType: aot, freqIndex: fi, channelConfig: ch)
+                guard c.asc.count == 2 else { allSafe = false; continue }
+                let decodedAOT = Int(c.asc[0]) >> 3
+                let decodedFreq = ((Int(c.asc[0]) & 0x07) << 1) | (Int(c.asc[1]) >> 7)
+                let decodedChan = (Int(c.asc[1]) >> 3) & 0x0F
+                // The 3 low bits are GASpecificConfig: frameLengthFlag,
+                // dependsOnCoreCoder, extensionFlag, all zero.
+                let gaBits = Int(c.asc[1]) & 0x07
+                if !(1...4).contains(decodedAOT) { allSafe = false }
+                if decodedFreq > 12 { allSafe = false }
+                if decodedChan < 1 || decodedChan > 7 { allSafe = false }
+                if gaBits != 0 { allSafe = false }
+                if decodedAOT != c.objectType || decodedFreq != c.freqIndex
+                    || decodedChan != c.channelConfig { allSafe = false }
+            }
+        }
+    }
+    expect(allSafe, "every ADTS header value yields a Chromium-parseable 2-byte ASC")
+}
+
+// MARK: 12. NO EXT-X-PROGRAM-DATE-TIME, and a window Shaka can seek in
+//
+// PROGRAM-DATE-TIME was added on 2026-09-12 (a6a443f) and removed the
+// same day. The anchor it was derived from was the wall clock at the
+// moment a segment was STORED, one whole segment later than the media
+// that segment begins with, so every stamp ran a segment ahead of its
+// own media. Shaka makes a PDT the authority for segment POSITIONS
+// (hls_parser.js createSegments_ -> SegmentReference.syncAgainst, and
+// setInitialProgramDateTime in determineDuration_), so its live window
+// slid past the media in the buffer: the receiver reported
+// seek=[51.368-52.373] against buffered=[46.537-51.593] with the
+// playhead at 51.357, outside its own seek range, BUFFERING forever.
+//
+// These tests pin the shape the receiver needs instead: no absolute
+// clock at all, and a window whose MEDIA SPAN exceeds the receiver's
+// presentation delay, because Shaka's live seek range is
+//   [availEnd - segmentAvailabilityDuration, availEnd - presentationDelay]
+// (presentation_timeline.js getSafeSeekRangeStart / getSeekRangeEnd) with
+// segmentAvailabilityDuration taken from the window span
+// (hls_parser.js determineDuration_ -> getLiveDuration_). A window
+// narrower than the delay leaves no seek range at all.
+
+/// Every EXT-X-PROGRAM-DATE-TIME value in a playlist, in order.
+@MainActor func programDateTimes(_ playlist: String) -> [String] {
+    playlist.split(separator: "\n").compactMap { line in
+        line.hasPrefix("#EXT-X-PROGRAM-DATE-TIME:")
+            ? String(line.dropFirst("#EXT-X-PROGRAM-DATE-TIME:".count))
+            : nil
+    }
+}
+
+/// Total EXTINF seconds advertised by a playlist: the window media span
+/// Shaka turns into its availability duration.
+@MainActor func windowSpanSeconds(_ playlist: String) -> Double {
+    playlist.split(separator: "\n").compactMap { line -> Double? in
+        guard line.hasPrefix("#EXTINF:") else { return nil }
+        let value = line.dropFirst("#EXTINF:".count).split(separator: ",").first ?? ""
+        return Double(value)
+    }.reduce(0, +)
+}
+
+/// What the receiver page configures as Shaka's presentation delay
+/// (LIVE_START_BEHIND_SECONDS in receiver.html).
+let receiverPresentationDelay = 4.0
+
+do {
+    let store = CastHLSSegmentStore()
+    let ticks3s: Int64 = 3 * 90_000
+    let gen = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen, video: Data("init".utf8), audio: nil)
+    for _ in 0..<4 {
+        store.addSegment(generation: gen, durationTicks: ticks3s, videoData: Data([1]), audioData: nil)
+    }
+
+    let first = store.videoPlaylistText()
+    expectEq(programDateTimes(first).count, 0, "no EXT-X-PROGRAM-DATE-TIME on a live playlist")
+    // The load gate is four segments (CastHLSProxySession.readyMinSegments),
+    // so this is the narrowest window the receiver can ever see.
+    expectEq(windowSpanSeconds(first), 12.0, "four 3 s segments span 12 s of media")
+    expect(windowSpanSeconds(first) - receiverPresentationDelay >= 3.0,
+           "first window leaves a seek range at least one target duration wide")
+
+    // Slide the window: windowSize is 15, so sixteen more segments roll
+    // the first five out, and the span stays the full fifteen segments.
+    for _ in 0..<16 {
+        store.addSegment(generation: gen, durationTicks: ticks3s, videoData: Data([1]), audioData: nil)
+    }
+    let slid = store.videoPlaylistText()
+    expect(slid.contains("#EXT-X-MEDIA-SEQUENCE:5"), "window head advanced with the ring")
+    expectEq(programDateTimes(slid).count, 0, "still no PROGRAM-DATE-TIME after the window slid")
+    expectEq(windowSpanSeconds(slid), 45.0, "a full window spans fifteen segments")
+}
+
+// A playlist built across a discontinuity carries no absolute clock
+// either: the discontinuity plus the new EXT-X-MAP is the whole
+// timeline-and-codec change contract.
+do {
+    let store = CastHLSSegmentStore()
+    let ticks3s: Int64 = 3 * 90_000
+    let gen1 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen1, video: Data("i1".utf8), audio: nil)
+    for _ in 0..<2 {
+        store.addSegment(generation: gen1, durationTicks: ticks3s, videoData: Data([1]), audioData: nil)
+    }
+    let gen2 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen2, video: Data("i2".utf8), audio: nil)
+    for _ in 0..<2 {
+        store.addSegment(generation: gen2, durationTicks: ticks3s, videoData: Data([2]), audioData: nil)
+    }
+
+    let text = store.videoPlaylistText()
+    let lines = text.split(separator: "\n").map(String.init)
+    expectEq(programDateTimes(text).count, 0, "no PROGRAM-DATE-TIME across a splice")
+    if let discIndex = lines.firstIndex(of: "#EXT-X-DISCONTINUITY") {
+        expect(discIndex + 1 < lines.count
+               && lines[discIndex + 1].hasPrefix("#EXT-X-MAP:"),
+               "EXT-X-MAP immediately follows EXT-X-DISCONTINUITY")
+    } else {
+        expect(false, "EXT-X-MAP immediately follows EXT-X-DISCONTINUITY")
+    }
+}
+
+// onSegmentComposition against the real transport stream: the numbers the
+// proxy log prints must be non-negative (a negative presentation time is
+// exactly the audio-below-zero failure section 9 covers) and the playlist
+// timeline (segmentStartSeconds) must accumulate to the emitted durations.
+@MainActor func runSegmentCompositionChecks() {
+    guard let bytes = continuityFixtureTS() else {
+        print("SKIP onSegmentComposition timeline (no ffmpeg fixture)")
+        return
+    }
+    struct Composition {
+        let video: Int, audio: Int
+        let vdts: Double, vpts: Double, apts: Double, start: Double
+    }
+    var compositions: [Composition] = []
+    var durations: [Int64] = []
+    let remuxer = CastFMP4Remuxer()
+    remuxer.onSegmentComposition = { v, a, vdts, vpts, apts, start in
+        compositions.append(Composition(video: v, audio: a, vdts: vdts, vpts: vpts,
+                                        apts: apts, start: start))
+    }
+    remuxer.onDemuxedMediaSegments = { _, _, ticks, _ in durations.append(ticks) }
+    var offset = 0
+    while offset < bytes.count {
+        let n = min(64 * 1024, bytes.count - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    expect(compositions.count >= 6,
+           "onSegmentComposition fires for every segment (\(compositions.count))")
+    expectEq(compositions.count, durations.count,
+             "one composition callback per emitted segment")
+    guard compositions.count >= 6, compositions.count == durations.count else { return }
+
+    expect(compositions.allSatisfy { $0.vpts >= 0 },
+           "firstVideoPTSSeconds is non-negative for every segment")
+    expect(compositions.allSatisfy { $0.apts >= 0 },
+           "firstAudioPTSSeconds is non-negative for every segment (fixture has audio throughout)")
+    expect(compositions.allSatisfy { $0.vdts >= 0 && $0.video > 0 && $0.audio > 0 },
+           "every segment reports samples on both tracks at a non-negative DTS")
+    // The first segment of a generation starts the playlist timeline at 0.
+    expect(abs(compositions[0].start) < 1e-9, "the first segment starts the playlist timeline at 0")
+    // segmentStartSeconds accumulates to the sum of the emitted durations,
+    // within one 90 kHz tick.
+    let tick = 1.0 / Double(CastFMP4Remuxer.ticksPerSecond)
+    var running: Int64 = 0
+    var accumulates = true
+    for (index, c) in compositions.enumerated() {
+        if abs(c.start - Double(running) / Double(CastFMP4Remuxer.ticksPerSecond)) > tick {
+            accumulates = false
+        }
+        running += durations[index]
+    }
+    expect(accumulates, "segmentStartSeconds accumulates to the sum of the emitted durations")
+    let total = Double(running) / Double(CastFMP4Remuxer.ticksPerSecond)
+    let lastEnd = compositions[compositions.count - 1].start
+        + Double(durations[durations.count - 1]) / Double(CastFMP4Remuxer.ticksPerSecond)
+    expect(abs(total - lastEnd) <= tick,
+           "the last segment ends at the total emitted duration")
+}
+
+// MARK: 13. AAC program_config_element stripping
+//
+// Added 2026-09-12 after a Google TV Streamer cast of a Dispatcharr
+// "Web Player (AAC Audio)" channel played video with silence: the
+// server's ffmpeg (`-c:a aac -ac 2`) emits ADTS frames with
+// channel_configuration 0 and a program_config_element at the start of
+// every raw_data_block ("Using a PCE to encode channel layout"), and
+// C2SoftAacDec rejected all of them (5388 lines of "error 0x0005,
+// substituting silence"). Transcoding is not allowed and neither are
+// server changes, so the frames are fixed losslessly: parse the PCE,
+// take the real channel count from it, and drop its bytes off the front
+// of the block.
+
+/// A program_config_element built bit by bit: `front` front elements,
+/// every one a channel_pair_element, optionally one LFE, and a comment of
+/// `comment` bytes.
+/// Build a PCE from explicit element lists. `front`/`side`/`back` are
+/// (is_cpe, tag) pairs, `lfeTags` are LFE instance tags. The default is
+/// the Dispatcharr stereo shape: one front CPE, nothing else.
+func buildPCEElements(
+    freqIndex: Int = 3,
+    front: [(Int, Int)] = [(1, 0)],
+    side: [(Int, Int)] = [],
+    back: [(Int, Int)] = [],
+    lfeTags: [Int] = [],
+    comment: Int = 0
+) -> [UInt8] {
+    var bits: [Int] = []
+    func put(_ value: Int, _ width: Int) {
+        for i in stride(from: width - 1, through: 0, by: -1) { bits.append((value >> i) & 1) }
+    }
+    put(5, 3) // id_syn_ele = PCE
+    put(0, 4) // element_instance_tag
+    put(1, 2) // object_type (AAC-LC)
+    put(freqIndex, 4)
+    put(front.count, 4); put(side.count, 4); put(back.count, 4)
+    put(lfeTags.count, 2); put(0, 3); put(0, 4) // num_lfe/assoc_data/valid_cc
+    put(0, 1); put(0, 1); put(0, 1) // no mono/stereo/matrix mixdown
+    for (isCPE, tag) in front + side + back { put(isCPE, 1); put(tag, 4) }
+    for tag in lfeTags { put(tag, 4) } // lfe_element_tag
+    while bits.count % 8 != 0 { bits.append(0) } // byte_align()
+    put(comment, 8) // comment_field_bytes
+    for _ in 0..<comment { put(0x41, 8) }
+    var out: [UInt8] = []
+    for i in stride(from: 0, to: bits.count, by: 8) {
+        var b = 0
+        for j in 0..<8 { b = (b << 1) | bits[i + j] }
+        out.append(UInt8(b))
+    }
+    return out
+}
+
+func buildPCE(freqIndex: Int = 3, front: Int = 1, lfe: Int = 0, comment: Int = 0) -> [UInt8] {
+    var bits: [Int] = []
+    func put(_ value: Int, _ width: Int) {
+        for i in stride(from: width - 1, through: 0, by: -1) { bits.append((value >> i) & 1) }
+    }
+    put(5, 3) // id_syn_ele = PCE
+    put(0, 4) // element_instance_tag
+    put(1, 2) // object_type (AAC-LC)
+    put(freqIndex, 4)
+    put(front, 4); put(0, 4); put(0, 4) // num_front/side/back
+    put(lfe, 2); put(0, 3); put(0, 4) // num_lfe/assoc_data/valid_cc
+    put(0, 1); put(0, 1); put(0, 1) // no mono/stereo/matrix mixdown
+    for _ in 0..<front { put(1, 1); put(0, 4) } // is_cpe = 1, tag 0
+    for _ in 0..<lfe { put(0, 4) } // lfe_element_tag
+    while bits.count % 8 != 0 { bits.append(0) } // byte_align()
+    put(comment, 8) // comment_field_bytes
+    for _ in 0..<comment { put(0x41, 8) }
+    var out: [UInt8] = []
+    for i in stride(from: 0, to: bits.count, by: 8) {
+        var b = 0
+        for j in 0..<8 { b = (b << 1) | bits[i + j] }
+        out.append(UInt8(b))
+    }
+    return out
+}
+
+do {
+    // The Dispatcharr shape: one front CPE, nothing else, empty comment.
+    let pce = buildPCE()
+    let block = pce + [0x21, 0x00, 0x00, 0x00]
+    if let info = CastFMP4Remuxer.parseAACPCE(block, offset: 0, end: block.count) {
+        expectEq(info.channels, 2, "a stereo PCE reports two channels")
+        expectEq(info.lengthBytes, pce.count, "PCE length measured in whole bytes")
+        expect(info.firstIsCPE, "the first front element is a channel pair")
+    } else {
+        expect(false, "a stereo PCE parses")
+    }
+
+    // The property the lossless strip rests on: the element always ends on
+    // a byte boundary relative to the block start, whatever its element
+    // counts and comment length, because byte_align() precedes
+    // comment_field_bytes (ISO/IEC 14496-3 4.4.1.1). Only then can the
+    // rest of the block be copied byte-wise instead of shifted bit by bit.
+    var alwaysAligned = true
+    for comment in 0...3 {
+        for front in 1...3 {
+            for lfe in 0...1 {
+                let bytes = buildPCE(front: front, lfe: lfe, comment: comment)
+                let blk = bytes + [0x21, 0x00, 0x00, 0x00]
+                guard let info = CastFMP4Remuxer.parseAACPCE(blk, offset: 0, end: blk.count),
+                      info.lengthBytes == bytes.count,
+                      info.channels == front * 2 + lfe else {
+                    alwaysAligned = false
+                    continue
+                }
+            }
+        }
+    }
+    expect(alwaysAligned, "every PCE shape ends byte-aligned with the channel count the layout implies")
+
+    // id_syn_ele 0 (SCE), 1 (CPE) and 7 (TERM) are not PCEs: those frames
+    // must pass through untouched.
+    var nonPCEIgnored = true
+    for synEle in [0, 1, 2, 3, 4, 6, 7] {
+        let blk: [UInt8] = [UInt8(synEle << 5), 0x11, 0x22, 0x33]
+        if CastFMP4Remuxer.parseAACPCE(blk, offset: 0, end: blk.count) != nil { nonPCEIgnored = false }
+    }
+    expect(nonPCEIgnored, "a block that does not start with a PCE is reported as absent")
+
+    // A truncated element is refused rather than guessed at: a wrong
+    // length would shift the whole payload and silence the frame.
+    var truncationRefused = true
+    for cut in 1..<pce.count {
+        if CastFMP4Remuxer.parseAACPCE(pce, offset: 0, end: cut) != nil { truncationRefused = false }
+    }
+    expect(truncationRefused, "a truncated PCE is refused rather than guessed")
+
+    // Channel count back to a Table 1.19 configuration. 7 channels has no
+    // entry (config 7 is 7.1), so it falls to 0 and the sanitizer makes it
+    // stereo.
+    // Table 1.19 is an element ORDER plus tags, not a channel count. The
+    // layout ffmpeg emits for "5.1(side)" (measured: front CPE(0) +
+    // SCE(0), side SCE(1), back CPE(1), no LFE element) adds up to six
+    // channels and still matches no configuration, so it must report 0
+    // and be refused rather than stripped and declared as config 6, which
+    // ffmpeg's aac and aac_fixed decoders reject on 189 of 189 frames and
+    // the Google TV Streamer's C2SoftAacDec on 4360 of 4360.
+    let ffmpeg51Side = buildPCEElements(
+        front: [(1, 0), (0, 0)], side: [(0, 1)], back: [(1, 1)])
+    let side51Block = ffmpeg51Side + [0x21, 0x00, 0x00, 0x00]
+    let side51 = CastFMP4Remuxer.parseAACPCE(side51Block, offset: 0, end: side51Block.count)
+    expectEq(side51?.channels ?? -1, 6, "ffmpeg's 5.1(side) PCE declares six channels")
+    expectEq(side51?.impliedChannelConfig ?? -1, 0,
+        "ffmpeg's 5.1(side) element order matches no channel_configuration")
+    let real51 = buildPCEElements(
+        front: [(0, 0), (1, 0)], back: [(1, 1)], lfeTags: [0])
+    let real51Block = real51 + [0x21, 0x00, 0x00, 0x00]
+    let real51Info = CastFMP4Remuxer.parseAACPCE(real51Block, offset: 0, end: real51Block.count)
+    expectEq(real51Info?.impliedChannelConfig ?? -1, 6,
+        "a PCE that restates Table 1.19's 5.1 order is config 6 and strips safely")
+    let stereoPCE = CastFMP4Remuxer.parseAACPCE(
+        buildPCEElements() + [0x21, 0x00, 0x00, 0x00], offset: 0,
+        end: buildPCEElements().count + 4)
+    expectEq(stereoPCE?.impliedChannelConfig ?? -1, 2,
+        "the Dispatcharr stereo PCE is config 2")
+
+    expectEq(CastFMP4Remuxer.aacChannelConfig(forCount: 2), 2, "2 channels is config 2")
+    expectEq(CastFMP4Remuxer.aacChannelConfig(forCount: 6), 6, "6 channels is config 6 (5.1)")
+    expectEq(CastFMP4Remuxer.aacChannelConfig(forCount: 8), 7, "8 channels is config 7 (7.1)")
+    expectEq(CastFMP4Remuxer.aacChannelConfig(forCount: 7), 0, "7 channels has no configuration")
+    expectEq(CastFMP4Remuxer.sanitizedAACConfig(
+        objectType: 2, freqIndex: 3,
+        channelConfig: CastFMP4Remuxer.aacChannelConfig(forCount: 7)).channelConfig, 2,
+        "an unmappable count still yields a legal stereo ASC")
+}
+
+/// Rewrite every ADTS frame of `adts` to channel_configuration 0 with a
+/// stereo PCE spliced in ahead of the raw_data_block, growing
+/// aac_frame_length to match: byte for byte the shape Dispatcharr emits.
+///
+/// Synthesized rather than asked of ffmpeg because ffmpeg's AAC encoder
+/// refuses every two-channel layout outside plain stereo, so it cannot be
+/// made to produce this case locally. Synthesizing also buys the stronger
+/// assertion: the frames under the PCE are the untouched fixture's
+/// frames, so a correct strip has to reproduce them exactly.
+func injectPCE(_ adts: [UInt8]) -> [UInt8] {
+    var out: [UInt8] = []
+    var p = 0
+    while p + 7 <= adts.count {
+        let protectionAbsent = adts[p + 1] & 0x01 != 0
+        let headerLen = protectionAbsent ? 7 : 9
+        let freqIndex = (Int(adts[p + 2]) >> 2) & 0x0F
+        let frameLen = ((Int(adts[p + 3]) & 0x03) << 11) | (Int(adts[p + 4]) << 3)
+            | ((Int(adts[p + 5]) >> 5) & 0x07)
+        if frameLen < headerLen || p + frameLen > adts.count { break }
+        let pce = buildPCE(freqIndex: freqIndex)
+        let newLen = frameLen + pce.count
+        var header = Array(adts[p..<(p + headerLen)])
+        // channel_configuration is the low bit of byte 2 plus the top two
+        // bits of byte 3; zero all three, then restate the frame length.
+        header[2] &= 0xFE
+        header[3] &= 0x3F
+        header[3] = (header[3] & 0xFC) | UInt8((newLen >> 11) & 0x03)
+        header[4] = UInt8((newLen >> 3) & 0xFF)
+        header[5] = (header[5] & 0x1F) | UInt8((newLen & 0x07) << 5)
+        out += header
+        out += pce
+        out += Array(adts[(p + headerLen)..<(p + frameLen)])
+        p += frameLen
+    }
+    return out
+}
+
+/// The continuity fixture with its audio rewritten to carry a PCE, plus
+/// the untouched original, both as transport streams. nil without ffmpeg.
+func pceFixtureTS() -> (plain: Data, pce: Data)? {
+    let ffmpeg = "/opt/homebrew/bin/ffmpeg"
+    guard FileManager.default.isExecutableFile(atPath: ffmpeg) else { return nil }
+    guard let plain = continuityFixtureTS() else { return nil }
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cast-hls-continuity", isDirectory: true)
+    let pceTS = dir.appendingPathComponent("pce.ts")
+    if !FileManager.default.fileExists(atPath: pceTS.path) {
+        let source = dir.appendingPathComponent("bframes.ts")
+        let adts = dir.appendingPathComponent("plain.aac")
+        let injected = dir.appendingPathComponent("pce.aac")
+        func ffmpegRun(_ args: [String]) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ffmpeg)
+            process.arguments = args
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try? process.run()
+            process.waitUntilExit()
+        }
+        ffmpegRun(["-y", "-v", "error", "-i", source.path, "-map", "0:a", "-c", "copy",
+                   "-f", "adts", adts.path])
+        guard let raw = try? Data(contentsOf: adts) else { return nil }
+        try? Data(injectPCE([UInt8](raw))).write(to: injected)
+        ffmpegRun(["-y", "-v", "error", "-i", source.path, "-i", injected.path,
+                   "-map", "0:v", "-map", "1:a", "-c", "copy", "-f", "mpegts", pceTS.path])
+    }
+    guard let pce = try? Data(contentsOf: pceTS), !pce.isEmpty else { return nil }
+    return (plain, pce)
+}
+
+/// Every audio sample of every segment, cut out of the mdat with the
+/// second traf's trun sizes and data_offset.
+@MainActor func audioSampleHex(_ segments: [Data]) -> [String] {
+    var out: [String] = []
+    for segment in segments {
+        let b = [UInt8](segment)
+        var moofStart = -1
+        var o = 0
+        while o + 8 <= b.count {
+            let size = Int(be32(b, o))
+            if size < 8 { break }
+            if boxType(b, o) == "moof" { moofStart = o; break }
+            o += size
+        }
+        guard moofStart >= 0 else { continue }
+        let moofEnd = moofStart + Int(be32(b, moofStart))
+        let trafs = boxChildren(b, moofStart + 8, moofEnd).filter { $0.0 == "traf" }
+        // Demuxed audio segments carry a single traf; a muxed moof would
+        // carry audio second. Either way the audio traf is the last one.
+        guard let traf = trafs.last else { continue }
+        for child in boxChildren(b, traf.1, traf.2) where child.0 == "trun" {
+            let count = Int(be32(b, child.1 + 4))
+            // data_offset is relative to the moof start.
+            var cursor = moofStart + Int(be32(b, child.1 + 8))
+            var q = child.1 + 12
+            for _ in 0..<count {
+                let len = Int(be32(b, q + 4))
+                guard cursor + len <= b.count else { break }
+                out.append(b[cursor..<(cursor + len)].map { String(format: "%02x", $0) }.joined())
+                cursor += len
+                q += 8
+            }
+        }
+    }
+    return out
+}
+
+@MainActor func runPCEStripChecks() {
+    guard let fixtures = pceFixtureTS() else {
+        print("SKIP AAC PCE strip against a real transport stream (no ffmpeg fixture)")
+        return
+    }
+    func remux(_ bytes: Data) -> (init_: Data?, segments: [Data], logs: [String]) {
+        var segments: [Data] = []
+        var logs: [String] = []
+        var initSegment: Data?
+        let remuxer = CastFMP4Remuxer(log: { logs.append($0) })
+        // The AUDIO init is what the PCE decides: its esds carries the ASC.
+        remuxer.onDemuxedInitSegments = { _, a in initSegment = a }
+        remuxer.onDemuxedMediaSegments = { _, a, _, _ in if let a { segments.append(a) } }
+        var offset = 0
+        while offset < bytes.count {
+            let n = min(64 * 1024, bytes.count - offset)
+            try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+            offset += n
+        }
+        return (initSegment, segments, logs)
+    }
+    let plain = remux(fixtures.plain)
+    let pce = remux(fixtures.pce)
+
+    expect(pce.segments.count >= 6, "the PCE stream still segments (\(pce.segments.count))")
+    expect(pce.init_ != nil, "the PCE stream emits an audio init segment")
+    // Same declared track as the untouched stereo stream: the PCE said one
+    // front channel pair, so the ASC says config 2 and nothing about the
+    // init segment changes.
+    if let a = plain.init_, let b = pce.init_ {
+        expectEq([UInt8](b), [UInt8](a), "the PCE stream's init segment matches the stereo stream's")
+    }
+    // Announced once for the session, not once per frame.
+    let stripLogs = pce.logs.filter { $0.hasPrefix("AAC PCE stripped:") }
+    expectEq(stripLogs.count, 1, "the PCE strip is logged exactly once")
+    expectEq(stripLogs.first ?? "", "AAC PCE stripped: layout 2 ch matches config 2",
+             "the log line names the derived layout and config")
+    expect(plain.logs.filter { $0.hasPrefix("AAC PCE stripped:") }.isEmpty,
+           "a stream without a PCE logs no strip")
+
+    // Losslessness on the bytes: aligned by CONTENT, because every source
+    // frame grew by the PCE, which repacks the PES and shifts both the
+    // first frame that clears the video presentation gate and where the
+    // last partial segment ends. From the first shared frame onward the
+    // two sample streams must be the same frames in the same order.
+    let plainSamples = audioSampleHex(plain.segments)
+    let pceSamples = audioSampleHex(pce.segments)
+    expect(plainSamples.count >= 200, "audio samples extracted (\(plainSamples.count))")
+    guard let first = plainSamples.first, let offset = pceSamples.firstIndex(of: first) else {
+        expect(false, "the stereo run's first frame appears in the PCE run")
+        return
+    }
+    expect(true, "the stereo run's first frame appears in the PCE run")
+    let common = min(plainSamples.count, pceSamples.count - offset)
+    expect(common >= 200, "a long shared run to compare (\(common))")
+    var identical = true
+    for i in 0..<max(0, common) where plainSamples[i] != pceSamples[i + offset] { identical = false }
+    expect(identical, "every audio frame is byte-identical after the PCE strip")
+
+    // The decoder's verdict, not ours: init + segments written out as one
+    // fMP4 and fully decoded. ffmpeg prints nothing on a clean decode, so
+    // any AAC error (the "substituting silence" class of failure the
+    // Streamer hit) shows up here as output.
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cast-hls-continuity", isDirectory: true)
+    for (name, run) in [("pce-strip.mp4", pce), ("stereo.mp4", plain)] {
+        var file = Data()
+        file.append(run.init_ ?? Data())
+        for segment in run.segments.prefix(4) { file.append(segment) }
+        let url = dir.appendingPathComponent(name)
+        try? file.write(to: url)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+        process.arguments = ["-v", "error", "-i", url.path, "-f", "null", "-"]
+        let pipe = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = pipe
+        try? process.run()
+        let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        expect(text.isEmpty, "\(name) decodes with no ffmpeg errors: \(text)")
+    }
+
+    // The AudioSpecificConfig the esds carries: AAC-LC, 48 kHz, config 2.
+    // 0x05 is the DecoderSpecificInfo tag, then its 2-byte length-and-ASC.
+    if let initSegment = pce.init_ {
+        let b = [UInt8](initSegment)
+        var found = false
+        for i in 0..<max(0, b.count - 3) where b[i] == 0x05 && b[i + 1] == 0x02 {
+            if b[i + 2] == 0x11 && b[i + 3] == 0x90 { found = true }
+        }
+        expect(found, "the esds ASC says AAC-LC 48 kHz channel configuration 2")
+    }
+}
+
+runPCEStripChecks()
+
+
+// MARK: 14. audio frame census: nothing lost, nothing re-stamped
+//
+// Added 2026-09-13 after a live cast to the Google TV Streamer was
+// measured on the device: the media clock ratio read 1.0000 and Chromium
+// decoded 60 fps with zero drops, yet SurfaceFlinger presented about 47
+// fps and Chromium logged audio DEMUXER_UNDERFLOW. The proxy's
+// per-segment census was the tell: ESPNU 4.00 s segments carried 179 to
+// 189 AAC frames where 187.5 belong.
+//
+// Two defects produced that, and both are measured here:
+//
+//  1. The carried partial frame was re-stamped. A PES PTS describes the
+//     first access unit that COMMENCES in its payload, so a frame carried
+//     in from the previous PES must keep the running clock's time; riding
+//     the new PES PTS put it, and every follower, one frame late. On the
+//     real capture the mux makes this worse: every audio PES is stamped
+//     exactly 9600 ticks (five frames) after the one before it while
+//     about one PES in six carries six frames, so every such PES
+//     re-stamped a frame that had already been emitted.
+//  2. Audio that arrived after the cut keyframe was lost to the splicer.
+//     Provider audio trails its video, so a segment's last ~170 ms of
+//     audio was unparsed when the cut keyframe arrived, and those frames
+//     opened the NEXT segment below its own start. The cut now waits.
+//
+// The primary fixture is a real ESPNU capture of the Dispatcharr AAC
+// output profile; it is too large to check in, so the path is overridable
+// with CAST_TS_FIXTURE and the check skips when the capture is absent.
+// The synthetic fixture always runs: it packs audio PES at byte offsets
+// that ignore frame boundaries, which ffmpeg's own TS muxer never does.
+
+/// ADTS frames in a raw elementary stream, counted header by header.
+func countADTSFrames(_ b: [UInt8]) -> Int {
+    var p = 0
+    var n = 0
+    while p + 7 <= b.count {
+        if b[p] != 0xFF || (b[p + 1] & 0xF0) != 0xF0 { p += 1; continue }
+        let len = (Int(b[p + 3] & 0x03) << 11) | (Int(b[p + 4]) << 3) | (Int(b[p + 5]) >> 5)
+        if len <= 7 || p + len > b.count { p += 1; continue }
+        n += 1
+        p += len
+    }
+    return n
+}
+
+struct CensusResult {
+    var segments: [(video: Data, audio: Data?)] = []
+    var durations: [Int64] = []
+    var audioCounts: [Int] = []
+    var logs: [String] = []
+}
+
+@MainActor func censusRemux(_ bytes: Data) -> CensusResult {
+    var result = CensusResult()
+    let remuxer = CastFMP4Remuxer(log: { result.logs.append($0) })
+    remuxer.onDemuxedMediaSegments = { v, a, ticks, _ in
+        result.segments.append((v, a))
+        result.durations.append(ticks)
+    }
+    remuxer.onSegmentComposition = { _, audio, _, _, _, _ in result.audioCounts.append(audio) }
+    var offset = 0
+    while offset < bytes.count {
+        let n = min(64 * 1024, bytes.count - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    remuxer.release() // the generation's tail segment counts too
+    return result
+}
+
+/// Audio pts continuity across every segment boundary, plus the frames
+/// counted. Within a segment the trun's fixed durations make the timeline
+/// contiguous by construction, so the boundaries are what can break.
+@MainActor func censusChecks(_ label: String, _ result: CensusResult,
+                             inputFrames: Int, lossAllowance: Int, minSegments: Int) {
+    let frameTicks = 1024 * CastFMP4Remuxer.ticksPerSecond / 48_000
+    expect(result.segments.count >= minSegments,
+           "\(label): at least \(minSegments) segments (\(result.segments.count))")
+    guard result.segments.count >= minSegments else { return }
+
+    var contiguous = true
+    var previousEnd: Int64 = -1
+    var framesInBoxes = 0
+    for segment in result.segments {
+        guard let audioData = segment.audio, let audio = segmentSpans(audioData)[2] else { continue }
+        if previousEnd >= 0, abs(audio.start - previousEnd) > 1 { contiguous = false }
+        previousEnd = audio.end
+        framesInBoxes += Int((audio.end - audio.start) / frameTicks)
+    }
+    let output = result.audioCounts.reduce(0, +)
+    print("[census \(label)] input=\(inputFrames) output=\(output) segments=\(result.segments.count) "
+        + "per=\(result.audioCounts)")
+    expect(contiguous, "\(label): audio runs contiguously across every segment boundary")
+    expectEq(framesInBoxes, output, "\(label): every counted frame reached a segment")
+    expect(output >= inputFrames - lossAllowance,
+           "\(label): no audio frame lost (input \(inputFrames), output \(output), "
+         + "allowance \(lossAllowance))")
+    expect(output <= inputFrames, "\(label): output cannot exceed input")
+
+    // The emitted media is fully covered by audio: a lost frame shows up
+    // here as a shortfall even when the fixture's own ends are ragged.
+    let declared = result.durations.reduce(0, +)
+    let covered = Int64(output) * frameTicks
+    expect(covered >= declared - 2 * frameTicks,
+           String(format: "%@: audio covers %.3f s of the %.3f s declared", label,
+                  Double(covered) / 90_000.0, Double(declared) / 90_000.0))
+
+    // Per-segment census: every interior segment carries what its own
+    // duration calls for, to within the frame a boundary quantizes away.
+    var interiorOK = true
+    for (i, ticks) in result.durations.enumerated() {
+        if i == 0 || i == result.durations.count - 1 { continue }
+        let expected = Double(ticks) / Double(frameTicks)
+        let actual = Double(result.audioCounts[i])
+        if abs(expected - actual) > 1.5 { interiorOK = false }
+    }
+    expect(interiorOK, "\(label): every interior segment carries the frames its duration calls for")
+}
+
+// ---- the real capture ----
+
+@MainActor func runRealCaptureCensus() {
+    let ffmpeg = "/opt/homebrew/bin/ffmpeg"
+    let path = ProcessInfo.processInfo.environment["CAST_TS_FIXTURE"]
+        ?? "/private/tmp/claude-501/-Users-loganjones-Documents-xcode-iOSDev/4567b156-2e97-48d3-a8d7-44b0e9a3fd9a/scratchpad/espnu-aac-60s.ts"
+    guard FileManager.default.isExecutableFile(atPath: ffmpeg),
+          let bytes = try? Data(contentsOf: URL(fileURLWithPath: path)), !bytes.isEmpty else {
+        print("SKIP real-capture audio census (no capture at \(path))")
+        return
+    }
+    // The input frame count comes from the raw ADTS demux of the same
+    // stream, which is the provider's count by definition.
+    let adts = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cast-hls-census-espnu.aac")
+    if !FileManager.default.fileExists(atPath: adts.path) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = ["-y", "-v", "error", "-i", path,
+                             "-map", "0:a:0", "-c", "copy", "-f", "adts", adts.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+    guard let demuxed = try? Data(contentsOf: adts) else {
+        print("SKIP real-capture audio census (ffmpeg could not demux the ADTS)")
+        return
+    }
+    let input = countADTSFrames([UInt8](demuxed))
+    // Only the audio before the first kept video keyframe may go missing:
+    // one GOP of 59.94 fps video is 2.002 s, i.e. 94 AAC frames, plus the
+    // handful parsed before the init segment existed.
+    censusChecks("espnu", censusRemux(bytes), inputFrames: input, lossAllowance: 100, minSegments: 12)
+}
+
+runRealCaptureCensus()
+
+// ---- a synthetic stream whose every audio PES straddles frames ----
+
+struct CensusTSWriter {
+    private var out = Data()
+    private var continuity: [Int: Int] = [:]
+
+    var bytes: Data { out }
+
+    mutating func psi(pid: Int, table: [UInt8]) {
+        var section = [UInt8](repeating: 0xFF, count: 184)
+        section[0] = 0 // pointer_field
+        for (i, b) in table.enumerated() { section[i + 1] = b }
+        packet(pid: pid, body: section, pusi: true, adaptation: false)
+    }
+
+    mutating func pes(pid: Int, payload: [UInt8]) {
+        var off = 0
+        var pusi = true
+        while off < payload.count {
+            let n = min(184, payload.count - off)
+            var body: [UInt8]
+            if n == 184 {
+                body = Array(payload[off..<(off + n)])
+            } else {
+                // Stuff the short final packet with an adaptation field,
+                // the way a real mux does.
+                let stuffing = 184 - n
+                body = [UInt8](repeating: 0xFF, count: 184)
+                body[0] = UInt8(stuffing - 1)
+                if stuffing >= 2 { body[1] = 0 }
+                for i in 0..<n { body[stuffing + i] = payload[off + i] }
+            }
+            packet(pid: pid, body: body, pusi: pusi, adaptation: n != 184)
+            pusi = false
+            off += n
+        }
+    }
+
+    private mutating func packet(pid: Int, body: [UInt8], pusi: Bool, adaptation: Bool) {
+        let cc = continuity[pid] ?? 0
+        continuity[pid] = (cc + 1) & 0x0F
+        var p = [UInt8](repeating: 0, count: 188)
+        p[0] = 0x47
+        p[1] = UInt8((pusi ? 0x40 : 0) | ((pid >> 8) & 0x1F))
+        p[2] = UInt8(pid & 0xFF)
+        p[3] = UInt8((adaptation ? 0x30 : 0x10) | cc)
+        for i in 0..<184 { p[4 + i] = body[i] }
+        out.append(contentsOf: p)
+    }
+}
+
+func censusPTSBytes(_ marker: Int, _ ts: Int64) -> [UInt8] {
+    [UInt8((marker << 4) | (Int((ts >> 30) & 0x07) << 1) | 1),
+     UInt8((ts >> 22) & 0xFF),
+     UInt8((Int((ts >> 15) & 0x7F) << 1) | 1),
+     UInt8((ts >> 7) & 0xFF),
+     UInt8((Int(ts & 0x7F) << 1) | 1)]
+}
+
+func censusPES(streamID: Int, payload: [UInt8], pts: Int64, dts: Int64?) -> [UInt8] {
+    let stamps = dts == nil ? censusPTSBytes(2, pts) : censusPTSBytes(3, pts) + censusPTSBytes(1, dts!)
+    var body: [UInt8] = [0, 0, 1, UInt8(streamID), 0, 0, 0x80, dts == nil ? 0x80 : 0xC0,
+                         UInt8(stamps.count)]
+    body.append(contentsOf: stamps)
+    body.append(contentsOf: payload)
+    let length = body.count - 6
+    body[4] = UInt8((length >> 8) & 0xFF)
+    body[5] = UInt8(length & 0xFF)
+    return body
+}
+
+/// One ADTS AAC-LC 48 kHz stereo frame. The payload is constant filler
+/// that can never be mistaken for a syncword, so the remuxer's false-sync
+/// guard has nothing to trip on and the census counts frames.
+func censusADTSFrame(_ frameLen: Int) -> [UInt8] {
+    var f = [UInt8](repeating: 0x21, count: frameLen)
+    f[0] = 0xFF
+    f[1] = 0xF1 // MPEG-4, layer 00, no CRC
+    f[2] = UInt8((1 << 6) | (3 << 2)) // AAC-LC, 48 kHz, channel config high bit 0
+    f[3] = UInt8((1 << 6) | ((frameLen >> 11) & 0x03)) // channel config 2
+    f[4] = UInt8((frameLen >> 3) & 0xFF)
+    f[5] = UInt8(((frameLen & 0x07) << 5) | 0x1F)
+    f[6] = 0xFC
+    return f
+}
+
+func censusVideoAU(keyframe: Bool, hevc: Bool = false) -> [UInt8] {
+    let start: [UInt8] = [0, 0, 0, 1]
+    if hevc {
+        // VPS + SPS + PPS, then an IDR_W_RADL (19) or TRAIL_R (1) slice.
+        let ps = hevcParameterSets()
+        var slice = [UInt8](repeating: 0x10, count: 400)
+        slice[0] = keyframe ? 19 << 1 : 1 << 1
+        slice[1] = 0x01
+        return start + ps.vps + start + ps.sps + start + ps.pps + start + slice
+    }
+    let sps: [UInt8] = [0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x00, 0xF0, 0x11, 0x7E, 0xF0, 0x3C, 0x80]
+    let pps: [UInt8] = [0x68, 0xCE, 0x3C, 0x80]
+    var slice = [UInt8](repeating: 0x10, count: 400)
+    slice[0] = keyframe ? 0x65 : 0x41
+    return start + sps + start + pps + start + slice
+}
+
+/// A transport stream whose audio PES are cut at byte offsets that have
+/// nothing to do with frame boundaries, so the carry runs on nearly every
+/// PES. `audioLagTicks` delays the audio in MUX ORDER, which is what puts
+/// a segment's last frames behind the keyframe that cuts it.
+func straddlingCensusTS(videoFrames: Int, videoFrameTicks: Int64, gop: Int,
+                        frameLen: Int, audioLagTicks: Int64, hevc: Bool = false) -> (Data, Int) {
+    let frameTicks = 1024 * CastFMP4Remuxer.ticksPerSecond / 48_000
+    let base: Int64 = 10_000
+    var writer = CensusTSWriter()
+    let audioFrames = Int((Int64(videoFrames) * videoFrameTicks) / frameTicks) + 4
+    var es: [UInt8] = []
+    es.reserveCapacity(audioFrames * frameLen)
+    for _ in 0..<audioFrames { es.append(contentsOf: censusADTSFrame(frameLen)) }
+    let cuts = [frameLen * 2 + 57, frameLen * 3 - 31, frameLen + 7, frameLen * 4 + 13]
+    var audioPES: [(start: Int, end: Int, pts: Int64)] = []
+    var off = 0
+    var cut = 0
+    while off < es.count {
+        var end = min(off + cuts[cut % cuts.count], es.count)
+        cut += 1
+        let firstFrame = (off + frameLen - 1) / frameLen
+        // A payload in which no frame COMMENCES would be sent without a
+        // PTS and the remuxer drops unstamped PES, so grow this one until
+        // a frame starts in it.
+        while firstFrame * frameLen >= end, end < es.count {
+            end = min(end + cuts[cut % cuts.count], es.count)
+            cut += 1
+        }
+        if firstFrame * frameLen >= end { break }
+        audioPES.append((off, end, base + Int64(firstFrame) * frameTicks))
+        off = end
+    }
+    // PAT pointing at a PMT on pid 0x1000: H.264 (or HEVC) on 0x100, ADTS on 0x101.
+    let pat: [UInt8] = [0x00, 0xB0, 13, 0x00, 0x01, 0xC1, 0, 0, 0, 0x01, 0xF0, 0x00, 0, 0, 0, 0]
+    let pmtBody: [UInt8] = [0x00, 0x01, 0xC1, 0, 0,
+                            0xE1, 0x00, 0xF0, 0x00,
+                            hevc ? 0x24 : 0x1B, 0xE1, 0x00, 0xF0, 0x00,
+                            0x0F, 0xE1, 0x01, 0xF0, 0x00]
+    let pmt: [UInt8] = [0x02, 0xB0, UInt8(pmtBody.count + 4)] + pmtBody + [0, 0, 0, 0]
+    writer.psi(pid: 0, table: pat)
+    writer.psi(pid: 0x1000, table: pmt)
+    var next = 0
+    for i in 0..<videoFrames {
+        let dts = base + Int64(i) * videoFrameTicks
+        writer.pes(pid: 0x100, payload: censusPES(streamID: 0xE0,
+                                                  payload: censusVideoAU(keyframe: i % gop == 0, hevc: hevc),
+                                                  pts: dts, dts: dts))
+        while next < audioPES.count, audioPES[next].pts <= dts - audioLagTicks {
+            let a = audioPES[next]
+            writer.pes(pid: 0x101, payload: censusPES(streamID: 0xC0, payload: Array(es[a.start..<a.end]),
+                                                      pts: a.pts, dts: nil))
+            next += 1
+        }
+    }
+    while next < audioPES.count {
+        let a = audioPES[next]
+        writer.pes(pid: 0x101, payload: censusPES(streamID: 0xC0, payload: Array(es[a.start..<a.end]),
+                                                  pts: a.pts, dts: nil))
+        next += 1
+    }
+    return (writer.bytes, countADTSFrames(es))
+}
+
+@MainActor func runStraddleCensus() {
+    // 12 s of 30 fps video, a keyframe every second, 400-byte AAC frames.
+    // The loss allowance covers the fixture's ragged ends only: the head
+    // frames below the first video presentation time and the tail video
+    // that outlives the audio (one GOP, 48 frames).
+    let (aligned, alignedFrames) = straddlingCensusTS(videoFrames: 360, videoFrameTicks: 3_000,
+                                                      gop: 30, frameLen: 400, audioLagTicks: 0)
+    censusChecks("straddle", censusRemux(aligned), inputFrames: alignedFrames,
+                 lossAllowance: 52, minSegments: 3)
+
+    // The measured provider shape: audio about 170 ms behind its video in
+    // mux order, so every segment's last 8 frames parse after the cut.
+    let (trailing, trailingFrames) = straddlingCensusTS(videoFrames: 360, videoFrameTicks: 3_000,
+                                                        gop: 30, frameLen: 400, audioLagTicks: 15_300)
+    censusChecks("trailing", censusRemux(trailing), inputFrames: trailingFrames,
+                 lossAllowance: 52, minSegments: 3)
+}
+
+runStraddleCensus()
+
+// MARK: 15. the init segment declares a duration (no Chromium low delay)
+//
+// Added 2026-09-13: Chromium logged "Video rendering in low delay mode" for
+// our stream and SurfaceFlinger presented only about 46 of 60 fps on the
+// Google TV Streamer. mp4_stream_parser.cc reads liveness as kLive unless
+// mvex/mehd fragment_duration > 0, or mvhd duration is neither 0 nor the
+// all-ones sentinel, and kLive pins video_renderer_impl.cc to one buffered
+// frame with no underflow growth. The init segment therefore declares 24 h
+// in both boxes.
+
+@MainActor func runInitLivenessChecks() {
+    let (bytes, _) = straddlingCensusTS(videoFrames: 90, videoFrameTicks: 3_000,
+                                        gop: 30, frameLen: 400, audioLagTicks: 0)
+    var initSegment: Data?
+    var logs: [String] = []
+    let remuxer = CastFMP4Remuxer(log: { logs.append($0) })
+    remuxer.onDemuxedInitSegments = { v, _ in initSegment = v }
+    remuxer.onDemuxedMediaSegments = { _, _, _, _ in }
+    var offset = 0
+    while offset < bytes.count {
+        let n = min(64 * 1024, bytes.count - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    guard let initSegment else {
+        expect(false, "the fixture emits an init segment")
+        return
+    }
+    let b = [UInt8](initSegment)
+    func find(_ type: String) -> Int? {
+        let t = [UInt8](type.utf8)
+        guard b.count >= 4 else { return nil }
+        for i in 0...(b.count - 4) where Array(b[i..<(i + 4)]) == t { return i }
+        return nil
+    }
+    func u64(at i: Int) -> UInt64 {
+        var v: UInt64 = 0
+        for k in 0..<8 { v = (v << 8) | UInt64(b[i + k]) }
+        return v
+    }
+    let expected: UInt64 = 86_400 * UInt64(CastFMP4Remuxer.ticksPerSecond)
+
+    // mehd sits inside mvex, ahead of the trex boxes.
+    guard let mehd = find("mehd"), let mvex = find("mvex"), let trex = find("trex") else {
+        expect(false, "the init segment carries mvex with mehd before trex")
+        return
+    }
+    expect(mvex < mehd && mehd < trex, "mehd sits inside mvex, before the trex boxes")
+    // type(4) version+flags(4), then the 64-bit fragment_duration.
+    expect(b[mehd + 4] == 1, "mehd is version 1 (64-bit fragment_duration)")
+    expectEq(u64(at: mehd + 8), expected, "mehd fragment_duration is 24 h in the movie timescale")
+
+    // mvhd version 1: type(4) version+flags(4) creation(8) modification(8)
+    // timescale(4) duration(8).
+    guard let mvhd = find("mvhd") else {
+        expect(false, "the init segment carries mvhd")
+        return
+    }
+    expect(b[mvhd + 4] == 1, "mvhd is version 1 (64-bit duration)")
+    var timescale: UInt32 = 0
+    for k in 0..<4 { timescale = (timescale << 8) | UInt32(b[mvhd + 24 + k]) }
+    expectEq(timescale, UInt32(CastFMP4Remuxer.ticksPerSecond), "mvhd timescale unchanged")
+    let declared = u64(at: mvhd + 28)
+    expectEq(declared, expected, "mvhd duration matches mehd (not the all-ones sentinel)")
+    expect(declared != UInt64.max, "mvhd duration is not the unknown-duration sentinel")
+
+    expectEq(logs.filter { $0 == "video init: mehd 24h, liveness recorded" }.count, 1,
+             "the declared duration is logged once per generation")
+    expectEq(logs.filter { $0 == "audio init: mehd 24h, liveness recorded" }.count, 1,
+             "the audio rendition declares its duration too")
+}
+
+runInitLivenessChecks()
+
+// MARK: 13. DEMUXED renditions (2026-09-13)
+//
+// Measured on the Google TV Streamer's Cast runtime,
+// isTypeSupported("video/mp4; codecs=\"avc1.64002A,ac-3\"") and
+// isTypeSupported("video/mp4; codecs=\"ac-3\"") are both false, but
+// isTypeSupported("audio/mp4; codecs=\"ac-3\"") is TRUE, and Emby's web
+// receiver plays AC-3 through MediaCodecAudioDecoder from a separate audio
+// SourceBuffer. One muxed rendition can therefore only ever declare an AAC
+// codec string, which is what forces the server-side AAC output profile, so
+// the proxy now also serves the pair: vinit/vseg and ainit/aseg.
+//
+// The Android side runs the same renditions through ffprobe and through a
+// real headless Chromium's two SourceBuffers
+// (CastDemuxedRenditionTest). What is checked here is the part that has to
+// hold identically on both platforms: one traf per rendition segment, the
+// same moof sequence number across the three renditions of one cut,
+// identical playlist numbering, and an audio EXTINF within one frame of the
+// video one.
+
+/// Track IDs of every traf in a segment, in order.
+func trafTrackIDs(_ segment: Data) -> [Int64] {
+    let b = [UInt8](segment)
+    var out: [Int64] = []
+    for (type, mStart, mEnd) in boxChildren(b, 0, b.count) where type == "moof" {
+        for (t2, tStart, tEnd) in boxChildren(b, mStart, mEnd) where t2 == "traf" {
+            for (t3, pStart, _) in boxChildren(b, tStart, tEnd) where t3 == "tfhd" {
+                out.append(be32(b, pStart + 4))
+            }
+        }
+    }
+    return out
+}
+
+/// mfhd sequence_number of a segment.
+func moofSequenceNumber(_ segment: Data) -> Int64? {
+    let b = [UInt8](segment)
+    for (type, mStart, mEnd) in boxChildren(b, 0, b.count) where type == "moof" {
+        for (t2, pStart, _) in boxChildren(b, mStart, mEnd) where t2 == "mfhd" {
+            return be32(b, pStart + 4)
+        }
+    }
+    return nil
+}
+
+/// trun sample counts of a segment, in traf order.
+func trunSampleCounts(_ segment: Data) -> [Int64] {
+    let b = [UInt8](segment)
+    var out: [Int64] = []
+    for (type, mStart, mEnd) in boxChildren(b, 0, b.count) where type == "moof" {
+        for (t2, tStart, tEnd) in boxChildren(b, mStart, mEnd) where t2 == "traf" {
+            for (t3, pStart, _) in boxChildren(b, tStart, tEnd) where t3 == "trun" {
+                out.append(be32(b, pStart + 4))
+            }
+        }
+    }
+    return out
+}
+
+@MainActor func runDemuxedRenditionChecks() {
+    guard let bytes = continuityFixtureTS() else {
+        print("SKIP demuxed renditions (no ffmpeg fixture)")
+        return
+    }
+    var videoSegments: [Data] = []
+    var audioSegments: [Data] = []
+    var videoTicks: [Int64] = []
+    var audioTicks: [Int64] = []
+    var videoInit: Data?
+    var audioInit: Data?
+    let remuxer = CastFMP4Remuxer()
+    remuxer.onDemuxedInitSegments = { v, a in videoInit = v; audioInit = a }
+    remuxer.onDemuxedMediaSegments = { v, a, vTicks, aTicks in
+        videoSegments.append(v)
+        if let a { audioSegments.append(a) }
+        videoTicks.append(vTicks)
+        audioTicks.append(aTicks)
+    }
+    var offset = 0
+    while offset < bytes.count {
+        let n = min(64 * 1024, bytes.count - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    remuxer.release()
+
+    expect(videoInit != nil && audioInit != nil, "demuxed: both init segments emitted")
+    expect(videoSegments.count >= 3, "demuxed: segments produced (\(videoSegments.count))")
+    expectEq(videoSegments.count, audioSegments.count, "demuxed: one audio segment per video segment")
+
+    // The audio-only moov declares the audio track and nothing else; the
+    // video-only moov the reverse. A stray second trak is what would make
+    // the receiver's codec string a lie again.
+    if let videoInit, let audioInit {
+        let vTraks = boxChildren([UInt8](videoInit), 0, videoInit.count)
+            .filter { $0.0 == "moov" }
+            .flatMap { boxChildren([UInt8](videoInit), $0.1, $0.2) }
+            .filter { $0.0 == "trak" }
+        let aTraks = boxChildren([UInt8](audioInit), 0, audioInit.count)
+            .filter { $0.0 == "moov" }
+            .flatMap { boxChildren([UInt8](audioInit), $0.1, $0.2) }
+            .filter { $0.0 == "trak" }
+        expectEq(vTraks.count, 1, "demuxed: the video init declares one trak")
+        expectEq(aTraks.count, 1, "demuxed: the audio init declares one trak")
+        expectEq(CastHLSSegmentStore.audioCodecString(from: audioInit), "mp4a.40.2",
+                 "demuxed: the audio init's sample entry names the codec")
+        expect(CastHLSSegmentStore.audioCodecString(from: videoInit) == nil,
+               "demuxed: the video init carries no audio sample entry")
+        // The mehd/mvhd 24 h declared duration survives into BOTH
+        // renditions: without it Chromium reads liveness as kLive and pins
+        // the video renderer to one buffered frame.
+        expect(videoInit.range(of: Data("mehd".utf8)) != nil, "demuxed: the video init keeps mehd")
+        expect(audioInit.range(of: Data("mehd".utf8)) != nil, "demuxed: the audio init keeps mehd")
+    }
+
+    var oneTraf = true
+    var rightTrack = true
+    var sameSequence = true
+    for i in videoSegments.indices {
+        if trafTrackIDs(videoSegments[i]) != [1] { oneTraf = false; rightTrack = false }
+        if trafTrackIDs(audioSegments[i]) != [2] { oneTraf = false; rightTrack = false }
+        let seqs = [moofSequenceNumber(videoSegments[i]),
+                    moofSequenceNumber(audioSegments[i])]
+        if Set(seqs).count != 1 { sameSequence = false }
+    }
+    expect(oneTraf, "demuxed: exactly one traf per rendition segment")
+    expect(rightTrack, "demuxed: each rendition names the track it always did")
+    expect(sameSequence, "demuxed: both renditions of a cut share one moof sequence")
+
+    // Audio census per segment, the rule the muxed shape already obeys: the
+    // frames in the segment add up to the duration the playlist declares.
+    var frames: Int64 = 0
+    var ticks: Int64 = 0
+    for i in audioSegments.indices {
+        frames += trunSampleCounts(audioSegments[i]).reduce(0, +)
+        ticks += audioTicks[i]
+    }
+    let frameTicks = frames > 0 ? Double(ticks) / Double(frames) : 0
+    var censusOK = frames > 0
+    for i in audioSegments.indices {
+        let count = Double(trunSampleCounts(audioSegments[i]).reduce(0, +))
+        let expected = Double(audioTicks[i]) / max(1, frameTicks)
+        if abs(expected - count) > 1.0 { censusOK = false }
+    }
+    expect(censusOK, "demuxed: every audio segment carries the frames its EXTINF calls for")
+
+    // And the playlists the store builds from them.
+    let store = CastHLSSegmentStore()
+    let gen = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen, video: videoInit ?? Data(), audio: audioInit)
+    for i in videoSegments.indices {
+        _ = store.addSegment(generation: gen, durationTicks: videoTicks[i],
+                             videoData: videoSegments[i],
+                             audioData: i < audioSegments.count ? audioSegments[i] : nil,
+                             audioDurationTicks: audioTicks[i])
+    }
+    let master = store.demuxedMasterPlaylistText()
+    expect(master.contains("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\""),
+           "demuxed master: advertises the audio rendition")
+    expect(master.contains("URI=\"audio.m3u8\"") && master.contains("AUDIO=\"aud\""),
+           "demuxed master: binds the audio group to the variant")
+    expect(master.contains(",mp4a.40.2\""), "demuxed master: CODECS names the audio honestly")
+    expect(master.contains("CLOSED-CAPTIONS=NONE"), "demuxed master: keeps Shaka's CEA parser off")
+    expect(master.hasSuffix("video.m3u8\n"), "demuxed master: points at the video rendition")
+
+    let videoPlaylist = store.videoPlaylistText()
+    let audioPlaylist = store.audioPlaylistText()
+    for (name, text) in [("video", videoPlaylist), ("audio", audioPlaylist)] {
+        let target = text.components(separatedBy: "\n")
+            .first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+            .flatMap { Int($0.dropFirst("#EXT-X-TARGETDURATION:".count)) } ?? -1
+        expect(text.contains("#EXT-X-TARGETDURATION:\(target)\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=NO,HOLD-BACK="
+                             + String(format: "%.3f", Double(target * 3)) + "\n#EXT-X-MEDIA-SEQUENCE:"),
+               "demuxed playlists: \(name) states HOLD-BACK at three target durations")
+    }
+    func matches(_ text: String, _ pattern: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = text as NSString
+        return re.matches(in: text, range: NSRange(location: 0, length: ns.length)).map {
+            ns.substring(with: $0.range(at: 1))
+        }
+    }
+    let vSeqs = matches(videoPlaylist, "vseg([0-9]+)\\.m4s")
+    let aSeqs = matches(audioPlaylist, "aseg([0-9]+)\\.m4s")
+    expect(!vSeqs.isEmpty, "demuxed playlists: the window is populated")
+    expectEq(vSeqs, aSeqs, "demuxed playlists: identical sequence numbering")
+    expectEq(matches(videoPlaylist, "#EXT-X-MEDIA-SEQUENCE:([0-9]+)"),
+             matches(audioPlaylist, "#EXT-X-MEDIA-SEQUENCE:([0-9]+)"),
+             "demuxed playlists: identical MEDIA-SEQUENCE")
+    expectEq(matches(videoPlaylist, "#EXT-X-TARGETDURATION:([0-9]+)"),
+             matches(audioPlaylist, "#EXT-X-TARGETDURATION:([0-9]+)"),
+             "demuxed playlists: identical TARGETDURATION")
+    expect(videoPlaylist.contains("#EXT-X-MAP:URI=\"vinit"), "demuxed playlists: video maps vinit")
+    expect(audioPlaylist.contains("#EXT-X-MAP:URI=\"ainit"), "demuxed playlists: audio maps ainit")
+    let vExtinf = matches(videoPlaylist, "#EXTINF:([0-9.]+)").compactMap(Double.init)
+    let aExtinf = matches(audioPlaylist, "#EXTINF:([0-9.]+)").compactMap(Double.init)
+    var extinfOK = vExtinf.count == aExtinf.count && !vExtinf.isEmpty
+    let frameSeconds = frameTicks / Double(CastFMP4Remuxer.ticksPerSecond)
+    // The generation's first segment is exempt: audio starts a little
+    // after video there (the first-segment offset). The window used to
+    // be short enough to have slid past it; at 15 segments it still lists it.
+    let firstListed = matches(videoPlaylist, "#EXT-X-MEDIA-SEQUENCE:([0-9]+)").first.flatMap { Int($0) } ?? 0
+    for i in vExtinf.indices where i < aExtinf.count && !(firstListed == 0 && i == 0) {
+        if abs(vExtinf[i] - aExtinf[i]) > frameSeconds + 0.001 { extinfOK = false }
+    }
+    expect(extinfOK, "demuxed playlists: EXTINF differs by less than one audio frame")
+}
+
+runDemuxedRenditionChecks()
+
+final class StoreRef: @unchecked Sendable {
+    var store: CastHLSSegmentStore?
+}
+
+final class LockedLines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    func append(_ s: String) { lock.lock(); lines.append(s); lock.unlock() }
+    var all: [String] { lock.lock(); defer { lock.unlock() }; return lines }
+}
+
+// MARK: generation splice with a held live-edge fetch (incident 2026-09-25)
+
+do {
+    let logs = LockedLines()
+    let storeRef = StoreRef()
+    // The log closure reads the store back: with the old log-under-lock
+    // beginGeneration this self-deadlocked on the non-recursive NSCondition.
+    let store = CastHLSSegmentStore(log: { line in
+        _ = storeRef.store?.currentReadyState
+        logs.append(line)
+    })
+    storeRef.store = store
+    let ticks: Int64 = 5 * CastFMP4Remuxer.ticksPerSecond
+    let gen1 = store.beginGeneration()
+    for _ in 0..<3 {
+        store.addSegment(generation: gen1, durationTicks: ticks, videoData: Data([1]), audioData: Data([1]))
+    }
+    // A receiver fetch for seq 3 is held at the live edge while the
+    // ingest drops, reconnects as gen 2 and publishes seq 3 from it. The
+    // splice's log closure re-enters the store (it runs outside the lock
+    // now), and a stale gen-1 add in the gap is gated without waking the
+    // waiter with the wrong bytes.
+    let spliceDone = DispatchSemaphore(value: 0)
+    let splicer = Thread {
+        Thread.sleep(forTimeInterval: 0.1)
+        store.addSegment(generation: gen1, durationTicks: ticks, videoData: Data([7]), audioData: nil)
+        let gen2 = store.beginGeneration()
+        _ = store.videoPlaylistText() // from the log path's thread: must not deadlock
+        Thread.sleep(forTimeInterval: 0.1)
+        _ = store.addSegment(generation: gen1, durationTicks: ticks, videoData: Data([8]), audioData: nil)
+        store.setDemuxedInitSegments(generation: gen2, video: Data([0x76]), audio: Data([0x61]))
+        store.addSegment(generation: gen2, durationTicks: ticks, videoData: Data([2]), audioData: Data([3]))
+        spliceDone.signal()
+    }
+    splicer.start()
+    let began = Date()
+    // seq 3 was published by gen 1 at 0.1 s: the held fetch resolves then.
+    expectEq(store.awaitSegment(seq: 3, rendition: .video, timeout: 3), Data([7]),
+             "splice: held fetch resolves with the last old-generation segment")
+    // seq 4 is held across the roll and resolves with the NEW generation's bytes.
+    expectEq(store.awaitSegment(seq: 4, rendition: .audio, timeout: 3), Data([3]),
+             "splice: fetch held across the generation roll resolves from gen 2")
+    expect(Date().timeIntervalSince(began) < 2, "splice: held fetches did not sleep out their timeout")
+    expect(spliceDone.wait(timeout: .now() + 3) == .success, "splice: publisher finished (no deadlock)")
+    expect(logs.all.contains { $0.hasPrefix("splice oldGen=1 newGen=2 lastSeq=3 firstNewSeq=4") },
+           "splice: log line intact: \(logs.all)")
+    expect(store.videoPlaylistText().contains("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"vinit2.mp4\""),
+           "splice: discontinuity into gen 2 advertised")
+    // Teardown wakes a fetch still held after the splice.
+    let closer = Thread { Thread.sleep(forTimeInterval: 0.1); store.close() }
+    closer.start()
+    let t = Date()
+    expectEq(store.awaitSegment(seq: 5, rendition: .video, timeout: 5), nil, "splice: close fails a held fetch")
+    expect(Date().timeIntervalSince(t) < 1, "splice: close wakes the waiter promptly")
+}
+
+// MARK: composite segment profile (round 6, 2026-10-07)
+
+do {
+    let tps = CastFMP4Remuxer.ticksPerSecond
+    // Standard rounding is unchanged: 3.03 s rounds UP to 4.
+    expectEq(CastHLSSegmentStore.targetDurationSeconds(spans: [tps * 303 / 100], nearest: false), 4,
+             "profile: standard TARGETDURATION rounds up")
+    expectEq(CastHLSSegmentStore.targetDurationSeconds(spans: [tps * 1033 / 1000, tps], nearest: true), 1,
+             "profile: composite TARGETDURATION rounds to the nearest second")
+    expectEq(CastHLSSegmentStore.targetDurationSeconds(spans: [tps * 49 / 100], nearest: true), 1,
+             "profile: composite TARGETDURATION never below 1")
+    expectEq(CastSegmentProfile.standard.targetSegmentTicks, 3 * tps, "profile: standard cut target stays 3 s")
+    expectEq(CastSegmentProfile.composite.targetSegmentTicks, tps, "profile: composite cut target 1 s")
+
+    // A single-channel cast (4.004 s seg) then the composite (1.033 s cuts),
+    // the device log 2026-10-07 15:10:27 shape.
+    let store = CastHLSSegmentStore()
+    let gen1 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen1, video: Data([0x76]), audio: Data([0x61]))
+    store.addSegment(generation: gen1, durationTicks: 360_360, videoData: Data([1]), audioData: Data([1]))
+    let standardText = store.videoPlaylistText()
+    expect(standardText.contains("#EXT-X-TARGETDURATION:5\n") && standardText.contains("HOLD-BACK=15.000"),
+           "profile: a standard generation keeps ceil rounding (4.004 s -> 5, HOLD-BACK 15)")
+    let gen2 = store.beginGeneration()
+    store.setProfile(generation: gen2, .composite)
+    store.setDemuxedInitSegments(generation: gen2, video: Data([0x76]), audio: Data([0x61]))
+    for i in 0..<40 {
+        store.addSegment(generation: gen2, durationTicks: i % 2 == 0 ? 92_970 : 90_000,
+                         videoData: Data([2]), audioData: Data([3]), audioDurationTicks: 91_000)
+    }
+    for text in [store.videoPlaylistText(), store.audioPlaylistText()] {
+        expect(text.contains("#EXT-X-TARGETDURATION:1\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=NO,HOLD-BACK=3.000\n"),
+               "profile: composite playlist states TARGETDURATION 1, HOLD-BACK 3")
+        expect(!text.contains("seg0.m4s") && !text.contains("init1.mp4"),
+               "profile: the leftover channel segment is not listed while the composite runs")
+        expectEq(text.components(separatedBy: "#EXTINF:").count - 1, CastHLSSegmentStore.compositeWindowSize,
+                 "profile: composite window lists 30 one-second segments")
+        expect(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"),
+               "profile: the trimmed splice is counted in DISCONTINUITY-SEQUENCE")
+    }
+    // Composite ring keeps 33 segments; the oldest is gone.
+    expectEq(store.awaitSegment(seq: 40 - 32, rendition: .video, timeout: 0), Data([2]),
+             "profile: composite ring retains 33 segments")
+    expectEq(store.awaitSegment(seq: 1, rendition: .video, timeout: 0), nil,
+             "profile: composite ring evicts past 33 segments")
+    // Back to a channel: standard rounding and window again.
+    let gen3 = store.beginGeneration()
+    store.setDemuxedInitSegments(generation: gen3, video: Data([0x76]), audio: Data([0x61]))
+    store.addSegment(generation: gen3, durationTicks: 3 * tps, videoData: Data([4]), audioData: Data([4]))
+    let back = store.videoPlaylistText()
+    expect(back.contains("#EXT-X-TARGETDURATION:3\n") && back.contains("HOLD-BACK=9.000"),
+           "profile: a channel after the composite advertises its own ceil target")
+    expectEq(back.components(separatedBy: "#EXTINF:").count - 1, CastHLSSegmentStore.windowSize,
+             "profile: standard window size after the composite")
+}
+
+// MARK: 16. AirPlay LAN audio rewrite (2026-09-26)
+//
+// AirPlay always serves the TS LAN playlist; for an AAC receiver the LAN
+// copy of each segment carries AAC-LC stereo as ADTS PES on the source
+// audio PID. Checked here: CRC-32/MPEG-2, the PMT rewrite, ADTS headers,
+// PES packetization (CC, stuffing, PTS) and one synthetic segment end to
+// end with the fake transcoder.
+
+func tsPacket(pid: Int, pusi: Bool, cc: UInt8, payload: [UInt8]) -> [UInt8] {
+    precondition(payload.count <= 184)
+    var p: [UInt8] = [0x47, UInt8((pusi ? 0x40 : 0) | (pid >> 8)), UInt8(pid & 0xFF), 0x10 | cc]
+    p.append(contentsOf: payload)
+    p.append(contentsOf: [UInt8](repeating: 0xFF, count: 188 - p.count))
+    return p
+}
+
+func psiPacket(pid: Int, section body: [UInt8]) -> [UInt8] {
+    var section = body
+    let len = section.count - 3 + 4
+    section[1] = 0xB0 | UInt8(len >> 8)
+    section[2] = UInt8(len & 0xFF)
+    let crc = TSLANAudioRewriter.crc32MPEG(section)
+    section += [UInt8(crc >> 24), UInt8((crc >> 16) & 0xFF), UInt8((crc >> 8) & 0xFF), UInt8(crc & 0xFF)]
+    return tsPacket(pid: pid, pusi: true, cc: 0, payload: [0x00] + section)
+}
+
+/// Video 0x100 (PCR), AC-3 0x101 (language + AC-3 registration), AC-3 0x102.
+func syntheticPMT() -> [UInt8] {
+    var s: [UInt8] = [0x02, 0, 0, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x00, 0xF0, 0x00]
+    s += [0x1B, 0xE1, 0x00, 0xF0, 0x00]
+    let desc: [UInt8] = [0x0A, 4, 0x65, 0x6E, 0x67, 0x00, 0x05, 4, 0x41, 0x43, 0x2D, 0x33]
+    s += [0x81, 0xE1, 0x01, 0xF0, UInt8(desc.count)] + desc
+    s += [0x81, 0xE1, 0x02, 0xF0, 0x00]
+    return psiPacket(pid: 0x1000, section: s)
+}
+
+func syntheticPAT() -> [UInt8] {
+    psiPacket(pid: 0, section: [0x00, 0, 0, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xF0, 0x00])
+}
+
+/// One AC-3 syncframe: 48 kHz, 64 kbps (256 bytes), 2/0 stereo.
+func ac3Frame() -> [UInt8] {
+    var f = [UInt8](repeating: 0x21, count: 256)
+    f[0] = 0x0B; f[1] = 0x77; f[2] = 0; f[3] = 0
+    f[4] = 0x08       // fscod 0 (48 kHz), frmsizecod 8 (64 kbps)
+    f[5] = 0x40       // bsid 8, bsmod 0
+    f[6] = 0x40       // acmod 2, dsurmod 0, lfeon 0
+    return f
+}
+
+func pesBytes(streamID: UInt8, pts: Int64, payload: [UInt8]) -> [UInt8] {
+    [0, 0, 1, streamID, 0, 0, 0x80, 0x80, 5] + TSLANAudioRewriter.encodePTS(pts) + payload
+}
+
+/// Split a PES into full-payload packets; the last is 0xFF-filled (the
+/// rewriter parses by syncword and length, so filler after it is harmless).
+func packetsFor(pid: Int, pes: [UInt8]) -> [[UInt8]] {
+    var out: [[UInt8]] = []
+    var o = 0
+    var cc: UInt8 = 0
+    while o < pes.count {
+        let n = min(184, pes.count - o)
+        out.append(tsPacket(pid: pid, pusi: o == 0, cc: cc, payload: Array(pes[o..<(o + n)])))
+        cc = (cc + 1) & 0x0F
+        o += n
+    }
+    return out
+}
+
+@MainActor func runLANAudioRewriteChecks() {
+    // CRC-32/MPEG-2 check value.
+    expectEq(TSLANAudioRewriter.crc32MPEG(Array("123456789".utf8)), 0x0376_E6E7, "lan-audio: CRC-32/MPEG-2 check value")
+
+    // PMT rewrite.
+    let pmt = syntheticPMT()
+    let before = TSLANAudioRewriter.parsePMT(pmt)
+    expectEq(before?.audio.count, 2, "lan-audio: synthetic PMT has two audio PIDs")
+    guard let rewritten = TSLANAudioRewriter.rewritePMT(pmt, targetPID: 0x101) else {
+        expect(false, "lan-audio: PMT rewrite produced a packet"); return
+    }
+    expectEq(rewritten.count, 188, "lan-audio: rewritten PMT is one packet")
+    let after = TSLANAudioRewriter.parsePMT(rewritten)
+    expectEq(after?.audio, [TSLANAudioRewriter.PMTInfo.AudioES(pid: 0x101, type: 0x0F)],
+             "lan-audio: PMT names only PID 0x101, as stream_type 0x0F")
+    expectEq(after?.videoPID, 0x100, "lan-audio: video entry kept")
+    expectEq(after?.pcrPID, 0x100, "lan-audio: PCR PID untouched")
+    let sectionLength = (Int(rewritten[6] & 0x0F) << 8) | Int(rewritten[7])
+    let section = Array(rewritten[5..<(5 + 3 + sectionLength)])
+    expectEq(TSLANAudioRewriter.crc32MPEG(section), 0, "lan-audio: rewritten PMT CRC verifies (residue 0)")
+    let text = section.map { String(format: "%02X", $0) }.joined()
+    expect(text.contains("0FE101F0060A04656E6700"), "lan-audio: AAC entry keeps only the language descriptor: \(text)")
+    expect(!text.contains("0541432D33"), "lan-audio: AC-3 registration descriptor dropped")
+    expect(TSLANAudioRewriter.rewritePMT(pmt, targetPID: 0x1FF) == nil, "lan-audio: unknown target PID refused")
+
+    // ADTS header.
+    let adts = TSLANAudioRewriter.adtsHeader(payloadLength: 300, frequencyIndex: 3)
+    expectEq(adts.count, 7, "lan-audio: ADTS header is 7 bytes")
+    let adtsLen = (Int(adts[3] & 0x03) << 11) | (Int(adts[4]) << 3) | (Int(adts[5]) >> 5)
+    expectEq(adtsLen, 307, "lan-audio: ADTS frame length includes the header")
+    expectEq((Int(adts[2]) >> 6) + 1, 2, "lan-audio: ADTS profile AAC-LC")
+    expectEq((Int(adts[2]) >> 2) & 0x0F, 3, "lan-audio: ADTS 48 kHz")
+    expectEq(((Int(adts[2]) & 1) << 2) | (Int(adts[3]) >> 6), 2, "lan-audio: ADTS stereo")
+
+    // PES packetization.
+    var cc: UInt8 = 14
+    let pts: Int64 = (1 << 33) - 1234
+    let ts = TSLANAudioRewriter.packetizePES(payload: [UInt8](repeating: 0x5A, count: 400), pts: pts, pid: 0x101, cc: &cc)
+    expectEq(ts.count, 3 * 188, "lan-audio: 414-byte PES fills three packets")
+    expectEq(cc, 1, "lan-audio: CC advanced by three with wrap")
+    let ccs = stride(from: 0, to: ts.count, by: 188).map { ts[$0 + 3] & 0x0F }
+    expectEq(ccs, [14, 15, 0], "lan-audio: CC continuous across the wrap")
+    expect(ts[1] & 0x40 != 0 && ts[189] & 0x40 == 0, "lan-audio: PUSI on the first packet only")
+    expectEq(ts[376 + 3] >> 4, 3, "lan-audio: last packet carries adaptation stuffing")
+    expectEq(Int(ts[376 + 4]), 183 - 46, "lan-audio: stuffing length fills the packet")
+    expectEq(TSLANAudioRewriter.pesPTS(Array(ts[0..<188])), pts, "lan-audio: PTS round trip")
+    let pesLen = (Int(ts[8]) << 8) | Int(ts[9])
+    expectEq(pesLen, 3 + 5 + 400, "lan-audio: PES_packet_length")
+
+    // One synthetic segment end to end.
+    let logs = LockedLines()
+    var fakes: [FakeCastAudioTranscoder] = []
+    let rewriter = TSLANAudioRewriter(log: { logs.append($0) }, canDecode: { _ in true },
+                                      transcoderFactory: { _, onConfig, onFrame in
+        let f = FakeCastAudioTranscoder(onConfig: onConfig, onFrame: onFrame)
+        fakes.append(f)
+        return f
+    })
+    var seg: [UInt8] = syntheticPAT() + pmt
+    let videoPTS: Int64 = 900_000
+    for p in packetsFor(pid: 0x100, pes: pesBytes(streamID: 0xE0, pts: videoPTS, payload: [0, 0, 0, 1, 0x65, 0x88])) { seg += p }
+    // Audio starts one frame before the first picture: gated.
+    var acc: UInt8 = 0
+    seg += TSLANAudioRewriter.packetizePES(payload: ac3Frame() + ac3Frame() + ac3Frame(), pts: videoPTS - 2880,
+                                           pid: 0x101, cc: &acc)
+    acc = 0
+    seg += TSLANAudioRewriter.packetizePES(payload: ac3Frame(), pts: videoPTS - 2880, pid: 0x102, cc: &acc)
+    let out = [UInt8](rewriter.rewrite(Data(seg)))
+    expectEq(out.count % 188, 0, "lan-audio: output is whole packets")
+    var pids: [Int: Int] = [:]
+    var audioPackets: [[UInt8]] = []
+    for o in stride(from: 0, to: out.count, by: 188) {
+        let p = Array(out[o..<(o + 188)])
+        let pid = (Int(p[1] & 0x1F) << 8) | Int(p[2])
+        pids[pid, default: 0] += 1
+        if pid == 0x101 { audioPackets.append(p) }
+    }
+    expectEq(pids[0x102], nil, "lan-audio: second audio PID dropped")
+    expectEq(pids[0x100], 1, "lan-audio: video copied")
+    expectEq(TSLANAudioRewriter.parsePMT(Array(out[188..<376]))?.audio.first?.type, 0x0F, "lan-audio: segment PMT rewritten")
+    expectEq(fakes.count, 1, "lan-audio: one transcoder")
+    expectEq(fakes.first?.fedPTS, [videoPTS - 2880, videoPTS, videoPTS + 2880], "lan-audio: AC-3 frames stamped from the PES PTS")
+    expectEq(audioPackets.count, 1, "lan-audio: two gated-in AAC frames fit one packet")
+    if let first = audioPackets.first {
+        expectEq(TSLANAudioRewriter.pesPTS(first), videoPTS, "lan-audio: first AAC PTS = first video PTS (earlier frame gated)")
+        var es = Array(first[(TSLANAudioRewriter.payloadOffset(first)! + 14)...])
+        var frames = 0
+        while es.count >= 7, es[0] == 0xFF, es[1] & 0xF0 == 0xF0 {
+            let len = (Int(es[3] & 0x03) << 11) | (Int(es[4]) << 3) | (Int(es[5]) >> 5)
+            frames += 1
+            es.removeFirst(min(len, es.count))
+        }
+        expectEq(frames, 2, "lan-audio: two ADTS frames in the PES")
+    }
+    expect(logs.all.contains("LAN audio: AC-3 2ch -> AAC-LC stereo muxed into TS (PID 257, PMT rewritten)"),
+           "lan-audio: session line: \(logs.all)")
+    // Second segment: CC continues on the audio PID.
+    let out2 = [UInt8](rewriter.rewrite(Data(seg)))
+    let cc2 = stride(from: 0, to: out2.count, by: 188).first { (Int(out2[$0 + 1] & 0x1F) << 8 | Int(out2[$0 + 2])) == 0x101 }
+        .map { out2[$0 + 3] & 0x0F }
+    expectEq(cc2, 1, "lan-audio: audio CC continues into the next segment")
+
+    // Stage: lazy, in order, cached, evicted.
+    let stage = TSLANAudioStage(rewriter: TSLANAudioRewriter(log: { _ in }, canDecode: { _ in true },
+                                                             transcoderFactory: { _, c, f in FakeCastAudioTranscoder(onConfig: c, onFrame: f) }))
+    expectEq(stage.sourcesNeeded(for: 5), [5], "lan-audio stage: first request needs only itself")
+    _ = stage.produce(seq: 5, sources: [(5, Data(seg))], oldestSeq: 0)
+    expectEq(stage.sourcesNeeded(for: 5), [], "lan-audio stage: cached")
+    expectEq(stage.sourcesNeeded(for: 7), [6, 7], "lan-audio stage: a skipped segment is produced first")
+    _ = stage.produce(seq: 7, sources: [(6, Data(seg)), (7, Data(seg))], oldestSeq: 6)
+    expectEq(stage.cachedCount, 2, "lan-audio stage: evicted below the ring")
+
+    // Non-AC-3 source: passthrough, logged once.
+    let aacLogs = LockedLines()
+    let passthrough = TSLANAudioRewriter(log: { aacLogs.append($0) }, canDecode: { _ in true })
+    var aacPMT = pmt
+    aacPMT[5 + 12 + 5] = 0x0F; aacPMT[5 + 12 + 5 + 5 + 12] = 0x0F
+    let plain = syntheticPAT() + psiPacket(pid: 0x1000, section: Array(aacPMT[5..<(5 + 12 + 5 + 17 + 5)]))
+    expectEq([UInt8](passthrough.rewrite(Data(plain))), plain, "lan-audio: AAC source passes through unchanged")
+    expect(aacLogs.all.count == 1 && aacLogs.all[0].contains("stays passthrough"), "lan-audio: unsupported line: \(aacLogs.all)")
+}
+
+runLANAudioRewriteChecks()
+
+// MARK: Stale-receiver request counters (incident 2026-09-25 15:26)
+
+do {
+    let t0 = Date(timeIntervalSince1970: 1000)
+    let c = CastHLSRequestCounters(now: t0)
+    c.mark(generation: 3, now: t0)
+    for p in ["/demuxed.m3u8", "/video.m3u8", "/audio.m3u8", "/vinit3.mp4", "/ainit3.mp4"] {
+        c.record(path: p, now: t0.addingTimeInterval(0.5))
+    }
+    var s = c.snapshot
+    expectEq(s.playlists, 3, "counters: three playlists")
+    expectEq(s.segments, 0, "counters: inits are not segments (stale shape)")
+    expect(s.firstSegmentAt == nil, "counters: no first segment yet")
+    c.record(path: "/vseg0.m4s", now: t0.addingTimeInterval(1.25))
+    c.record(path: "/aseg0.m4s", now: t0.addingTimeInterval(1.5))
+    c.record(path: "/vseg1.m4s", now: t0.addingTimeInterval(2.0))
+    s = c.snapshot
+    expectEq(s.videoSegments, 2, "counters: video segments")
+    expectEq(s.audioSegments, 1, "counters: audio segments")
+    expectEq(s.generation, 3, "counters: generation")
+    expectEq(s.firstSegmentAt.map { $0.timeIntervalSince(s.markedAt) }, 1.25, "counters: first segment offset")
+    expectEq(s.lastSegmentAt, t0.addingTimeInterval(2.0), "counters: last segment time")
+    c.mark(generation: 4, now: t0.addingTimeInterval(10))
+    s = c.snapshot
+    expect(s.playlists == 0 && s.segments == 0 && s.generation == 4 && s.lastSegmentAt == nil,
+           "counters: mark resets for the reload")
+}
+
+// MARK: 17. video transcode plan, codec strings, hvcC, remux wiring (2026-09-26)
+//
+// The VideoToolbox sessions themselves cannot run here (no hardware
+// encoder contract on the CI Mac, and no real H.264 slices in the
+// fixtures); what runs is everything around them: the SPS facts the plan
+// reads, the plan's decision per receiver, the codec strings the master
+// declares, the hvcC record, and the remuxer's transcode wiring driven by
+// a fake transcoder that re-stamps like the real one (PTS kept, DTS = PTS,
+// forced IDR every 3 s, a few frames of encoder latency).
+
+struct BitWriter {
+    var bytes: [UInt8] = []
+    var nbits = 0
+    mutating func put(_ v: Int, _ n: Int) {
+        for i in stride(from: n - 1, through: 0, by: -1) {
+            if nbits % 8 == 0 { bytes.append(0) }
+            if (v >> i) & 1 == 1 { bytes[bytes.count - 1] |= UInt8(0x80 >> (nbits % 8)) }
+            nbits += 1
+        }
+    }
+    mutating func ue(_ v: Int) {
+        let x = v + 1
+        var len = 0
+        while (x >> len) > 1 { len += 1 }
+        put(0, len)
+        put(x, len + 1)
+    }
+    mutating func trailing() {
+        put(1, 1)
+        while nbits % 8 != 0 { put(0, 1) }
+    }
+}
+
+/// Insert emulation prevention bytes (00 00 0x -> 00 00 03 0x for x <= 3).
+func escapeRBSP(_ rbsp: [UInt8]) -> [UInt8] {
+    var out: [UInt8] = []
+    var zeros = 0
+    for b in rbsp {
+        if zeros >= 2, b <= 3 { out.append(3); zeros = 0 }
+        out.append(b)
+        zeros = b == 0 ? zeros + 1 : 0
+    }
+    return out
+}
+
+/// H.264 High level 4.2 1920x1080 SPS with VUI: BT.709, 59.94 fps
+/// (1001 / 120000), max_num_reorder_frames 2.
+func h264SPS1080p60() -> [UInt8] {
+    var w = BitWriter()
+    w.put(100, 8); w.put(0, 8); w.put(42, 8)
+    w.ue(0) // sps id
+    w.ue(1); w.ue(0); w.ue(0); w.put(0, 1); w.put(0, 1) // chroma, depths, qpprime, no scaling
+    w.ue(0); w.ue(0); w.ue(0) // log2_max_frame_num, poc type 0, log2_max_poc_lsb
+    w.ue(4); w.put(0, 1) // max refs, gaps
+    w.ue(119); w.ue(67) // 120 x 68 MBs
+    w.put(1, 1); w.put(1, 1) // frame_mbs_only, direct_8x8
+    w.put(1, 1); w.ue(0); w.ue(0); w.ue(0); w.ue(4) // crop 1088 -> 1080
+    w.put(1, 1) // vui
+    w.put(0, 1); w.put(0, 1) // aspect, overscan
+    w.put(1, 1); w.put(5, 3); w.put(0, 1); w.put(1, 1); w.put(1, 8); w.put(1, 8); w.put(1, 8)
+    w.put(0, 1) // chroma loc
+    w.put(1, 1); w.put(1001, 32); w.put(120_000, 32); w.put(1, 1)
+    w.put(0, 1); w.put(0, 1); w.put(0, 1) // nal hrd, vcl hrd, pic_struct
+    w.put(1, 1); w.put(1, 1); w.ue(0); w.ue(0); w.ue(16); w.ue(16); w.ue(2); w.ue(4)
+    w.trailing()
+    return [0x67] + escapeRBSP(w.bytes)
+}
+
+/// HEVC Main level 5.1 1920x1080 parameter sets (only the SPS is parsed).
+func hevcParameterSets() -> (vps: [UInt8], sps: [UInt8], pps: [UInt8]) {
+    var w = BitWriter()
+    w.put(0, 4); w.put(0, 3); w.put(1, 1) // vps id, max_sub_layers_minus1 0, nesting
+    w.put(0, 2); w.put(0, 1); w.put(1, 5) // space, tier, profile_idc 1 (Main)
+    w.put(0x6000_0000, 32) // compat flags 1 and 2
+    w.put(0xB0, 8); w.put(0, 40) // progressive, non-packed, frame-only
+    w.put(153, 8) // level 5.1
+    w.ue(0) // sps id
+    w.ue(1) // 4:2:0
+    w.ue(1920); w.ue(1088)
+    w.put(1, 1); w.ue(0); w.ue(0); w.ue(0); w.ue(4) // conformance 1088 -> 1080
+    w.ue(0); w.ue(0) // 8-bit
+    w.trailing()
+    let sps: [UInt8] = [0x42, 0x01] + escapeRBSP(w.bytes)
+    let vps: [UInt8] = [0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF]
+    let pps: [UInt8] = [0x44, 0x01, 0xC1, 0x72, 0xB4, 0x62, 0x40]
+    return (vps, sps, pps)
+}
+
+func boxBytes(_ type: String, _ payload: [UInt8]) -> Data {
+    let size = 8 + payload.count
+    var d = Data([UInt8((size >> 24) & 0xFF), UInt8((size >> 16) & 0xFF), UInt8((size >> 8) & 0xFF), UInt8(size & 0xFF)])
+    d.append(contentsOf: Array(type.utf8))
+    d.append(contentsOf: payload)
+    return d
+}
+
+func dataContains(_ data: Data, _ type: String) -> Bool {
+    data.range(of: Data(type.utf8)) != nil
+}
+
+/// Chromecast Ultra, measured 2026-09-26.
+let ultraCaps = CastReceiverVideoCaps(
+    mse: ["avc1.64002A": false, "hvc1": false, "hvc1.4k": false, "hev1": false],
+    display: ["h264_1080p60": false, "h264_1080p30": true, "hevc_1080p60": false,
+              "hevc_4k60": false, "h264_4k60": false])
+
+@MainActor func runVideoTranscodeChecks() {
+    // SPS facts
+    let sps = h264SPS1080p60()
+    let info = try? CastFMP4Remuxer.parseSPSInfo(sps)
+    expectEq(info?.width, 1920, "sps info: width")
+    expectEq(info?.height, 1080, "sps info: height (cropped)")
+    expectEq(info?.levelIDC, 42, "sps info: level")
+    expectEq(info?.codecString, "avc1.64002A", "sps info: codec string")
+    expectEq(info.flatMap { $0.fps.map { ($0 * 100).rounded() / 100 } }, 59.94, "sps info: VUI fps 59.94")
+    expectEq(info?.colourPrimaries, 1, "sps info: BT.709 primaries")
+    expectEq(info?.maxNumReorderFrames, 2, "sps info: max_num_reorder_frames")
+    expectEq(info?.progressive, true, "sps info: progressive")
+    let dims = try? CastFMP4Remuxer.parseSPSDimensions(sps)
+    expect(dims?.width == 1920 && dims?.height == 1080, "sps dimensions unchanged by the VUI parse")
+
+    guard let src = info else { return }
+
+    // Plan: the Ultra (no 720p60 key, 1080p60=no) and 1080p59.94 ->
+    // H.264 1080 at half rate.
+    let ultra = CastVideoPlan(caps: ultraCaps)
+    let d = ultra.decide(src)
+    expectEq(d.output, CastVideoOutputSpec(codec: .h264, width: 1920, height: 1080, frameStep: 2,
+                                           bitrateCap: 8_000_000), "plan: Ultra 1080p60 -> H.264 1080p30")
+    expectEq(d.reason, "receiver does not display 60 fps H.264", "plan: 1080p60 half-rate reason")
+    expectEq(ultra.logLine(source: src, decision: d),
+             "[Cast] video plan: source=avc1.64002A 1920x1080@59.94 receiver display h264_1080p60=no "
+             + "h264_1080p30=yes h264_720p60=n/a hevc_1080p60=no hvc1=no -> transcode H.264 1080p29.97 "
+             + "level 4.1 (8000 kbps)",
+             "plan: log line format")
+    var caps720No = ultraCaps; caps720No.display?["h264_720p60"] = false
+    expectEq(CastVideoPlan(caps: caps720No).decide(src).output,
+             CastVideoOutputSpec(codec: .h264, width: 1920, height: 1080, frameStep: 2, bitrateCap: 8_000_000),
+             "plan: 1080p59.94, h264_720p60=no -> H.264 1080p29.97")
+    var caps720Yes = ultraCaps; caps720Yes.display?["h264_720p60"] = true
+    expectEq(CastVideoPlan(caps: caps720Yes).decide(src).output,
+             CastVideoOutputSpec(codec: .h264, width: 1280, height: 720, frameStep: 1, bitrateCap: 8_000_000),
+             "plan: 1080p59.94, h264_720p60=yes -> 720p60 profile")
+
+    var ultra30 = ultra
+    ultra30.downProfile = .p1080p30
+    expectEq(ultra30.decide(src).output, CastVideoOutputSpec(codec: .h264, width: 1920, height: 1080,
+                                                             frameStep: 2, bitrateCap: 8_000_000),
+             "plan: 1080p30 profile halves the frame rate, keeps the size")
+
+    var s720 = src; s720.width = 1280; s720.height = 720; s720.levelIDC = 32
+    // Ultra caps (page without h264_720p60): falls back to h264_1080p60=no.
+    let d720 = ultra.decide(s720)
+    expectEq(d720.output, CastVideoOutputSpec(codec: .h264, width: 1280, height: 720, frameStep: 2,
+                                              bitrateCap: 8_000_000),
+             "plan: 720p60 on the Ultra (no 720p60 key) -> H.264 720p at half rate")
+    expectEq(d720.reason, "receiver does not display 720p60", "plan: 720p60 transcode reason")
+    expectEq(d720.unsupported, ["720p60"], "plan: 720p60 named as unsupported")
+    expectEq(ultra.logLine(source: s720, decision: d720),
+             "[Cast] video plan: source=avc1.640020 1280x720@59.94 receiver display h264_1080p60=no "
+             + "h264_1080p30=yes h264_720p60=n/a hevc_1080p60=no hvc1=no -> transcode H.264 720p29.97 "
+             + "level 4.1 (8000 kbps)",
+             "plan: 720p60 log line")
+    var ultra720No = ultraCaps; ultra720No.display?["h264_720p60"] = false
+    expectEq(CastVideoPlan(caps: ultra720No).decide(s720).output?.frameStep, 2,
+             "plan: h264_720p60=no -> half rate")
+    var ultra720Yes = ultraCaps; ultra720Yes.display?["h264_720p60"] = true
+    expectEq(CastVideoPlan(caps: ultra720Yes).decide(s720).output, nil,
+             "plan: h264_720p60=yes overrides 1080p60=no, passthrough")
+    var s720p30 = s720; s720p30.fps = 29.97
+    expectEq(ultra.decide(s720p30).output, nil, "plan: 720p30 on the Ultra, passthrough")
+    var s1080i = src; s1080i.fps = 29.97; s1080i.progressive = false; s1080i.levelIDC = 40
+    expectEq(ultra.decide(s1080i).output, nil, "plan: 1080i29.97 fits the Ultra, passthrough")
+    var s1080p30NoVUI = src; s1080p30NoVUI.fps = nil; s1080p30NoVUI.levelIDC = 40
+    expectEq(ultra.decide(s1080p30NoVUI).output, nil, "plan: no VUI, level 4.0 reads as 30 fps")
+    var s1080p60NoVUI = src; s1080p60NoVUI.fps = nil
+    expectEq(ultra.decide(s1080p60NoVUI).output?.codec, .h264, "plan: no VUI, level 4.2 reads as 60 fps")
+
+    let hevcRx = CastVideoPlan(caps: CastReceiverVideoCaps(
+        mse: ["hvc1": true], display: ["h264_1080p60": false, "h264_1080p30": true, "hevc_1080p60": true]))
+    expectEq(hevcRx.decide(src).output, CastVideoOutputSpec(codec: .hevc, width: 1920, height: 1080,
+                                                            frameStep: 1, bitrateCap: 12_000_000),
+             "plan: HEVC receiver -> HEVC at the source size")
+    var s4K = src; s4K.width = 3840; s4K.height = 2160; s4K.levelIDC = 51
+    expectEq(hevcRx.decide(s4K).output?.width, 1920, "plan: 4K source, 1080-only HEVC -> 1080 HEVC")
+    let hevc4K = CastVideoPlan(caps: CastReceiverVideoCaps(mse: ["hvc1": true, "hvc1.4k": true],
+                                                           display: ["hevc_4k60": true]))
+    expectEq(hevc4K.decide(s4K).output, CastVideoOutputSpec(codec: .hevc, width: 3840, height: 2160,
+                                                            frameStep: 1, bitrateCap: 25_000_000),
+             "plan: 4K HEVC receiver -> 4K HEVC at 25 Mbps cap")
+
+    let streamer = CastVideoPlan(caps: CastReceiverVideoCaps(
+        mse: ["avc1.64002A": true], display: ["h264_1080p60": true, "h264_1080p30": true]))
+    expectEq(streamer.decide(src).output, nil, "plan: receiver displays 1080p60, passthrough")
+    var forced = streamer; forced.force = true
+    expectEq(forced.decide(src).output?.codec, .h264, "plan: force without HEVC -> H.264 profile")
+    expect(forced.logLine(source: src, decision: forced.decide(src)).hasSuffix("[forced]"),
+           "plan: forced log line is marked")
+    var forcedHEVC = hevcRx; forcedHEVC.force = true
+    var s720f = s720; s720f.fps = 59.94
+    expectEq(forcedHEVC.decide(s720f).output?.codec, .hevc, "plan: force with HEVC -> HEVC even when it fits")
+
+    let oldPage = CastVideoPlan(caps: CastReceiverVideoCaps(mse: ["avc1.64002A": false], display: nil))
+    expectEq(oldPage.decide(src), CastVideoDecision(output: nil, reason: "receiver sent no display caps"),
+             "plan: no display map -> passthrough")
+    expectEq(CastVideoPlan.passthrough.decide(src).output, nil, "plan: no caps -> passthrough")
+    var disabled = ultra; disabled.disabledReason = "VT failed"
+    expectEq(disabled.decide(src), CastVideoDecision(output: nil, reason: "VT failed"),
+             "plan: disabled after a failure -> passthrough")
+
+    // hvcC and codec strings
+    let ps = hevcParameterSets()
+    let parsed = CastVideoCodecConfig.parseHEVCSPS(ps.sps)
+    expect(parsed?.width == 1920 && parsed?.height == 1080, "hevc sps: 1920x1080 through emulation prevention")
+    let hvcC = CastVideoCodecConfig.buildHVCC(vps: ps.vps, sps: ps.sps, pps: ps.pps)
+    expectEq(hvcC.flatMap { CastVideoCodecConfig.hevcCodecString(hvcC: $0) }, "hvc1.1.6.L153.B0",
+             "hvcC: codec string for Main 5.1")
+    expectEq(hvcC?[21], 0x0F, "hvcC: one temporal layer, nested, 4-byte lengths")
+    expectEq(hvcC?[22], 3, "hvcC: three parameter set arrays")
+    var tier = hvcC ?? []
+    if tier.count > 13 { tier[1] |= 0x20; tier[12] = 120 }
+    expectEq(CastVideoCodecConfig.hevcCodecString(hvcC: tier), "hvc1.1.6.H120.B0", "hvcC: high tier string")
+
+    // Master playlist CODECS
+    let store = CastHLSSegmentStore()
+    var gen = store.beginGeneration()
+    let hevcInit = boxBytes("ftyp", [0, 0, 0, 0]) + boxBytes("hvcC", hvcC ?? [])
+    store.setVideoTranscoded(generation: gen, true)
+    store.setDemuxedInitSegments(generation: gen, video: hevcInit, audio: nil)
+    store.setAudioCodecsAttribute(nil)
+    expect(store.demuxedMasterPlaylistText().contains("CODECS=\"hvc1.1.6.L153.B0\""),
+           "master: HEVC transcode declares the hvcC string")
+    gen = store.beginGeneration()
+    let avc41 = boxBytes("avcC", [1, 0x64, 0x00, 0x29, 0xFF])
+    store.setVideoTranscoded(generation: gen, true)
+    store.setDemuxedInitSegments(generation: gen, video: avc41, audio: nil)
+    store.setReceiverDecodesAVCLevel42(false)
+    expect(store.demuxedMasterPlaylistText().contains("CODECS=\"avc1.640029\""),
+           "master: H.264 transcode declares avc1.640029 verbatim")
+    gen = store.beginGeneration()
+    let avc42 = boxBytes("avcC", [1, 0x64, 0x00, 0x2A, 0xFF])
+    store.setDemuxedInitSegments(generation: gen, video: avc42, audio: nil)
+    expect(store.demuxedMasterPlaylistText().contains("CODECS=\"avc1.640028\""),
+           "master: passthrough keeps the level 4.0 relabel")
+    expectEq(CastHLSSegmentStore.videoCodecString(from: avc42), "avc1.64002A", "codec string: avcC")
+
+    runTranscodeRemuxChecks(hvcC: hvcC ?? [])
+    runHEVCIngestChecks(hvcC: hvcC ?? [])
+}
+
+/// Stands in for VideoToolbox: keeps PTS, DTS = PTS, forced IDR every
+/// `keyTicks`, emits `latency` frames late, format before the first frame.
+final class FakeVideoTranscoder: CastVideoTranscoding {
+    let sink: CastVideoTranscodeSink
+    let keyTicks: Int64
+    let latency: Int
+    let config: [UInt8]
+    var held: [Int64] = []
+    var sentFormat = false
+    var lastKey: Int64 = -1
+    var fed = 0
+    var released = false
+    var failAfter: Int?
+    var lastParameterSets: [[UInt8]] = []
+
+    init(sink: CastVideoTranscodeSink, keyTicks: Int64, latency: Int, config: [UInt8], failAfter: Int? = nil) {
+        self.sink = sink; self.keyTicks = keyTicks; self.latency = latency
+        self.config = config; self.failAfter = failAfter
+    }
+
+    func feed(_ sample: [UInt8], pts: Int64, dts: Int64, keyframe: Bool, parameterSets: [[UInt8]]) {
+        fed += 1
+        lastParameterSets = parameterSets
+        if let failAfter, fed == failAfter { sink.onFailure("fake VT error"); return }
+        if held.isEmpty && lastKey < 0 && !keyframe { return }
+        held.append(pts)
+        while held.count > latency {
+            let p = held.removeFirst()
+            if !sentFormat { sentFormat = true; sink.onFormat(.hevc, config, 1920, 1080) }
+            let key = lastKey < 0 || p - lastKey >= keyTicks
+            if key { lastKey = p }
+            sink.onSample([0, 0, 0, 3, 0x26, 0x01, 0xAF], p, key)
+        }
+    }
+
+    func release() { released = true }
+}
+
+@MainActor func runTranscodeRemuxChecks(hvcC: [UInt8]) {
+    // 12 s of 30 fps H.264, source GOP 1 s, audio 170 ms behind in mux order.
+    let (bytes, inputFrames) = straddlingCensusTS(videoFrames: 360, videoFrameTicks: 3_000,
+                                                  gop: 30, frameLen: 400, audioLagTicks: 15_300)
+    var result = CensusResult()
+    var videoInit: Data?
+    var fake: FakeVideoTranscoder?
+    var plan = CastVideoPlan(caps: ultraCaps)
+    plan.force = true
+    let remuxer = CastFMP4Remuxer(
+        videoPlan: plan, videoDelivery: { block in block() },
+        log: { result.logs.append($0) },
+        videoTranscoderFactory: { _, spec, keyTicks, sink, _ in
+            let f = FakeVideoTranscoder(sink: sink, keyTicks: keyTicks, latency: 6, config: hvcC)
+            fake = f
+            _ = spec
+            return f
+        })
+    remuxer.onDemuxedInitSegments = { v, _ in videoInit = v }
+    remuxer.onDemuxedMediaSegments = { v, a, ticks, _ in
+        result.segments.append((v, a))
+        result.durations.append(ticks)
+    }
+    remuxer.onSegmentComposition = { _, audio, _, _, _, _ in result.audioCounts.append(audio) }
+    var offset = 0
+    while offset < bytes.count {
+        let n = min(64 * 1024, bytes.count - offset)
+        try? remuxer.feed(bytes.subdata(in: offset..<(offset + n)))
+        offset += n
+    }
+    remuxer.release()
+
+    expect(result.logs.contains { $0.hasPrefix("[Cast] video plan:") && $0.contains("-> transcode") },
+           "transcode remux: plan line logged")
+    expect(remuxer.videoIsTranscoded, "transcode remux: video path is the transcoder")
+    expect(fake?.released == true, "transcode remux: release reaches the transcoder")
+    expect(videoInit.map { dataContains($0, "hvc1") && dataContains($0, "hvcC") && !dataContains($0, "avcC") } == true,
+           "transcode remux: init carries hvc1 + hvcC only")
+    expectEq(videoInit.flatMap { CastHLSSegmentStore.videoCodecString(from: $0) }, "hvc1.1.6.L153.B0",
+             "transcode remux: init codec string")
+    // Every segment but the tail is cut on a forced IDR 3 s after the last.
+    let full = result.durations.dropLast()
+    expect(!full.isEmpty && full.allSatisfy { $0 == 270_000 },
+           "transcode remux: segments cut exactly on the 3 s encoder IDRs (\(result.durations))")
+    // Every video traf opens on a sync sample with DTS == PTS.
+    var syncFirst = true
+    for seg in result.segments {
+        let b = [UInt8](seg.video)
+        guard let trun = b.indices.first(where: { $0 + 3 < b.count && b[$0] == 0x74 && b[$0 + 1] == 0x72
+                                                  && b[$0 + 2] == 0x75 && b[$0 + 3] == 0x6E }) else {
+            syncFirst = false; continue
+        }
+        // trun: type, version/flags(4), count(4), data_offset(4), then
+        // duration, size, flags, cts per sample.
+        let flagsAt = trun + 4 + 4 + 4 + 4 + 4 + 4
+        let ctsAt = flagsAt + 4
+        if flagsAt + 8 > b.count { syncFirst = false; continue }
+        if be32(b, flagsAt) != 0x0200_0000 || be32(b, ctsAt) != 0 { syncFirst = false }
+    }
+    expect(syncFirst, "transcode remux: each segment opens on a sync sample, composition offset 0")
+    // Audio demuxed while the encoder warmed up is kept: the interior
+    // segments match the passthrough census frame for frame. The allowance
+    // is passthrough's 52 plus the audio under the 6 frames still inside
+    // the encoder at teardown (6 x 3000 ticks = 9.4 AAC frames), which the
+    // tail trims to the last encoded video.
+    censusChecks("transcode", result, inputFrames: inputFrames, lossAllowance: 62, minSegments: 3)
+
+    // Failure: the next feed throws CastVideoTranscodeError, callback first.
+    var failedReason: String?
+    let failing = CastFMP4Remuxer(
+        videoPlan: plan, videoDelivery: { block in block() },
+        videoTranscoderFactory: { _, _, keyTicks, sink, _ in
+            FakeVideoTranscoder(sink: sink, keyTicks: keyTicks, latency: 2, config: hvcC, failAfter: 5)
+        })
+    failing.onVideoTranscodeFailed = { failedReason = $0 }
+    var thrown: Error?
+    offset = 0
+    while offset < bytes.count, thrown == nil {
+        let n = min(4 * 1024, bytes.count - offset)
+        do { try failing.feed(bytes.subdata(in: offset..<(offset + n))) } catch { thrown = error }
+        offset += n
+    }
+    expectEq(failedReason, "fake VT error", "transcode failure: callback carries the reason")
+    expect(thrown is CastVideoTranscodeError, "transcode failure: feed throws for the reconnect")
+
+    // No delivery queue (a caller that never wired one): passthrough.
+    let plain = CastFMP4Remuxer(videoPlan: plan)
+    var plainInit: Data?
+    plain.onDemuxedInitSegments = { v, _ in plainInit = v }
+    try? plain.feed(bytes.subdata(in: 0..<min(256 * 1024, bytes.count)))
+    expect(plainInit.map { dataContains($0, "avcC") } == true && !plain.videoIsTranscoded,
+           "transcode remux: no delivery queue keeps passthrough")
+}
+
+// MARK: 18. HEVC ingest: SPS / VPS facts, codec-aware plan, passthrough (2026-09-27)
+//
+// Measured: a Google TV Streamer answered hevc_1080p60=yes hevc_4k60=no
+// h264_4k60=yes hvc1=yes; a 4K HEVC channel was refused by name before
+// this, because the remuxer only took stream_type 0x1B.
+
+/// Google TV Streamer, measured 2026-09-27.
+let streamerCaps = CastReceiverVideoCaps(
+    mse: ["h264": true, "hvc1": true, "hvc1.4k": false, "hev1": true],
+    display: ["h264_1080p60": true, "h264_1080p30": true, "hevc_1080p60": true,
+              "hevc_4k60": false, "h264_4k60": true])
+
+extension BitWriter {
+    mutating func se(_ v: Int) { ue(v > 0 ? 2 * v - 1 : -2 * v) }
+}
+
+/// HEVC Main10 level 5.1 3840x2160 SPS carrying the whole tail the plan
+/// reads past: 10-bit, reorder 2 at the highest sub-layer, scaling list
+/// data (one explicit 4x4 list, one explicit 16x16 with its DC), two
+/// short-term RPS (the second inter-predicted from the first), then a VUI
+/// with BT.2020 / HLG / BT.2020nc and 50 fps timing.
+func hevcSPS4K50HLG() -> [UInt8] {
+    var w = BitWriter()
+    w.put(0, 4); w.put(0, 3); w.put(1, 1) // vps id, max_sub_layers_minus1 0, nesting
+    w.put(0, 2); w.put(0, 1); w.put(2, 5) // space, tier, profile_idc 2 (Main10)
+    w.put(0x2000_0000, 32) // compat flag 2
+    w.put(0xB0, 8); w.put(0, 40)
+    w.put(153, 8) // level 5.1
+    w.ue(0) // sps id
+    w.ue(1) // 4:2:0
+    w.ue(3840); w.ue(2160)
+    w.put(0, 1) // no conformance window
+    w.ue(2); w.ue(2) // 10-bit luma and chroma
+    w.ue(4) // log2_max_pic_order_cnt_lsb_minus4
+    w.put(0, 1) // ordering info for the highest sub-layer only
+    w.ue(4); w.ue(2); w.ue(0) // dec pic buffering, num_reorder_pics 2, latency
+    w.ue(0); w.ue(3); w.ue(0); w.ue(3); w.ue(1); w.ue(1) // block sizes, hierarchy depths
+    w.put(1, 1); w.put(1, 1) // scaling_list_enabled, data present
+    for sizeId in 0..<4 {
+        for matrixId in stride(from: 0, to: 6, by: sizeId == 3 ? 3 : 1) {
+            if matrixId == 0 && (sizeId == 0 || sizeId == 2) {
+                w.put(1, 1)
+                if sizeId == 2 { w.se(8) } // DC
+                for _ in 0..<(sizeId == 0 ? 16 : 64) { w.se(1) }
+            } else {
+                w.put(0, 1); w.ue(0)
+            }
+        }
+    }
+    w.put(0, 1); w.put(1, 1) // amp off, SAO on
+    w.put(0, 1) // pcm off
+    w.ue(2) // two short-term RPS
+    w.ue(1); w.ue(0); w.ue(0); w.put(1, 1) // set 0: one negative picture, used
+    w.put(1, 1); w.put(0, 1); w.ue(0) // set 1: predicted, sign, abs_delta_rps_minus1
+    w.put(1, 1) // j 0: used
+    w.put(0, 1); w.put(1, 1) // j 1: not used, use_delta
+    w.put(0, 1) // no long-term pictures
+    w.put(1, 1); w.put(1, 1) // temporal mvp, strong intra smoothing
+    w.put(1, 1) // vui
+    w.put(1, 1); w.put(1, 8) // aspect_ratio_idc 1
+    w.put(0, 1) // overscan
+    w.put(1, 1); w.put(5, 3); w.put(0, 1); w.put(1, 1); w.put(9, 8); w.put(18, 8); w.put(9, 8)
+    w.put(0, 1) // chroma loc
+    w.put(0, 1); w.put(0, 1); w.put(0, 1) // neutral chroma, field_seq, frame_field_info
+    w.put(0, 1) // default display window
+    w.put(1, 1); w.put(1, 32); w.put(50, 32) // 50 fps
+    w.put(0, 1); w.put(0, 1); w.put(0, 1) // poc proportional, hrd, bitstream restriction
+    w.put(0, 1) // sps_extension_present
+    w.trailing()
+    return [0x42, 0x01] + escapeRBSP(w.bytes)
+}
+
+/// HEVC VPS with 59.94 fps timing (60000 / 1001).
+func hevcVPSWithTiming() -> [UInt8] {
+    var w = BitWriter()
+    w.put(0, 4); w.put(1, 1); w.put(1, 1); w.put(0, 6) // id, base layer flags, max_layers_minus1
+    w.put(0, 3); w.put(1, 1); w.put(0xFFFF, 16) // max_sub_layers_minus1, nesting, reserved
+    w.put(0, 2); w.put(0, 1); w.put(1, 5); w.put(0x6000_0000, 32); w.put(0xB0, 8); w.put(0, 40); w.put(123, 8)
+    w.put(1, 1); w.ue(4); w.ue(2); w.ue(0) // ordering info
+    w.put(0, 6); w.ue(0) // max_layer_id, num_layer_sets_minus1
+    w.put(1, 1); w.put(1001, 32); w.put(60000, 32)
+    w.put(0, 1); w.ue(0); w.put(0, 1) // poc proportional, num_hrd, extension
+    w.trailing()
+    return [0x40, 0x01] + escapeRBSP(w.bytes)
+}
+
+@MainActor func runHEVCIngestChecks(hvcC: [UInt8]) {
+    // SPS parser: the whole tail
+    let sps4K = hevcSPS4K50HLG()
+    let full = CastVideoCodecConfig.parseHEVCSPS(sps4K)
+    expect(full?.width == 3840 && full?.height == 2160, "hevc sps: 3840x2160, no conformance window")
+    expectEq(full?.bitDepthLumaMinus8, 2, "hevc sps: 10-bit luma")
+    expectEq(full?.generalProfileIDC, 2, "hevc sps: Main10 profile")
+    expectEq(full?.generalLevelIDC, 153, "hevc sps: level 5.1")
+    expectEq(full?.maxNumReorderPics, 2, "hevc sps: reorder depth through the ordering info")
+    expectEq(full?.fps, 50, "hevc sps: VUI 50 fps past scaling lists and an inter-predicted RPS")
+    expect(full?.colourPrimaries == 9 && full?.transferCharacteristics == 18 && full?.matrixCoefficients == 9,
+           "hevc sps: BT.2020 / HLG / BT.2020nc colour description")
+    expectEq(full?.fieldCoding, false, "hevc sps: progressive")
+    let info = CastVideoCodecConfig.hevcStreamInfo(sps: sps4K, vps: nil)
+    expectEq(info?.codec, .hevc, "hevc info: codec")
+    expectEq(info?.bitDepth, 10, "hevc info: bit depth")
+    expectEq(info?.codecString, "hvc1.2.4.L153.B0", "hevc info: hvc1 string from the PTL")
+    expectEq(info?.levelLabel, "5.1", "hevc info: level label")
+    expectEq(info?.maxNumReorderFrames, 2, "hevc info: reorder depth")
+    // Minimal SPS (ends after the bit depths): the tail is best effort.
+    let ps = hevcParameterSets()
+    let small = CastVideoCodecConfig.hevcStreamInfo(sps: ps.sps, vps: nil)
+    expect(small?.width == 1920 && small?.height == 1080 && small?.fps == nil,
+           "hevc info: truncated tail keeps the size, fps unknown")
+    // VPS timing fills in a frame rate the SPS lacks.
+    let vps = hevcVPSWithTiming()
+    expectEq(CastVideoCodecConfig.parseHEVCVPSFrameRate(vps).map { ($0 * 100).rounded() / 100 }, 59.94,
+             "hevc vps: 60000 / 1001 timing")
+    expectEq(CastVideoCodecConfig.hevcStreamInfo(sps: ps.sps, vps: vps)?.fps.map { ($0 * 100).rounded() / 100 },
+             59.94, "hevc info: VPS timing when the SPS VUI has none")
+    expectEq(CastVideoCodecConfig.parseHEVCVPSFrameRate(ps.vps), nil, "hevc vps: truncated VPS reads nil")
+
+    guard let src4K = info, let src1080 = small else { return }
+
+    // Codec-aware plan
+    let streamer = CastVideoPlan(caps: streamerCaps)
+    let d4K = streamer.decide(src4K)
+    expectEq(d4K.output, CastVideoOutputSpec(codec: .hevc, width: 1920, height: 1080, frameStep: 1,
+                                             bitrateCap: 12_000_000),
+             "hevc plan: Streamer 4K50 HEVC -> HEVC 1080 at the source rate")
+    let o4K = CastVideoPlanOutcome(source: src4K, decision: d4K)
+    expectEq(o4K.sourceDescription, "HEVC 3840x2160 at 50fps HDR", "hevc note: source line")
+    expectEq(o4K.outputDescription, "HEVC 1920x1080 at 50fps", "hevc note: output line")
+    expectEq(streamer.logLine(source: src4K, decision: d4K),
+             "[Cast] video plan: source=hvc1.2.4.L153.B0 3840x2160@50 10-bit HDR HLG receiver display "
+             + "h264_1080p60=yes h264_1080p30=yes hevc_1080p60=yes hevc_4k60=no hvc1=yes "
+             + "hevc_1080p60_hlg=no hevc_4k60_hlg=no hvc1.hlg=no "
+             + "-> transcode HEVC 1080p50 (12000 kbps) HDR HLG -> SDR BT.709",
+             "hevc plan: log line")
+    expectEq(streamer.decide(src1080).output, nil, "hevc plan: Streamer 1080 HEVC passes through")
+    var hevc4KRx = streamerCaps; hevc4KRx.display?["hevc_4k60"] = true
+    hevc4KRx.display?["hevc_4k60_hlg"] = true
+    expectEq(CastVideoPlan(caps: hevc4KRx).decide(src4K).output, nil,
+             "hevc plan: receiver displaying HEVC 4K60 HLG passes 4K HLG through")
+    var mseOnly4K = streamerCaps; mseOnly4K.mse["hvc1.4k"] = true
+    expectEq(CastVideoPlan(caps: mseOnly4K).decide(src4K).output?.width, 1920,
+             "hevc plan: MSE hvc1.4k without display hevc_4k60 still goes to 1080, never a 4K re-encode")
+
+    let ultra = CastVideoPlan(caps: ultraCaps)
+    expectEq(ultra.decide(src4K).output, CastVideoOutputSpec(codec: .h264, width: 1280, height: 720,
+                                                             frameStep: 1, bitrateCap: 8_000_000),
+             "hevc plan: Ultra 4K HEVC -> H.264 720p")
+    expectEq(CastVideoPlanOutcome(source: src4K, decision: ultra.decide(src4K)).outputDescription,
+             "H.264 1280x720 at 50fps", "hevc note: H.264 output line")
+    var ultra30 = ultra; ultra30.downProfile = .p1080p30
+    let d30 = ultra30.decide(src4K)
+    expectEq(d30.output, CastVideoOutputSpec(codec: .h264, width: 1920, height: 1080, frameStep: 2,
+                                             bitrateCap: 8_000_000),
+             "hevc plan: Ultra 1080p30 profile -> H.264 1080 at half rate")
+    expectEq(CastVideoPlanOutcome(source: src4K, decision: d30).outputDescription,
+             "H.264 1920x1080 at 25fps", "hevc note: half-rate output line")
+    expectEq(ultra.decide(src1080).output?.codec, .h264, "hevc plan: Ultra 1080 HEVC -> H.264")
+    var s720 = src1080; s720.width = 1280; s720.height = 720
+    expectEq(ultra.decide(s720).output?.codec, .h264, "hevc plan: 720 HEVC without MSE hvc1 -> H.264")
+    expectEq(streamer.decide(s720).output, nil, "hevc plan: 720 HEVC with MSE hvc1 passes through")
+
+    // No caps: transcode rather than refuse or pass blind; H.264 is unchanged.
+    let blind = CastVideoPlan.passthrough.decide(src4K)
+    expectEq(blind, CastVideoDecision(output: CastVideoOutputSpec(codec: .h264, width: 1280, height: 720,
+                                                                  frameStep: 1, bitrateCap: 8_000_000),
+                                      reason: "receiver caps not measured"),
+             "hevc plan: no caps -> H.264 down profile")
+    let oldPage = CastVideoPlan(caps: CastReceiverVideoCaps(mse: ["hvc1": true], display: nil))
+    expectEq(oldPage.decide(src1080).output, nil, "hevc plan: no display map, MSE hvc1 -> 1080 passes")
+    expectEq(oldPage.decide(src4K).output?.codec, .hevc, "hevc plan: no display map, 4K -> HEVC 1080")
+    let oldPageNoHEVC = CastVideoPlan(caps: CastReceiverVideoCaps(mse: [:], display: nil))
+    expectEq(oldPageNoHEVC.decide(src1080),
+             CastVideoDecision(output: CastVideoOutputSpec(codec: .h264, width: 1280, height: 720,
+                                                           frameStep: 1, bitrateCap: 8_000_000),
+                               reason: "receiver sent no display caps"),
+             "hevc plan: no display map, no hvc1 -> H.264 down profile")
+
+    var forced = streamer; forced.force = true
+    expectEq(forced.decide(src1080).output?.codec, .hevc, "hevc plan: force on an HEVC receiver -> HEVC")
+    var disabled = ultra; disabled.disabledReason = "VT failed"
+    expectEq(disabled.decide(src4K), CastVideoDecision(output: nil, reason: "VT failed"),
+             "hevc plan: disabled after a failure -> passthrough")
+    expectEq(CastVideoPlan.fpsLabel(59.94), "59.94", "fps label: 59.94")
+    expectEq(CastVideoPlan.fpsLabel(50), "50", "fps label: 50")
+    expectEq(CastVideoPlan.fpsLabel(59.9), "59.9", "fps label: trailing zero trimmed")
+
+    // Passthrough remux: hvc1 + hvcC from the source sets, sets out of the samples.
+    let (bytes, _) = straddlingCensusTS(videoFrames: 240, videoFrameTicks: 3_000, gop: 30,
+                                        frameLen: 400, audioLagTicks: 0, hevc: true)
+    var outcome: CastVideoPlanOutcome?
+    var videoInit: Data?
+    var segments: [Data] = []
+    let pass = CastFMP4Remuxer(videoPlan: CastVideoPlan(caps: streamerCaps))
+    pass.onVideoDecision = { outcome = $0 }
+    pass.onDemuxedInitSegments = { v, _ in videoInit = v }
+    pass.onDemuxedMediaSegments = { v, _, _, _ in segments.append(v) }
+    var thrown: Error?
+    do { try pass.feed(bytes) } catch { thrown = error }
+    pass.release()
+    expect(thrown == nil, "hevc remux: stream_type 0x24 is accepted")
+    expectEq(outcome?.source.codec, .hevc, "hevc remux: decision reported with the HEVC source")
+    expectEq(outcome?.decision.output, nil, "hevc remux: Streamer 1080 passes through")
+    expectEq(pass.videoPathDescription, "HEVC passthrough", "hevc remux: Stream Info path")
+    expect(videoInit.map { dataContains($0, "hvc1") && dataContains($0, "hvcC") && !dataContains($0, "avcC") } == true,
+           "hevc remux: init carries hvc1 + hvcC only")
+    expectEq(videoInit.flatMap { CastHLSSegmentStore.videoCodecString(from: $0) }, "hvc1.1.6.L153.B0",
+             "hevc remux: init codec string from the source sets")
+    expect(segments.count >= 2, "hevc remux: segments emitted (\(segments.count))")
+    expect(segments.allSatisfy { $0.range(of: Data(ps.vps)) == nil && $0.range(of: Data(ps.sps)) == nil },
+           "hevc remux: parameter sets stripped from the samples (hvc1)")
+
+    // Transcode wiring: the Ultra takes no HEVC, so the fake gets
+    // [VPS, SPS, PPS] and the plan reports an H.264 output.
+    var fake: FakeVideoTranscoder?
+    var tOutcome: CastVideoPlanOutcome?
+    let trans = CastFMP4Remuxer(
+        videoPlan: CastVideoPlan(caps: ultraCaps), videoDelivery: { block in block() },
+        videoTranscoderFactory: { _, _, keyTicks, sink, _ in
+            let f = FakeVideoTranscoder(sink: sink, keyTicks: keyTicks, latency: 2, config: hvcC)
+            fake = f
+            return f
+        })
+    trans.onVideoDecision = { tOutcome = $0 }
+    try? trans.feed(bytes)
+    trans.release()
+    expect(trans.videoIsTranscoded, "hevc transcode: video path is the transcoder")
+    expectEq(fake?.lastParameterSets, [ps.vps, ps.sps, ps.pps], "hevc transcode: VPS, SPS, PPS handed over")
+    expectEq(tOutcome?.outputDescription, "H.264 1280x720", "hevc transcode: note output, fps unknown omitted")
+    expectEq(trans.videoPathDescription, "HEVC -> H.264 1280x720", "hevc transcode: Stream Info path")
+}
+
+runVideoTranscodeChecks()
+
+// MARK: 19. HDR plan rules and the three-line note (2026-09-27)
+//
+// Measured: Sky Sports Main Event UHD is HEVC Main10 3840x2160@50 HLG
+// BT.2020. The Ultra got 8-bit H.264 with no tone map and looked washed
+// out; the plan now keeps HDR only where the receiver answers yes.
+
+@MainActor func runHDRPlanChecks() {
+    guard let hlg4K = CastVideoCodecConfig.hevcStreamInfo(sps: hevcSPS4K50HLG(), vps: nil) else {
+        expect(false, "hdr: 4K HLG SPS parses"); return
+    }
+    expectEq(hlg4K.hdrTransfer, .hlg, "hdr: transfer 18 reads as HLG")
+    expect(hlg4K.isHDR, "hdr: HLG source is HDR")
+    var pq4K = hlg4K; pq4K.transferCharacteristics = 16
+    expectEq(pq4K.hdrTransfer, .pq, "hdr: transfer 16 reads as PQ")
+    var sdr4K = hlg4K; sdr4K.transferCharacteristics = 1; sdr4K.colourPrimaries = 1
+    expect(!sdr4K.isHDR, "hdr: BT.709 source is SDR")
+    var hlg1080 = hlg4K; hlg1080.width = 1920; hlg1080.height = 1080
+    var hlg720 = hlg4K; hlg720.width = 1280; hlg720.height = 720
+
+    // Passthrough needs the HDR key at the source size class.
+    var sdrOnly4K = streamerCaps; sdrOnly4K.display?["hevc_4k60"] = true
+    let d = CastVideoPlan(caps: sdrOnly4K).decide(hlg4K)
+    expectEq(d.output, CastVideoOutputSpec(codec: .hevc, width: 1920, height: 1080, frameStep: 1,
+                                           bitrateCap: 12_000_000, hdr: false),
+             "hdr: 4K SDR yes, no HLG key -> HEVC 1080 SDR (tone mapped)")
+    expectEq(d.unsupported, ["HDR"], "hdr: only HDR ruled out")
+    var hdr4K = sdrOnly4K; hdr4K.display?["hevc_4k60_hlg"] = true
+    expectEq(CastVideoPlan(caps: hdr4K).decide(hlg4K).output, nil, "hdr: 4K HLG key -> passthrough")
+    expect(CastVideoPlan(caps: hdr4K).decide(pq4K).output != nil, "hdr: HLG key does not pass a PQ source")
+    var hdr1080 = streamerCaps; hdr1080.display?["hevc_1080p60_hlg"] = true
+    expectEq(CastVideoPlan(caps: hdr1080).decide(hlg1080).output, nil, "hdr: 1080 HLG key -> 1080 passthrough")
+    expect(CastVideoPlan(caps: streamerCaps).decide(hlg1080).output != nil,
+           "hdr: 1080 HEVC SDR yes without the HLG key -> transcode")
+    var mseHLG = streamerCaps; mseHLG.mse["hvc1.hlg"] = true
+    expectEq(CastVideoPlan(caps: mseHLG).decide(hlg720).output, nil, "hdr: 720 with MSE hvc1.hlg -> passthrough")
+    expect(CastVideoPlan(caps: mseHLG).decide(hlg1080).output != nil,
+           "hdr: MSE hvc1.hlg does not vouch for 1080")
+
+    // Transcode keeps HDR only with the key for the OUTPUT size class.
+    let keep = CastVideoPlan(caps: hdr1080).decide(hlg4K)
+    expectEq(keep.output, CastVideoOutputSpec(codec: .hevc, width: 1920, height: 1080, frameStep: 1,
+                                              bitrateCap: 12_000_000, hdr: true),
+             "hdr: 4K HLG, 1080 HLG key -> HEVC 1080 HDR kept")
+    expectEq(keep.unsupported, ["4K"], "hdr: Streamer with 1080 HLG rules out 4K only")
+    let keepOutcome = CastVideoPlanOutcome(source: hlg4K, decision: keep)
+    expectEq(keepOutcome.outputDescription, "HEVC 1920x1080 at 50fps HDR", "hdr note: kept output line")
+    expect(CastVideoTranscoder.outputTenBit(source: hlg4K, spec: keep.output!), "hdr: kept output is Main10")
+    let streamerD = CastVideoPlan(caps: streamerCaps).decide(hlg4K)
+    expectEq(streamerD.output?.hdr, false, "hdr: Streamer without HDR keys -> SDR HEVC 1080")
+    expect(!CastVideoTranscoder.outputTenBit(source: hlg4K, spec: streamerD.output!),
+           "hdr: tone-mapped HEVC output is 8-bit Main")
+    expectEq(streamerD.unsupported, ["4K", "HDR"], "hdr: Streamer rules out 4K, HDR")
+    var hevc8Bit10 = sdr4K; hevc8Bit10.width = 3840
+    expect(CastVideoTranscoder.outputTenBit(source: hevc8Bit10, spec: streamerD.output!),
+           "hdr: 10-bit SDR HEVC source keeps Main10")
+
+    // Chromecast Ultra: H.264, always SDR, full three-line note.
+    let ultraD = CastVideoPlan(caps: ultraCaps).decide(hlg4K)
+    expectEq(ultraD.output, CastVideoOutputSpec(codec: .h264, width: 1280, height: 720, frameStep: 1,
+                                                bitrateCap: 8_000_000, hdr: false),
+             "hdr: Ultra -> H.264 720p SDR")
+    let ultraOutcome = CastVideoPlanOutcome(source: hlg4K, decision: ultraD)
+    expectEq(ultraOutcome.sourceDescription, "HEVC 3840x2160 at 50fps HDR", "hdr note: source line")
+    expectEq(ultraOutcome.outputDescription, "H.264 1280x720 at 50fps", "hdr note: output line")
+    expectEq(ultraOutcome.receiverLine(deviceName: "Travel Chromecast TV"),
+             "Your Travel Chromecast TV doesn't support HEVC, 4K, HDR", "hdr note: receiver line")
+    expectEq(ultraOutcome.receiverLine(deviceName: nil),
+             "This receiver doesn't support HEVC, 4K, HDR", "hdr note: unnamed receiver")
+    var ultraHDR = ultraCaps; ultraHDR.display?["hevc_4k60_hlg"] = true
+    expectEq(CastVideoPlan(caps: ultraHDR).decide(hlg4K).output?.codec, .h264,
+             "hdr: an HDR yes without HEVC SDR yes still goes to H.264 (never HDR H.264)")
+
+    // H.264 sources: 1080p60 vs 1080p on the list.
+    let h264 = try? CastFMP4Remuxer.parseSPSInfo(h264SPS1080p60())
+    if let h264 {
+        expectEq(CastVideoPlan(caps: ultraCaps).decide(h264).unsupported, ["1080p60"],
+                 "note list: Ultra rules out 1080p60 for an H.264 1080p59.94 source")
+        var no1080 = ultraCaps; no1080.display?["h264_1080p30"] = false
+        expectEq(CastVideoPlan(caps: no1080).decide(h264).unsupported, ["1080p"],
+                 "note list: no 1080 at all -> 1080p")
+    }
+
+    // Forced and unmeasured.
+    var forced = CastVideoPlan(caps: streamerCaps); forced.force = true
+    let fo = CastVideoPlanOutcome(source: hlg1080, decision: forced.decide(hlg1080))
+    expectEq(fo.receiverLine(deviceName: "Den TV"), "Transcode forced by the Developer switch",
+             "hdr note: forced line")
+    let blind = CastVideoPlanOutcome(source: hlg4K, decision: CastVideoPlan.passthrough.decide(hlg4K))
+    expectEq(blind.decision.output?.hdr, false, "hdr: no caps -> H.264 SDR")
+    expectEq(blind.receiverLine(deviceName: "Den TV"), "Your Den TV didn't report what it supports",
+             "hdr note: no caps line")
+    expectEq(CastVideoPlanOutcome(source: hlg4K, decision: CastVideoPlan(caps: hdr4K).decide(hlg4K))
+                .receiverLine(deviceName: "Den TV"), nil, "hdr note: passthrough has no note")
+}
+
+runHDRPlanChecks()
+
+// MARK: 18. In-place AirPlay flip: LAN / loopback playlist splice (2026-09-27)
+//
+// The flip keeps one remuxer and one playlist URL; the new channel's
+// first segment carries EXT-X-DISCONTINUITY and the media sequence just
+// continues. TSHLSPlaylist is the renderer every TSHLSRemuxer playlist
+// (loopback, LAN, in-process) goes through.
+
+@MainActor func runInPlaceFlipPlaylistChecks() {
+    func window(_ seqs: ClosedRange<Int>, _ d: Double = 2.5) -> [TSHLSPlaylist.Entry] {
+        seqs.map { TSHLSPlaylist.Entry(seq: $0, duration: d, uri: "seg\($0).ts") }
+    }
+    func count(_ text: String, _ needle: String) -> Int { text.components(separatedBy: needle).count - 1 }
+
+    // No flip yet: byte-identical to the pre-flip format (no DSEQ line).
+    let plain = TSHLSPlaylist.render(window: window(3...3, 2.0), targetDuration: 4, version: 3,
+                                     discontinuitySeqs: [], eventPlaylist: false, mapURI: nil, complete: false)
+    expectEq(plain, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:3\n#EXTINF:2.000,\nseg3.ts\n",
+             "flip playlist: no discontinuity renders the classic text")
+    expectEq(TSHLSPlaylist.emptyText(targetDuration: 4),
+             "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n",
+             "flip playlist: empty playlist text")
+
+    // Flip at seq 14: the receiver's window straddles both channels.
+    let straddle = TSHLSPlaylist.render(window: window(10...17), targetDuration: 4, version: 3,
+                                        discontinuitySeqs: [14], eventPlaylist: false, mapURI: nil, complete: false)
+    expect(straddle.contains("#EXT-X-MEDIA-SEQUENCE:10\n"), "flip playlist: media sequence continues across the flip")
+    expect(straddle.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0\n"), "flip playlist: DSEQ 0 while the tag is in the window")
+    expectEq(count(straddle, "#EXT-X-DISCONTINUITY\n"), 1, "flip playlist: exactly one discontinuity tag")
+    expect(straddle.contains("seg13.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2.500,\nseg14.ts\n"),
+           "flip playlist: the tag sits right before the new channel's first segment")
+    expect(straddle.contains("#EXT-X-TARGETDURATION:4\n"), "flip playlist: fixed LAN target duration kept")
+
+    // The tagged segment slid out: DSEQ bumps, tag gone.
+    let after = TSHLSPlaylist.render(window: window(15...22), targetDuration: 4, version: 3,
+                                     discontinuitySeqs: [14], eventPlaylist: false, mapURI: nil, complete: false)
+    expect(after.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"), "flip playlist: DSEQ 1 once the tag slid out")
+    expectEq(count(after, "#EXT-X-DISCONTINUITY\n"), 0, "flip playlist: no tag after it slid out")
+
+    // Two flips: only the one still in the window is tagged.
+    let two = TSHLSPlaylist.render(window: window(15...22), targetDuration: 4, version: 3,
+                                   discontinuitySeqs: [14, 20], eventPlaylist: false, mapURI: nil, complete: false)
+    expect(two.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"), "flip playlist: two flips, DSEQ counts the slid one")
+    expectEq(count(two, "#EXT-X-DISCONTINUITY\n"), 1, "flip playlist: two flips, one tag in the window")
+    expect(two.contains("#EXT-X-DISCONTINUITY\n#EXTINF:2.500,\nseg20.ts"), "flip playlist: second flip tagged")
+    expectEq(TSHLSPlaylist.discontinuitySequence(firstSeq: 21, discontinuitySeqs: [14, 20]), 2,
+             "flip playlist: DSEQ 2 once both slid out")
+
+    // Header order for the other variants (event, fMP4 map, finished).
+    let event = TSHLSPlaylist.render(window: window(0...1), targetDuration: 2, version: 7,
+                                     discontinuitySeqs: [1], eventPlaylist: true, mapURI: "init.mp4", complete: true)
+    expect(event.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-MAP:URI=\"init.mp4\"\n"),
+           "flip playlist: DSEQ, event and map order")
+    expect(event.hasSuffix("seg1.ts\n#EXT-X-ENDLIST\n"), "flip playlist: ENDLIST last")
+
+    // Receiver crossing: first fetch of a new-generation segment.
+    expect(!TSHLSPlaylist.receiverCrossed(receiverHighestSeq: -1, generationFirstSeq: 0),
+           "flip cross: nothing fetched is not a crossing")
+    expect(!TSHLSPlaylist.receiverCrossed(receiverHighestSeq: 13, generationFirstSeq: 14),
+           "flip cross: still on the old channel")
+    expect(TSHLSPlaylist.receiverCrossed(receiverHighestSeq: 14, generationFirstSeq: 14),
+           "flip cross: first new-generation segment fetched")
+
+    // LAN audio stage (Roku AAC rewrite): the old channel's codec / PES
+    // state never runs into the new one across the flip.
+    var fakes: [FakeCastAudioTranscoder] = []
+    let stage = TSLANAudioStage(rewriter: TSLANAudioRewriter(log: { _ in }, canDecode: { _ in true },
+                                                             transcoderFactory: { _, c, f in
+        let fake = FakeCastAudioTranscoder(onConfig: c, onFrame: f)
+        fakes.append(fake)
+        return fake
+    }))
+    var seg: [UInt8] = syntheticPAT() + syntheticPMT()
+    for p in packetsFor(pid: 0x100, pes: pesBytes(streamID: 0xE0, pts: 900_000, payload: [0, 0, 0, 1, 0x65, 0x88])) { seg += p }
+    var acc: UInt8 = 0
+    seg += TSLANAudioRewriter.packetizePES(payload: ac3Frame(), pts: 900_000, pid: 0x101, cc: &acc)
+    _ = stage.produce(seq: 5, sources: [(5, Data(seg))], oldestSeq: 0, discontinuities: [7])
+    _ = stage.produce(seq: 6, sources: [(6, Data(seg))], oldestSeq: 0, discontinuities: [7])
+    let flushesBefore = fakes.reduce(0) { $0 + $1.flushes }
+    expectEq(flushesBefore, 0, "flip stage: contiguous same-source segments keep codec state")
+    _ = stage.produce(seq: 7, sources: [(7, Data(seg))], oldestSeq: 0, discontinuities: [7])
+    expectEq(fakes.reduce(0) { $0 + $1.flushes }, 1, "flip stage: the new channel's first segment resets the rewriter")
+}
+
+runInPlaceFlipPlaylistChecks()
+
+// MARK: audio-only programs (GH #90)
+
+/// A TS whose PMT declares `streamType` audio on pid 0x101 and, when
+/// `declareVideo` is set, an H.264 entry on pid 0x100 that never sends a
+/// packet (the 3 s no-video fallback). `framesPerPES` frames per PES.
+func audioOnlyFixtureTS(declareVideo: Bool, streamType: UInt8, frame: [UInt8],
+                        frameTicks: Int64, frames: Int, framesPerPES: Int = 4) -> Data {
+    var writer = CensusTSWriter()
+    let base: Int64 = 10_000
+    let pat: [UInt8] = [0x00, 0xB0, 13, 0x00, 0x01, 0xC1, 0, 0, 0, 0x01, 0xF0, 0x00, 0, 0, 0, 0]
+    var pmtBody: [UInt8] = [0x00, 0x01, 0xC1, 0, 0, 0xE1, 0x01, 0xF0, 0x00]
+    if declareVideo { pmtBody += [0x1B, 0xE1, 0x00, 0xF0, 0x00] }
+    pmtBody += [streamType, 0xE1, 0x01, 0xF0, 0x00]
+    let pmt: [UInt8] = [0x02, 0xB0, UInt8(pmtBody.count + 4)] + pmtBody + [0, 0, 0, 0]
+    writer.psi(pid: 0, table: pat)
+    writer.psi(pid: 0x1000, table: pmt)
+    var n = 0
+    while n < frames {
+        let end = min(n + framesPerPES, frames)
+        var bytes: [UInt8] = []
+        for _ in n..<end { bytes += frame }
+        writer.pes(pid: 0x101, payload: censusPES(streamID: 0xC0, payload: bytes,
+                                                  pts: base + Int64(n) * frameTicks, dts: nil))
+        n = end
+    }
+    return writer.bytes
+}
+
+struct AudioOnlyRun {
+    var videoInit: Data?
+    var audioInit: Data?
+    var initCalls = 0
+    var videoParts: [Data] = []
+    var audioParts: [Data] = []
+    var durations: [Int64] = []
+    var audioDurations: [Int64] = []
+    var threw: Error?
+    var logs: [String] = []
+}
+
+@MainActor func runAudioOnly(_ ts: Data, remuxer: CastFMP4Remuxer, logs: @escaping () -> [String] = { [] }) -> AudioOnlyRun {
+    var run = AudioOnlyRun()
+    remuxer.onDemuxedInitSegments = { v, a in run.videoInit = v; run.audioInit = a; run.initCalls += 1 }
+    remuxer.onDemuxedMediaSegments = { v, a, ticks, aTicks in
+        run.videoParts.append(v)
+        if let a { run.audioParts.append(a) }
+        run.durations.append(ticks)
+        run.audioDurations.append(aTicks)
+    }
+    do { try remuxer.feed(ts) } catch { run.threw = error }
+    remuxer.release()
+    run.logs = logs()
+    return run
+}
+
+@MainActor func checkAudioOnlySegments(_ run: AudioOnlyRun, frameTicks: Int64, label: String) {
+    expect(run.threw == nil, "\(label): not refused (\(String(describing: run.threw)))")
+    expectEq(run.initCalls, 1, "\(label): one init")
+    expect(run.videoInit == nil, "\(label): no video init")
+    expect(run.videoParts.allSatisfy { $0.isEmpty }, "\(label): no video rendition bytes")
+    expectEq(run.audioParts.count, run.durations.count, "\(label): every cut has an audio segment")
+    expect(run.audioParts.count >= 3, "\(label): at least three segments (\(run.audioParts.count))")
+    // Whole frames, first cut at or past 2 s by less than one frame.
+    let perSegment = (CastFMP4Remuxer.audioOnlySegmentTicks + frameTicks - 1) / frameTicks
+    let full = run.durations.dropLast()
+    expect(full.allSatisfy { $0 == perSegment * frameTicks },
+           "\(label): full segments are \(perSegment) frames = \(perSegment * frameTicks) ticks (\(Array(full)))")
+    expect(run.durations.last.map { $0 > 0 && $0 <= perSegment * frameTicks } ?? false,
+           "\(label): the release tail is a shorter final segment")
+    expectEq(run.durations, run.audioDurations, "\(label): audio EXTINF equals the cut span")
+    var contiguous = true
+    var expectedStart: Int64 = 0
+    var seqOK = true
+    var tracksOK = true
+    var countsOK = true
+    for (i, seg) in run.audioParts.enumerated() {
+        let spans = segmentSpans(seg)
+        guard let span = spans[2] else { contiguous = false; continue }
+        if span.start != expectedStart || span.end - span.start != run.durations[i] { contiguous = false }
+        expectedStart = span.end
+        if moofSequenceNumber(seg) != Int64(i + 1) { seqOK = false }
+        if trafTrackIDs(seg) != [2] { tracksOK = false }
+        if trunSampleCounts(seg) != [run.durations[i] / frameTicks] { countsOK = false }
+    }
+    expect(contiguous, "\(label): tfdt starts at 0 and each segment starts where the previous ended")
+    expect(seqOK, "\(label): moof sequence numbers 1, 2, 3, ...")
+    expect(tracksOK, "\(label): every segment carries only the audio traf (track 2)")
+    expect(countsOK, "\(label): trun sample count matches the duration in frames")
+}
+
+@MainActor func runAudioOnlyChecks() {
+    // 1. AAC ADTS, PMT with no video PID.
+    let aacTicks: Int64 = 1920 // 1024 samples at 48 kHz
+    let aacTS = audioOnlyFixtureTS(declareVideo: false, streamType: 0x0F, frame: censusADTSFrame(200),
+                                   frameTicks: aacTicks, frames: 330)
+    var aacLogs: [String] = []
+    let aacRemuxer = CastFMP4Remuxer(log: { aacLogs.append($0) })
+    let aac = runAudioOnly(aacTS, remuxer: aacRemuxer, logs: { aacLogs })
+    checkAudioOnlySegments(aac, frameTicks: aacTicks, label: "audio-only AAC")
+    expect(aacRemuxer.isAudioOnly, "audio-only AAC: remuxer reports audio-only")
+    expectEq(aacRemuxer.videoPathDescription, "none (audio only)", "audio-only AAC: video path description")
+    expectEq(aacRemuxer.audioCodecsAttribute, "mp4a.40.2", "audio-only AAC: CODECS attribute")
+    if let ainit = aac.audioInit {
+        expect(dataContains(ainit, "mp4a") && dataContains(ainit, "esds") && dataContains(ainit, "soun"),
+               "audio-only AAC: init has the mp4a/esds audio track")
+        expect(!dataContains(ainit, "avc1") && !dataContains(ainit, "vide") && !dataContains(ainit, "hvc1"),
+               "audio-only AAC: init has no video track")
+        expectEq(CastHLSSegmentStore.audioCodecString(from: ainit), "mp4a.40.2", "audio-only AAC: init codec string")
+    } else {
+        expect(false, "audio-only AAC: audio init emitted")
+    }
+    expect(aac.logs.contains { $0.hasPrefix("[AUDIO-ONLY] detected: no video track in PMT; serving audio-only") },
+           "audio-only AAC: detection logged")
+    expect(!aac.logs.contains { $0.contains("[Cast] video plan") }, "audio-only AAC: no video plan runs")
+
+    // 2. PMT declares a video PID that never sends: the 3 s fallback.
+    let silentTS = audioOnlyFixtureTS(declareVideo: true, streamType: 0x0F, frame: censusADTSFrame(200),
+                                      frameTicks: aacTicks, frames: 400)
+    var silentLogs: [String] = []
+    let silentRemuxer = CastFMP4Remuxer(log: { silentLogs.append($0) })
+    let silent = runAudioOnly(silentTS, remuxer: silentRemuxer, logs: { silentLogs })
+    checkAudioOnlySegments(silent, frameTicks: aacTicks, label: "silent video PID fallback")
+    expect(silent.logs.contains { $0.hasPrefix("[AUDIO-ONLY] detected: no video packets in 3 s") },
+           "silent video PID fallback: detection logged")
+    // 3 s of grace (141 frames) plus the next PES is lost to detection.
+    let silentFrames = silent.durations.reduce(0, +) / aacTicks
+    expect(silentFrames >= 400 - 150 && silentFrames < 400 - 140,
+           "silent video PID fallback: only the 3 s detection window is dropped (\(silentFrames) frames)")
+
+    // 3. MPEG audio (MP2) still goes through the AAC transcode.
+    let mp2Ticks: Int64 = 1152 * CastFMP4Remuxer.ticksPerSecond / 48_000 // 2160
+    var fake: FakeCastAudioTranscoder?
+    let mp2Remuxer = CastFMP4Remuxer(transcoderFactory: { _, c, f in
+        let t = FakeCastAudioTranscoder(onConfig: c, onFrame: f)
+        fake = t
+        return t
+    })
+    let mp2TS = audioOnlyFixtureTS(declareVideo: false, streamType: 0x04, frame: mp2Frame(),
+                                   frameTicks: mp2Ticks, frames: 320, framesPerPES: 2)
+    let mp2 = runAudioOnly(mp2TS, remuxer: mp2Remuxer)
+    expect(mp2.threw == nil, "audio-only MP2: transcoded, not refused")
+    expect((fake?.fedLengths.count ?? 0) >= 300, "audio-only MP2: frames reach the transcoder")
+    expectEq(mp2Remuxer.audioPathDescription, "MP2 stereo -> AAC stereo", "audio-only MP2: audio path")
+    expectEq(mp2Remuxer.audioCodecsAttribute, "mp4a.40.2", "audio-only MP2: CODECS names AAC")
+    expect(mp2.audioInit.map { dataContains($0, "mp4a") && dataContains($0, "esds") } ?? false,
+           "audio-only MP2: init carries the encoder's AAC track")
+    expect(mp2.videoInit == nil && mp2.audioParts.count >= 3, "audio-only MP2: audio-only segments")
+    // The fake hands back one AAC unit per source frame at the source PTS,
+    // so the stamps step by the MP2 frame and the trun by audioFrameTicks.
+
+    // 4. AC-3 passthrough to a receiver that decodes it.
+    let ac3Ticks: Int64 = 2880
+    let ac3TS = audioOnlyFixtureTS(declareVideo: false, streamType: 0x81, frame: ac3Frame(),
+                                   frameTicks: ac3Ticks, frames: 250)
+    let ac3Remuxer = CastFMP4Remuxer(allowAC3Passthrough: true)
+    let ac3 = runAudioOnly(ac3TS, remuxer: ac3Remuxer)
+    checkAudioOnlySegments(ac3, frameTicks: ac3Ticks, label: "audio-only AC-3 passthrough")
+    expect(ac3.audioInit.map { dataContains($0, "ac-3") && dataContains($0, "dac3") } ?? false,
+           "audio-only AC-3 passthrough: init carries ac-3/dac3")
+    expectEq(ac3Remuxer.audioCodecsAttribute, "ac-3", "audio-only AC-3 passthrough: CODECS attribute")
+
+    // 5. AC-3 with no passthrough and no transcode plan still refuses by name.
+    var refused: CastUnsupportedCodecError?
+    do { try CastFMP4Remuxer().feed(ac3TS) } catch let e as CastUnsupportedCodecError { refused = e } catch {}
+    expectEq(refused?.codecName, "AC-3 audio", "audio-only AC-3 without a plan refuses by name")
+
+    // 6. Store: master and media playlists for an audio-only generation.
+    let store = CastHLSSegmentStore()
+    let gen = store.beginGeneration()
+    store.setAudioCodecsAttribute(aacRemuxer.audioCodecsAttribute)
+    store.setDemuxedInitSegments(generation: gen, video: nil, audio: aac.audioInit)
+    for i in aac.audioParts.indices {
+        store.addSegment(generation: gen, durationTicks: aac.durations[i],
+                         videoData: aac.videoParts[i].isEmpty ? nil : aac.videoParts[i],
+                         audioData: aac.audioParts[i], audioDurationTicks: aac.audioDurations[i])
+    }
+    let master = store.demuxedMasterPlaylistText()
+    expectEq(master, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=320000,CODECS=\"mp4a.40.2\"\naudio.m3u8\n",
+             "audio-only master: one audio variant")
+    expect(!master.contains("RESOLUTION") && !master.contains("EXT-X-MEDIA") && !master.contains("video.m3u8"),
+           "audio-only master: no resolution, no media group, no video playlist")
+    print("[audio-only master]\n\(master)")
+    let audioPlaylist = store.audioPlaylistText()
+    print("[audio-only media]\n\(audioPlaylist)")
+    expect(audioPlaylist.contains("#EXT-X-MAP:URI=\"ainit\(gen).mp4\"") && audioPlaylist.contains("aseg0.m4s"),
+           "audio-only media playlist serves ainit + aseg")
+    expect(audioPlaylist.contains("#EXTINF:2.005,") && audioPlaylist.contains("#EXT-X-TARGETDURATION:3"),
+           "audio-only media playlist: 2.005 s segments, target 3")
+    expect(store.awaitSegment(seq: 0, rendition: .audio, timeout: 0) != nil, "audio-only: aseg0 served")
+    expect(store.awaitSegment(seq: 0, rendition: .video, timeout: 0) == nil, "audio-only: no vseg")
+    expectEq(CastHLSSegmentStore.audioOnlyMasterPlaylistText(audioCodec: "ac-3"),
+             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"ac-3\"\naudio.m3u8\n",
+             "audio-only master: AC-3 variant")
+
+    // 7. Flip video -> audio-only -> video: each playlist lists only the
+    // trailing run matching the current generation's shape.
+    let flip = CastHLSSegmentStore()
+    let g1 = flip.beginGeneration()
+    flip.setDemuxedInitSegments(generation: g1, video: Data("v1".utf8), audio: Data("mp4a".utf8))
+    for _ in 0..<3 {
+        flip.addSegment(generation: g1, durationTicks: 270_000, videoData: Data([1]), audioData: Data([2]))
+    }
+    let g2 = flip.beginGeneration()
+    flip.setDemuxedInitSegments(generation: g2, video: nil, audio: Data("mp4a".utf8))
+    for _ in 0..<2 {
+        flip.addSegment(generation: g2, durationTicks: 180_480, videoData: nil, audioData: Data([3]))
+    }
+    let flipAudio = flip.audioPlaylistText()
+    expect(flipAudio.contains("#EXT-X-MEDIA-SEQUENCE:0") && flipAudio.contains("#EXT-X-DISCONTINUITY\n")
+           && flipAudio.contains("ainit\(g1).mp4") && flipAudio.contains("ainit\(g2).mp4"),
+           "flip to audio-only: audio playlist keeps the old audio, discontinuity into the new generation")
+    expect(flip.demuxedMasterPlaylistText().hasSuffix("audio.m3u8\n"), "flip to audio-only: master is audio-only")
+    let g3 = flip.beginGeneration()
+    flip.setDemuxedInitSegments(generation: g3, video: Data("v3".utf8), audio: Data("mp4a".utf8))
+    flip.addSegment(generation: g3, durationTicks: 270_000, videoData: Data([4]), audioData: Data([5]))
+    let backVideo = flip.videoPlaylistText()
+    let backAudio = flip.audioPlaylistText()
+    expect(backVideo.contains("#EXT-X-MEDIA-SEQUENCE:5") && !backVideo.contains("vinit\(g2)")
+           && backVideo.contains("vseg5.m4s") && !backVideo.contains("vseg4.m4s"),
+           "flip back to video: video playlist starts at the new generation")
+    expect(backAudio.contains("#EXT-X-MEDIA-SEQUENCE:5") && !backAudio.contains("aseg4.m4s"),
+           "flip back to video: audio playlist aligned with the video one")
+    expect(backVideo.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1") && backAudio.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"),
+           "flip back to video: trimmed discontinuity counted")
+    expect(flip.demuxedMasterPlaylistText().contains("video.m3u8"), "flip back to video: master has video again")
+
+    // 8. A PMT with video still produces the old demuxed output.
+    var es: [UInt8] = []
+    for _ in 0..<120 { es += mp2Frame() }
+    var vInit: Data?
+    var vInitCalls = 0
+    var vParts: [Data] = []
+    let videoRemuxer = CastFMP4Remuxer(transcoderFactory: { _, c, f in FakeCastAudioTranscoder(onConfig: c, onFrame: f) })
+    videoRemuxer.onDemuxedInitSegments = { v, _ in vInit = v; vInitCalls += 1 }
+    videoRemuxer.onDemuxedMediaSegments = { v, _, _, _ in vParts.append(v) }
+    let videoTS = mpegAudioFixtureTS(audioStreamType: 0x04, audioES: es, audioFrameLen: 384,
+                                     audioFrameTicks: mp2Ticks, videoFrames: 150)
+    do { try videoRemuxer.feed(videoTS) } catch { expect(false, "video PMT: not refused (\(error))") }
+    expect(!videoRemuxer.isAudioOnly, "video PMT: not audio-only")
+    expect(vInitCalls == 1 && vInit.map { dataContains($0, "avc1") } == true, "video PMT: video init with avc1")
+    expect(!vParts.isEmpty && vParts.allSatisfy { !$0.isEmpty && trafTrackIDs($0) == [1] },
+           "video PMT: video segments carry the video traf")
+}
+
+runAudioOnlyChecks()
+
+// MARK: Audio-only sample clock: one resync per source step
+
+/// ADTS AAC-LC 44.1 kHz stereo frame of `len` bytes (1024 samples).
+func clockADTSFrame(_ len: Int = 100) -> [UInt8] {
+    var f: [UInt8] = [0xFF, 0xF1, 0x50, 0x80 | UInt8((len >> 11) & 0x03),
+                      UInt8((len >> 3) & 0xFF), UInt8((len & 0x07) << 5) | 0x1F, 0xFC]
+    f += [UInt8](repeating: 0x21, count: len - 7)
+    return f
+}
+
+/// TS packets of one PES (PTS only) carrying `frames` ADTS frames.
+func clockPESPackets(pts: Int64, frames: Int, cc: inout UInt8) -> [Data] {
+    var pes: [UInt8] = [0, 0, 1, 0xC0, 0, 0, 0x80, 0x80, 5, 0, 0, 0, 0, 0]
+    AudioOnlySampleClock.writeTS(&pes, 9, pts)
+    pes[9] = (pes[9] & 0x0F) | 0x20
+    for _ in 0..<frames { pes += clockADTSFrame() }
+    var out: [Data] = []
+    var i = 0
+    while i < pes.count {
+        let chunk = Array(pes[i..<min(i + 184, pes.count)])
+        var pkt = tsPacket(pid: 0x100, pusi: i == 0, cc: cc, payload: chunk)
+        if chunk.count < 184 {
+            // Pad with an adaptation field so the payload stays contiguous.
+            let pad = 184 - chunk.count
+            pkt = [0x47, i == 0 ? 0x41 : 0x01, 0x00, 0x30 | cc, UInt8(pad - 1)]
+            if pad > 1 { pkt += [0x00] + [UInt8](repeating: 0xFF, count: pad - 2) }
+            pkt += chunk
+        }
+        cc = (cc + 1) & 0x0F
+        out.append(Data(pkt))
+        i += 184
+    }
+    return out
+}
+
+@MainActor func runAudioOnlyClockStepChecks() {
+    // 8 frames per PES (185.8 ms), PTS rounded to whole ms like the
+    // SiriusXM feed, one genuine +291 ms step before PES 20.
+    var clock = AudioOnlySampleClock(streamType: 0x0F, primaryPID: 0x100)
+    clock.requestResync(nil)
+    var cc: UInt8 = 0
+    var resyncs: [(Int, String)] = []
+    var outPTS: [Int64] = []
+    let pesSamples = 8 * 1024
+    for n in 0..<60 {
+        let exact = Double(n * pesSamples) / 44100 + (n >= 20 ? 0.291 : 0)
+        let pts = Int64((exact * 1000).rounded()) * 90 + 900_000
+        for (k, pkt) in clockPESPackets(pts: pts, frames: 8, cc: &cc).enumerated() {
+            let r = clock.process(pkt)
+            for line in r.logs where line.contains("resync") { resyncs.append((n, line)) }
+            if k == 0 { outPTS.append(AudioOnlySampleClock.readTS([UInt8](r.packet), 4 + 9)) }
+        }
+    }
+    expectEq(resyncs.count, 1, "audio-only clock: one 291 ms source step yields exactly one resync")
+    expect(resyncs.first?.0 == 20, "audio-only clock: the resync lands on the stepped PES")
+    // After the step the output advances by the counted frames only.
+    let steps = (21..<60).map { outPTS[$0] - outPTS[$0 - 1] }
+    expect(steps.allSatisfy { abs($0 - Int64(pesSamples) * 90_000 / 44100) <= 1 },
+           "audio-only clock: after the resync the output PTS steps by exactly 8 frames")
+
+    // Field case: PES that arrive with frames missing while the source
+    // PTS keeps real time. Each short PES is a genuine hole, one resync each.
+    var lossy = AudioOnlySampleClock(streamType: 0x0F, primaryPID: 0x100)
+    lossy.requestResync(nil)
+    var lossyResyncs = 0
+    var t: Int64 = 900_000
+    for n in 0..<40 {
+        let frames = (10..<20).contains(n) ? 3 : 8
+        for pkt in clockPESPackets(pts: t, frames: frames, cc: &cc) {
+            lossyResyncs += lossy.process(pkt).logs.filter { $0.contains("resync") }.count
+        }
+        t += Int64(8 * 1024) * 90_000 / 44100
+    }
+    expectEq(lossyResyncs, 10, "audio-only clock: ten PES missing frames yield ten resyncs, one each")
+}
+
+runAudioOnlyClockStepChecks()
+
+// MARK: AirPlay LAN card video (audio-only programs)
+
+@MainActor func cardPSIPacket(pid: Int, section: [UInt8]) -> [UInt8] {
+    var sec = section
+    let crc = TSLANAudioRewriter.crc32MPEG(sec)
+    sec += [UInt8(crc >> 24), UInt8((crc >> 16) & 0xFF), UInt8((crc >> 8) & 0xFF), UInt8(crc & 0xFF)]
+    var p: [UInt8] = [0x47, 0x40 | UInt8(pid >> 8), UInt8(pid & 0xFF), 0x10, 0x00] + sec
+    p += [UInt8](repeating: 0xFF, count: 188 - p.count)
+    return p
+}
+
+@MainActor func cardFixtureSegment(startPTS: Int64, seconds: Double) -> [UInt8] {
+    // PAT: program 1 -> PMT PID 0x1000. PMT: PCR on 0x101, AC-3 on 0x101.
+    let pat: [UInt8] = [0x00, 0xB0, 13, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xF0, 0x00]
+    let pmt: [UInt8] = [0x02, 0xB0, 18, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x01, 0xF0, 0x00,
+                        0x81, 0xE1, 0x01, 0xF0, 0x00]
+    var seg = cardPSIPacket(pid: 0, section: pat) + cardPSIPacket(pid: 0x1000, section: pmt)
+    var cc: UInt8 = 0
+    var pts = startPTS
+    let frameTicks: Int64 = 2880                    // AC-3 1536 samples at 48 kHz
+    let frames = Int(seconds * 90_000) / Int(frameTicks)
+    for _ in 0..<frames {
+        var frame: [UInt8] = [0x0B, 0x77]
+        frame += [UInt8](repeating: 0x5A, count: 380)
+        seg += TSLANAudioRewriter.packetizePES(payload: frame, pts: pts, pid: 0x101, cc: &cc)
+        pts += frameTicks
+    }
+    return seg
+}
+
+@MainActor func runCardVideoChecks() {
+    // Synthetic access unit: AUD, SPS, PPS, IDR (NAL 5), large enough to span packets.
+    var au: [UInt8] = [0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1F, 0xAC,
+                       0, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84]
+    au += [UInt8](repeating: 0x42, count: 3000)
+    var cc: UInt8 = 0
+    for (index, start) in [Int64(900_000), TSLANAudioRewriter.pts33Mask - 45_000].enumerated() {
+        let label = index == 0 ? "card" : "card (PTS wrap)"
+        let seg = cardFixtureSegment(startPTS: start, seconds: 2.0)
+        let ccBefore = cc
+        guard let out = TSCardVideoMuxer.inject(segment: seg, accessUnit: au, fps: 1, cc: &cc) else {
+            expect(false, "\(label): injected"); continue
+        }
+        expect(out.count % 188 == 0 && out.count > seg.count, "\(label): whole packets, larger than the source")
+        let packets = stride(from: 0, to: out.count, by: 188).map { Array(out[$0..<($0 + 188)]) }
+        func pid(_ p: [UInt8]) -> Int { (Int(p[1] & 0x1F) << 8) | Int(p[2]) }
+        guard let pmtPacket = packets.first(where: { pid($0) == 0x1000 }),
+              let info = TSLANAudioRewriter.parsePMT(pmtPacket) else { expect(false, "\(label): PMT parses"); continue }
+        expect(info.videoPID == 0x0100, "\(label): PMT lists the H.264 card PID")
+        expect(info.audio.map(\.pid) == [0x101], "\(label): PMT keeps the audio PID")
+        expectEq(info.pcrPID, 0x0100, "\(label): PCR_PID is the video PID")
+        // CRC over the rewritten section is valid.
+        let s = 5
+        let secLen = (Int(pmtPacket[s + 1] & 0x0F) << 8) | Int(pmtPacket[s + 2])
+        let body = Array(pmtPacket[s..<(s + 3 + secLen - 4)])
+        let crcBytes = Array(pmtPacket[(s + 3 + secLen - 4)..<(s + 3 + secLen)])
+        let crc = TSLANAudioRewriter.crc32MPEG(body)
+        expect(crcBytes == [UInt8(crc >> 24), UInt8((crc >> 16) & 0xFF), UInt8((crc >> 8) & 0xFF), UInt8(crc & 0xFF)],
+               "\(label): PMT CRC valid")
+        // The first non-PSI packet opens a video PES with RAI + PCR and an IDR.
+        guard let firstES = packets.first(where: { pid($0) != 0 && pid($0) != 0x1000 }) else {
+            expect(false, "\(label): has ES packets"); continue
+        }
+        expect(pid(firstES) == 0x0100 && firstES[1] & 0x40 != 0, "\(label): segment starts with a video PES")
+        expect(firstES[5] & 0x40 != 0, "\(label): first video packet sets random_access_indicator")
+        expectEq(TSCardVideoMuxer.decodePCR(firstES), (start - TSCardVideoMuxer.pcrLeadTicks) & TSLANAudioRewriter.pts33Mask,
+                 "\(label): first PCR leads the first audio PTS by 100 ms")
+        expectEq(TSLANAudioRewriter.pesPTS(firstES), start, "\(label): first video PTS equals the first audio PTS")
+        // Reassemble the video PES payloads; each must contain an IDR NAL.
+        var pesList: [[UInt8]] = []
+        var ccs: [UInt8] = []
+        for p in packets where pid(p) == 0x0100 && p[3] & 0x10 != 0 {
+            ccs.append(p[3] & 0x0F)
+            guard let off = TSLANAudioRewriter.payloadOffset(p) else { continue }
+            if p[1] & 0x40 != 0 { pesList.append([]) }
+            pesList[pesList.count - 1] += p[off...]
+        }
+        expectEq(pesList.count, 2, "\(label): 1 fps over 2 s = 2 card pictures")
+        let idrOK = pesList.allSatisfy { pes in
+            let es = Array(pes[(9 + Int(pes[8]))...])
+            return es == au
+        }
+        expect(idrOK, "\(label): every video PES carries the full access unit (IDR)")
+        let ccOK = ccs.enumerated().allSatisfy { i, c in c == (ccBefore &+ UInt8(i)) & 0x0F }
+        expect(ccOK, "\(label): video continuity counters run on from the previous segment")
+        // Audio packets survive untouched.
+        let audioIn = stride(from: 0, to: seg.count, by: 188).filter { (Int(seg[$0 + 1] & 0x1F) << 8 | Int(seg[$0 + 2])) == 0x101 }.count
+        expectEq(packets.filter { pid($0) == 0x101 }.count, audioIn, "\(label): every audio packet kept")
+        // PCR at least every 100 ms of media.
+        let pcrs = packets.compactMap { pid($0) == 0x0100 ? TSCardVideoMuxer.decodePCR($0) : nil }
+        let gaps = zip(pcrs.dropFirst(), pcrs).map { ($0 - $1) & TSLANAudioRewriter.pts33Mask }
+        expect(!gaps.isEmpty && gaps.allSatisfy { $0 > 0 && $0 <= 9_000 + 2_880 }, "\(label): PCR interval <= ~100 ms and monotonic")
+    }
+    // A PMT that already lists video is left alone.
+    var c: UInt8 = 0
+    let pat: [UInt8] = [0x00, 0xB0, 13, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xF0, 0x00]
+    let vpmt: [UInt8] = [0x02, 0xB0, 23, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x00, 0xF0, 0x00,
+                         0x1B, 0xE1, 0x00, 0xF0, 0x00, 0x81, 0xE1, 0x01, 0xF0, 0x00]
+    let videoSeg = cardPSIPacket(pid: 0, section: pat) + cardPSIPacket(pid: 0x1000, section: vpmt)
+        + TSLANAudioRewriter.packetizePES(payload: [0x0B, 0x77, 1, 2], pts: 1000, pid: 0x101, cc: &c)
+    expect(TSCardVideoMuxer.inject(segment: videoSeg, accessUnit: au, fps: 1, cc: &c) == nil,
+           "card: a program with video is not touched")
+    // Stage: cached per seq, CC carried in order.
+    let stage = TSLANCardStage(accessUnit: au, fps: 1)
+    let s0 = stage.produce(seq: 0, segment: Data(cardFixtureSegment(startPTS: 0, seconds: 2)), oldestSeq: 0)
+    let s0again = stage.produce(seq: 0, segment: Data(), oldestSeq: 0)
+    expect(s0 != nil && s0 == s0again, "card stage: cached per segment")
+    // Encoder smoke check (informational: VideoToolbox may be absent where
+    // the tests run, and the muxing checks above need no encoder).
+    let ctx = CGContext(data: nil, width: 1280, height: 720, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
+    ctx?.setFillColor(CGColor(red: 0.1, green: 0.13, blue: 0.19, alpha: 1))
+    ctx?.fill(CGRect(x: 0, y: 0, width: 1280, height: 720))
+    if let img = ctx?.makeImage(), let encoded = TSCardFrameEncoder.encodeIDR(img) {
+        var types: [UInt8] = []
+        var i = 0
+        while i + 4 < encoded.count {
+            if encoded[i] == 0, encoded[i + 1] == 0, encoded[i + 2] == 0, encoded[i + 3] == 1 {
+                types.append(encoded[i + 4] & 0x1F); i += 4
+            } else { i += 1 }
+        }
+        print("INFO card encoder: \(encoded.count) B, NAL types \(types)")
+        expect(types.first == 9 && types.contains(7) && types.contains(8) && types.contains(5),
+               "card encoder: AUD + SPS + PPS + IDR")
+    } else {
+        print("INFO card encoder: VideoToolbox H.264 unavailable here; skipped")
+    }
+}
+
+runCardVideoChecks()
+
+// MARK: Multiview composite (phone-side grid, 2026-10-06)
+
+@MainActor func runMultiviewCompositeChecks() {
+    // Layout at 1280x720.
+    let r2 = MultiviewCompositeLayout.tileRects(count: 2)
+    expectEq(r2, [CGRect(x: 0, y: 0, width: 638, height: 720), CGRect(x: 642, y: 0, width: 638, height: 720)],
+             "mv composite: 2-up rects")
+    let r4 = MultiviewCompositeLayout.tileRects(count: 4)
+    expectEq(r4, [CGRect(x: 0, y: 0, width: 638, height: 358), CGRect(x: 642, y: 0, width: 638, height: 358),
+                  CGRect(x: 0, y: 362, width: 638, height: 358), CGRect(x: 642, y: 362, width: 638, height: 358)],
+             "mv composite: 4-up rects")
+    let r3 = MultiviewCompositeLayout.tileRects(count: 3)
+    expectEq(r3.count, 3, "mv composite: 3-up count")
+    expect(r3[0].minX == 0 && r3[0].height == 720 && r3[0].width > r3[1].width,
+           "mv composite: 3-up big tile left, full height")
+    expect(r3[1].minX == r3[2].minX && r3[1].maxY < r3[2].minY && r3[2].maxY == 720 && r3[1].maxX == 1280,
+           "mv composite: 3-up two stacked on the right")
+    let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
+    for (n, rects) in [(2, r2), (3, r3), (4, r4)] {
+        var ok = rects.allSatisfy { bounds.contains($0) && $0.width >= 300 && $0.height >= 300 }
+        for i in rects.indices { for j in rects.indices where i < j { if rects[i].intersects(rects[j]) { ok = false } } }
+        expect(ok, "mv composite: \(n)-up rects inside the frame, no overlap")
+    }
+    expectEq(MultiviewCompositeLayout.tileRects(count: 6).count, 4, "mv composite: capped at 4 tiles")
+    expectEq(MultiviewCompositeLayout.videoRect(in: r4[1], aspect: 16.0 / 9.0),
+             CGRect(x: 643, y: 0, width: 636, height: 358), "mv composite: 16:9 letterboxed in a 2x2 tile")
+    expectEq(MultiviewCompositeLayout.videoRect(in: r2[0], aspect: 16.0 / 9.0),
+             CGRect(x: 0, y: 181, width: 638, height: 359), "mv composite: 16:9 letterboxed in a 2-up tile")
+    expectEq(MultiviewCompositeLayout.videoRect(in: r2[0], aspect: 4.0 / 3.0).width, 638,
+             "mv composite: 4:3 fits the 2-up tile width")
+    expectEq(MultiviewCompositeLayout.borderStrips(r4[0], width: 2).count, 4, "mv composite: four border strips")
+
+    // Key-frame policy: 30 fps, a segment IDR every 1 s (round 6).
+    var policy = MultiviewKeyframePolicy()
+    var keys: [Int] = []
+    for f in 0..<200 where policy.isKeyframe(pts: 900_000 + Int64(f) * 3000) { keys.append(f) }
+    expectEq(keys, [0, 30, 60, 90, 120, 150, 180], "mv composite: IDR every 1 s")
+    expectEq(MultiviewKeyframePolicy.segmentTicks, CastSegmentProfile.composite.targetSegmentTicks,
+             "mv composite: key frame spacing equals the proxy's composite cut target")
+
+    // Host-clock jitter (device log 2026-10-07): frame times wander a few
+    // ticks either side of the 3000-tick grid. The remuxer cuts at the
+    // first key frame at or after 1 s from the segment's first DTS; every
+    // segment must stay under 1 s plus one frame (no 2 s segments).
+    policy = MultiviewKeyframePolicy()
+    var jitterSegStart: Int64 = -1
+    var longest: Int64 = 0
+    var segCount = 0
+    for f in 0..<900 {
+        let jitter: Int64 = [0, -40, 25, -12, 37, -29, 8][f % 7]
+        let pts = 900_000 + Int64(f) * 3000 + jitter
+        guard policy.isKeyframe(pts: pts) else { continue }
+        if jitterSegStart < 0 { jitterSegStart = pts; continue }
+        if pts - jitterSegStart >= MultiviewKeyframePolicy.segmentTicks {
+            longest = max(longest, pts - jitterSegStart)
+            jitterSegStart = pts
+            segCount += 1
+        }
+    }
+    expect(segCount >= 8, "mv composite jitter: segments cut (\(segCount))")
+    expect(longest < MultiviewKeyframePolicy.segmentTicks + 3000 + 100,
+           "mv composite jitter: longest segment \(Double(longest) / 90_000) s stays under 1 s plus a frame")
+
+    // Live H.264 TS: 10 s at 30 fps plus AAC every 1920 ticks.
+    var mux = MultiviewCompositeTSMuxer()
+    policy = MultiviewKeyframePolicy()
+    var stream: [UInt8] = []
+    let base: Int64 = (1 << 33) - 5 * 90_000   // crosses the 33-bit wrap mid-run
+    var audioPTS = base
+    var expectedAudio: [Int64] = []
+    for f in 0..<300 {
+        let pts = base + Int64(f) * 3000
+        let key = policy.isKeyframe(pts: pts)
+        let au: [UInt8] = [0, 0, 0, 1, 0x09, 0xF0] + (key ? [0, 0, 0, 1, 0x65] : [0, 0, 0, 1, 0x41])
+            + [UInt8](repeating: UInt8(f & 0xFF), count: 300 + (f % 7) * 97)
+        stream += mux.video(accessUnit: au, pts: pts, keyframe: key)
+        // Audio runs a little ahead of the video, as the compositor muxes it.
+        while audioPTS <= pts + 9000 {
+            let adts = TSLANAudioRewriter.adtsHeader(payloadLength: 20, frequencyIndex: 3) + [UInt8](repeating: 0x11, count: 20)
+            stream += mux.audio(adtsFrame: adts, pts: audioPTS)
+            expectedAudio.append(audioPTS & TSLANAudioRewriter.pts33Mask)
+            audioPTS += 1920
+        }
+    }
+    expectEq(stream.count % 188, 0, "mv composite TS: whole packets")
+    let packets = stride(from: 0, to: stream.count, by: 188).map { Array(stream[$0..<($0 + 188)]) }
+    func pid(_ p: [UInt8]) -> Int { (Int(p[1] & 0x1F) << 8) | Int(p[2]) }
+    expect(packets.allSatisfy { $0[0] == 0x47 }, "mv composite TS: sync bytes")
+    let pmtPacket = packets.first { pid($0) == MultiviewCompositeTSMuxer.pmtPID }
+    let info = pmtPacket.flatMap { TSLANAudioRewriter.parsePMT($0) }
+    expectEq(info?.videoPID, 0x0100, "mv composite TS: PMT video PID")
+    expectEq(info?.pcrPID, 0x0100, "mv composite TS: PCR on video")
+    expectEq(info?.audio.first?.pid, 0x0101, "mv composite TS: PMT audio PID")
+    expectEq(info?.audio.first?.type, 0x0F, "mv composite TS: ADTS AAC stream type")
+    expectEq(packets.first.map(pid), 0, "mv composite TS: PAT first (first frame is a key frame)")
+    // Continuity counters per PID (payload-bearing packets only).
+    var lastCC: [Int: UInt8] = [:]
+    var ccOK = true
+    for p in packets where p[3] & 0x10 != 0 {
+        let cc = p[3] & 0x0F
+        if let prev = lastCC[pid(p)], (prev + 1) & 0x0F != cc { ccOK = false }
+        lastCC[pid(p)] = cc
+    }
+    expect(ccOK, "mv composite TS: continuity counters run without gaps")
+    // Video PES: PTS continuity, key frames with RAI led by PAT + PMT.
+    var videoPTS: [Int64] = []
+    var keyIndexes: [Int] = []
+    var raiLedByPSI = true
+    for (i, p) in packets.enumerated() where pid(p) == 0x0100 && p[1] & 0x40 != 0 {
+        if let v = TSLANAudioRewriter.pesPTS(p) { videoPTS.append(v) }
+        let rai = (p[3] >> 4) & 0x02 != 0 && p[4] > 0 && p[5] & 0x40 != 0
+        if rai {
+            keyIndexes.append(videoPTS.count - 1)
+            if i < 2 || pid(packets[i - 2]) != 0 || pid(packets[i - 1]) != MultiviewCompositeTSMuxer.pmtPID { raiLedByPSI = false }
+        }
+    }
+    expectEq(videoPTS.count, 300, "mv composite TS: one video PES per frame")
+    var steps = Set<Int64>()
+    for i in 1..<videoPTS.count { steps.insert((videoPTS[i] - videoPTS[i - 1]) & TSLANAudioRewriter.pts33Mask) }
+    expectEq(steps, [3000], "mv composite TS: video PTS continuous at 3000 ticks across the 33-bit wrap")
+    expectEq(keyIndexes, Array(stride(from: 0, to: 300, by: 30)), "mv composite TS: RAI only on the policy's IDRs")
+    expect(raiLedByPSI, "mv composite TS: every IDR led by PAT + PMT")
+    // The Cast remuxer (first key frame at or after 1 s) cuts every IDR;
+    // TSHLSRemuxer (AirPlay, first key frame at or after 2 s) every second
+    // IDR. Both land on IDRs.
+    for (target, expected) in [(Int64(90_000), 30), (Int64(180_000), 60)] {
+        var segStart = 0
+        var segFrames: [Int] = []
+        for k in keyIndexes.dropFirst() where (Int64(k - segStart) * 3000) >= target {
+            segFrames.append(k - segStart)
+            segStart = k
+        }
+        expect(!segFrames.isEmpty && segFrames.allSatisfy { $0 == expected },
+               "mv composite TS: segment cuts at \(target / 90_000) s land on IDRs (\(segFrames))")
+    }
+    // The tile-tap demuxer reads the audio back in arbitrary chunks.
+    var demux = MultiviewTapDemuxer()
+    var tapped: [MultiviewTapAudioPES] = []
+    var o = 0
+    var chunk = 977
+    while o < stream.count {
+        let end = min(stream.count, o + chunk)
+        tapped += demux.feed(Array(stream[o..<end]))
+        o = end
+        chunk = chunk == 977 ? 5003 : 977
+    }
+    expectEq(demux.audioPID, 0x0101, "mv tap demux: audio PID from the PMT")
+    expectEq(Array(tapped.map(\.pts)), Array(expectedAudio.dropLast()), "mv tap demux: audio PTS in order (last PES pending)")
+    expect(tapped.allSatisfy { MultiviewADTS.parse($0.payload, 0)?.frameLength == 27 }, "mv tap demux: ADTS frames intact")
+    if let h = MultiviewADTS.parse(tapped.first?.payload ?? [], 0) {
+        expectEq(h.sampleRate, 48_000, "mv ADTS: 48 kHz")
+        expectEq(MultiviewADTS.audioSpecificConfig(h), [0x11, 0x90], "mv ADTS: ASC for AAC-LC 48 kHz stereo")
+    } else {
+        expect(false, "mv ADTS: header parses")
+    }
+
+    // Audio clock: anchored so the displayed source frame sounds now.
+    var clock = MultiviewAudioClock()
+    let now: Int64 = 50 * 90_000
+    let a = clock.map(sourcePTS: 1_000_000, compositeNow: now, displayedSourcePTS: { 1_000_000 - 4 * 90_000 }, floor: 0)
+    expectEq(a, now + 4 * 90_000, "mv audio clock: ahead-of-display audio lands in the future by the display lag")
+    let b = clock.map(sourcePTS: 1_001_920, compositeNow: 0, displayedSourcePTS: { 0 }, floor: a ?? 0)
+    expectEq(b, (a ?? 0) + 1920, "mv audio clock: continuous after the anchor")
+    let wrapped = clock.map(sourcePTS: (1_001_920 + 1920) & TSLANAudioRewriter.pts33Mask, compositeNow: 0,
+                            displayedSourcePTS: { 0 }, floor: b ?? 0)
+    expectEq(wrapped, (b ?? 0) + 1920, "mv audio clock: steady offset")
+    let late = clock.map(sourcePTS: 1_001_920, compositeNow: 0, displayedSourcePTS: { 0 }, floor: wrapped ?? 0)
+    expect(late == nil, "mv audio clock: audio already covered is dropped")
+    clock.reanchor()
+    // Focus switch: the new tile's replayed history from before what it
+    // shows is dropped; its audio from the displayed frame on sounds now.
+    let floorNow = (wrapped ?? 0) + 1920
+    let early = clock.map(sourcePTS: 7_000_000, compositeNow: floorNow, displayedSourcePTS: { 7_000_000 + 90_000 },
+                          floor: floorNow)
+    expect(early == nil, "mv audio clock: re-anchored history before the displayed frame is dropped")
+    let shown = clock.map(sourcePTS: 7_090_000, compositeNow: 0, displayedSourcePTS: { 0 }, floor: floorNow)
+    expectEq(shown, nil, "mv audio clock: the displayed frame itself is at the floor (already covered)")
+    let next = clock.map(sourcePTS: 7_091_920, compositeNow: 0, displayedSourcePTS: { 0 }, floor: floorNow)
+    expectEq(next, floorNow + 1920, "mv audio clock: re-anchored audio follows on the composite clock")
+}
+
+runMultiviewCompositeChecks()
+
+print(failures == 0 ? "\nALL TESTS PASSED" : "\n\(failures) FAILURES")
+exit(failures == 0 ? 0 : 1)

@@ -1,0 +1,1083 @@
+//
+//  ServerDetailView.swift
+//  Astral
+//
+//  Extracted verbatim from SettingsView.swift (Settings redesign Phase 1,
+//  SettingsUIRedesign.md A4). No behavior change intended in this move.
+//
+
+import SwiftUI
+import SwiftData
+
+@MainActor
+func performServerCascadeDelete(_ server: ServerConnection,
+                                servers: [ServerConnection],
+                                modelContext: ModelContext) {
+    let sid = server.id.uuidString
+    let deletedID = server.id
+    let name = server.name
+    // TestFlight 1.8.41 crash: the channel-server task was inside
+    // seedEPGCache holding this model when it was deleted. Cancel every
+    // long task that holds it first; they re-check `isGone` after each
+    // suspension.
+    ChannelStore.shared.cancelWork(forDeletedServerID: deletedID, name: name)
+    // 2026-10-14 crash: the launch permissions pass was sleeping between
+    // retries and resumed into `server.type` on the deleted model.
+    DispatcharrCapabilityProbe.cancelWork(forDeletedServerID: deletedID, name: name)
+    GuideStore.shared.cancelBackgroundGridSweep(reason: "playlist \(name) deleted")
+    VODStore.shared.clear()
+    debugLog("[PLAYLIST] delete: cancelled VOD loads and sweeps for \(name)")
+    server.deleteCredentialsFromKeychain()
+    // Display-only account facts for the permissions section.
+    DispatcharrAccountFactsStore.clear(deletedID)
+    // Rebuildable on-disk caches are keyed per server and are kept across
+    // playlist switches so switching back is instant (Logan 2026-09-16).
+    // DELETING the playlist is the one moment they are removed.
+    let vodIdentity = VODLibraryCache.identity(for: server)
+    VODLibraryCache.clear(kinds: [.movie, .series], identity: vodIdentity)
+    VODSweepProgress.clear(identity: VODSweepProgress.identity(for: server))
+    // The paged VOD catalog (GH #109) is keyed per server and survives a
+    // playlist switch; deleting the playlist is what removes its rows.
+    // Values captured now: the Task body runs after the model is deleted.
+    let deletedRef = VODStore.DeletedCatalogRef(server)
+    Task { await VODStore.shared.deleteCatalog(deletedRef) }
+    EPGGridCoverage.clear(identity: EPGGridCoverage.identity(serverID: sid, server: server))
+    // The server row goes first, on the main context, so nothing in the UI
+    // can resolve it any more. The per-server rows below are keyed only by
+    // the id STRING, so they are purged afterwards off the main thread.
+    modelContext.delete(server)
+    try? modelContext.save()
+    // Issue #25: wipe in-memory VOD so On Demand stops
+    // showing the removed server's movies / series. Live
+    // already clears (ChannelStore.refresh re-runs on the
+    // server-list change), but VODStore's no-active-server
+    // path returns without clearing, so stale, unplayable
+    // entries lingered. The orchestrator re-fires on the
+    // allServers change and repopulates VOD for whatever
+    // server remains active (if any).
+    VODStore.shared.clear()
+    // Push updated list to iCloud (server removed)
+    // `server` is deleted now: compare against the id captured up front and
+    // skip any row that is gone, never read the deleted model.
+    SyncManager.shared.pushServers(servers.filter { !$0.isGone && $0.id != deletedID })
+
+    // Orphan-row purge, OFF the main thread (2026-10-14: deleting 19,513
+    // EPGProgram rows on the main context blocked the UI for 996 ms inside
+    // the Delete button's animation completion). Same background-context
+    // pattern as `GuideStore.purgePrograms`.
+    //
+    // - EPGProgram: rows scoped to this server, so a later server of a
+    //   different type with different channel ids never reuses them (an
+    //   Xtream playlist deleted and re-added via Dispatcharr API otherwise
+    //   left stale XC EPG rows that loadFromCache returned).
+    // - WatchProgress: resume positions for this server. The predicate
+    //   matches only rows whose Optional serverID is exactly `sid`, so
+    //   legacy nil-serverID rows stay untouched.
+    // - Recording: server-side Dispatcharr recordings only
+    //   (`localFilePath == nil`); their playback URLs point at the deleted
+    //   server. Local recordings are kept on purpose: the user may want the
+    //   `.ts` files in `Documents/Recordings/` after the server is gone.
+    let container = modelContext.container
+    Task { @MainActor in
+        await Task.detached(priority: .utility) {
+            purgeOrphanRows(forDeletedServerID: sid, container: container)
+        }.value
+        // Push the post-cascade WatchProgress set to iCloud (immediate, not
+        // debounced) so the deletion replicates to other devices before they
+        // next pull; otherwise another device would re-introduce the
+        // orphaned rows on its next merge pass via the KVS payload. Filtered
+        // by id in case the main context has not merged the purge yet.
+        if let remaining = try? modelContext.fetch(FetchDescriptor<WatchProgress>()) {
+            let kept = remaining.filter { !$0.isDeleted && $0.serverID != sid }
+            SyncManager.shared.pushWatchProgress(kept, immediate: true)
+        }
+    }
+}
+
+/// Background half of `performServerCascadeDelete`. Plain values only: the
+/// server row is already deleted, and this runs on its own ModelContext.
+nonisolated private func purgeOrphanRows(forDeletedServerID sid: String,
+                                         container: ModelContainer) {
+    let started = Date()
+    let ctx = ModelContext(container)
+    ctx.autosaveEnabled = false
+
+    let epgPredicate = #Predicate<EPGProgram> { $0.serverID == sid }
+    let epgCount = (try? ctx.fetchCount(FetchDescriptor<EPGProgram>(predicate: epgPredicate))) ?? 0
+    if epgCount > 0 { try? ctx.delete(model: EPGProgram.self, where: epgPredicate) }
+    debugLog("🗑️ Deleted \(epgCount) orphaned EPGProgram rows for server \(sid) (background)")
+
+    let wpPredicate = #Predicate<WatchProgress> { $0.serverID == sid }
+    let wpCount = (try? ctx.fetchCount(FetchDescriptor<WatchProgress>(predicate: wpPredicate))) ?? 0
+    if wpCount > 0 { try? ctx.delete(model: WatchProgress.self, where: wpPredicate) }
+    debugLog("🗑️ Deleted \(wpCount) orphaned WatchProgress rows for server \(sid) (background)")
+
+    let recPredicate = #Predicate<Recording> { $0.serverID == sid && $0.localFilePath == nil }
+    let recCount = (try? ctx.fetchCount(FetchDescriptor<Recording>(predicate: recPredicate))) ?? 0
+    if recCount > 0 { try? ctx.delete(model: Recording.self, where: recPredicate) }
+    debugLog("🗑️ Deleted \(recCount) orphaned server-side Recording rows for server \(sid) (background)")
+
+    try? ctx.save()
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    debugLog("[PLAYLIST] delete: orphan-row purge off main finished in \(ms) ms for server \(sid) "
+             + "(main=\(Thread.isMainThread))")
+}
+
+/// Activate a playlist: stop whatever the old source is still playing
+/// (GH #22 parity), flip the isActive flags, persist, and push to iCloud.
+/// Shared by the root list activation and the Playlist Detail "Set Active"
+/// row (Rev 2 canon amendment 1) so both paths stay in lockstep.
+@MainActor
+func performSetActiveServer(_ server: ServerConnection,
+                            servers: [ServerConnection],
+                            modelContext: ModelContext) {
+    PlayerSession.shared.stop()
+    for s in servers { s.isActive = false }
+    server.isActive = true
+    try? modelContext.save()
+    SyncManager.shared.pushServers(servers)
+}
+
+struct ServerDetailView: View {
+    let server: ServerConnection
+    /// See SettingsView for the rationale, observing ThemeManager
+    /// makes every accent-tinted row in this detail page reactive to
+    /// theme changes (icons, status pills, action buttons).
+    @ObservedObject private var theme = ThemeManager.shared
+    @Query private var servers: [ServerConnection]
+    /// Used by the per-playlist "Refresh EPG Data" action so the
+    /// detached delete can grab a `ModelContainer` from this context.
+    @Environment(\.modelContext) private var modelContext
+    @State private var isTestingConnection = false
+    @State private var connectionResult: String? = nil
+    @State private var connectionSuccess = false
+    /// Per-playlist EPG-purge UX. v1.6.8: replaces the global
+    /// "Refresh EPG Data" action that used to live on
+    /// `AppearanceSettingsView`. Each playlist now owns its own
+    /// EPG-purge action so users with multiple servers can fix one
+    /// playlist's corrupted cache without nuking the others.
+    @State private var showPurgeConfirmation = false
+    @State private var isPurgingEPG = false
+    /// "Refresh Everything" (nuclear) UX. Unlike "Refresh EPG Data"
+    /// (which only purges this playlist's EPGProgram rows), this clears
+    /// EVERY cache: all guide data + the in-memory per-channel EPG actor
+    /// cache + all On Demand state, then reloads channels (so newly-added
+    /// channels appear), the guide, and On Demand from scratch. Added
+    /// after a user hit a stuck-guide state that survived "Refresh EPG
+    /// Data", clearing cache, and force-quitting repeatedly.
+    @State private var showRefreshAllConfirmation = false
+    @State private var isRefreshingAll = false
+    /// Cross-platform LAN-probe observer. `TVLANProbe` is the
+    /// (legacy-named) cross-platform reachability checker, see
+    /// `AstralApp.swift` for the rationale. Observing the singleton
+    /// lets ServerDetailView surface the last probe result on every
+    /// platform so users can see WHY the app thinks it's on LAN, plus
+    /// drive the "Refresh LAN Detection" button. The probe is the sole
+    /// LAN signal, there is no SSID / location dependence.
+    @ObservedObject private var tvLANProbe = TVLANProbe.shared
+    @State private var lanRefreshAcked = false
+    /// Unified playlist page (2026-07): edit is a top-right toolbar
+    /// button on iOS and the first Actions row on tvOS (a corner
+    /// button is off the D-pad path). Delete lives in Danger Zone.
+    @State private var editingServer: ServerConnection? = nil
+    @State private var showDeleteConfirm = false
+    @State private var isRefreshingPlaylist = false
+    /// "Refresh Permissions" row: an unthrottled capability probe.
+    @State private var isRefreshingPermissions = false
+    @State private var playlistRefreshDone = false
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.editPlaylist) private var editPlaylist
+
+    private var hasLANConfigured: Bool {
+        // LAN means "we have a localURL we can probe" on every
+        // platform. The TVLANProbe reachability check is the only
+        // signal that decides LAN vs WAN.
+        return server.type != .m3uPlaylist && !server.localURL.isEmpty
+    }
+
+    private var isOnLAN: Bool {
+        hasLANConfigured && server.effectiveBaseURL != server.normalizedBaseURL
+    }
+
+    var body: some View {
+        // The held `server` model can be deleted out from under this pushed
+        // detail view by an iCloud sync merge (SyncManager / AstralApp
+        // delete+recreate local ServerConnection rows on a remote merge). SwiftUI
+        // then re-renders this view and reading ANY @Persisted property
+        // (server.type, server.localURL, ...) traps in SwiftData with
+        // `_KKMDBackingData.getValue` assertion (TestFlight crash, 1.7.12). Guard
+        // on the detached model (modelContext goes nil after delete) BEFORE any
+        // persisted read, render an inert background, and pop.
+        Group {
+            if server.modelContext == nil {
+                Color.appBackground.ignoresSafeArea()
+            } else {
+                detailContent
+            }
+        }
+        .onChange(of: server.modelContext == nil) { _, deleted in
+            if deleted { dismiss() }
+        }
+    }
+
+    private var detailContent: some View {
+        ZStack {
+            Color.appBackground.ignoresSafeArea()
+            iosList
+        }
+        .navigationTitle(server.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color.appBackground, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Edit") {
+                    if let editPlaylist {
+                        debugLog("[Settings] Edit playlist tapped: \(server.name) via root serverToEdit")
+                        editPlaylist(server)
+                    } else {
+                        debugLog("[Settings] Edit playlist tapped: \(server.name) via local sheet")
+                        editingServer = server
+                    }
+                }
+                    .foregroundColor(.accentPrimary)
+            }
+        }
+        .sheet(item: $editingServer) { EditServerSheet(server: $0) }
+        // Opening the ACTIVE playlist re-reads its permissions, throttled
+        // to once a minute like a return to foreground, so the User
+        // Permissions block is never minutes stale. The section reads the
+        // SwiftData row, so the probe's writes re-render it directly.
+        // Android parity: PlaylistDetailScreen, trigger "playlist detail".
+        .task(id: server.isActive) {
+            guard !server.isGone, server.isActive, server.type == .dispatcharrAPI else { return }
+            await DispatcharrCapabilityProbe.refresh(server, reason: "playlist detail",
+                                                     minInterval: 60)
+        }
+        .alert("Delete Playlist?", isPresented: $showDeleteConfirm) {
+            Button("Delete", role: .destructive) {
+                performServerCascadeDelete(server, servers: Array(servers), modelContext: modelContext)
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will remove \"\(server.name)\" from the app. Your server data will not be affected.")
+        }
+        // Per-playlist EPG-purge confirmation. The action handler:
+        //   1. Always calls `GuideStore.shared.purgePrograms(for:…)`
+        //      to delete this playlist's EPGProgram rows on a
+        //      background context.
+        //   2. Only triggers `ChannelStore.shared.forceRefresh(...)`
+        //      when this playlist is the active one: refreshing a
+        //      non-active server would either no-op (forceRefresh
+        //      bails on non-active first(where:isActive)) or, worse,
+        //      hijack the user's currently-loaded data with a
+        //      different server's payload. For non-active purges we
+        //      just clear the cache and let the next activation
+        //      refetch normally.
+        .alert("Refresh EPG Data?", isPresented: $showPurgeConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Refresh", role: .destructive) {
+                // Plain values captured up front; the model is re-checked
+                // after every await (2026-10-14 delete crash audit).
+                guard !server.isGone else { return }
+                let sid = server.id.uuidString
+                let wasActive = server.isActive
+                Task {
+                    isPurgingEPG = true
+                    await GuideStore.shared.purgePrograms(
+                        for: sid,
+                        isActiveServer: wasActive,
+                        modelContext: modelContext
+                    )
+                    // Also drop the in-memory per-channel "upcoming" actor
+                    // cache. Without this, purging the SwiftData rows still
+                    // left stale guide data sitting in EPGCache, so a wedged
+                    // guide could survive "Refresh EPG Data". (This is a
+                    // 30-minute in-memory cache that repopulates lazily, so
+                    // clearing it for all servers is harmless.)
+                    await EPGCache.shared.invalidateAll()
+                    if !server.isGone, server.isActive {
+                        // Refresh EPG Data must refetch the grid too: with the
+                        // chunk coverage still valid the walk fetched 0 of 61
+                        // chunks after a purge (atv log 2026-10-02 16:21:03).
+                        GuideStore.shared.invalidateGridCoverage()
+                        await ChannelStore.shared.forceRefresh(servers: Array(servers), modelContext: modelContext)
+                    }
+                    isPurgingEPG = false
+                }
+            }
+        } message: {
+            Text(server.isActive
+                 ? "All cached guide data for \"\(server.name)\" will be cleared and reloaded from the server. This may take a few minutes on large playlists."
+                 : "All cached guide data for \"\(server.name)\" will be cleared. The next time you make this playlist active, fresh guide data will load automatically.")
+        }
+        // Refresh Everything: nuke every cache, then reload. Strictly more
+        // thorough than "Refresh EPG Data" so a wedged guide / missing
+        // channels can't survive it.
+        .alert("Refresh Everything?", isPresented: $showRefreshAllConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Refresh", role: .destructive) {
+                Task {
+                    isRefreshingAll = true
+                    // 1. Purge ALL guide data: every EPGProgram row in
+                    //    SwiftData plus GuideStore's in-memory state and
+                    //    load-idempotency flags (via invalidateCache).
+                    await GuideStore.shared.purgeAllPrograms(modelContext: modelContext)
+                    guard !server.isGone else { isRefreshingAll = false; return }
+                    // 2. Clear the per-channel "upcoming" actor cache.
+                    //    "Refresh EPG Data" leaves this in place, which is
+                    //    how stale guide data can survive that action.
+                    await EPGCache.shared.invalidateAll()
+                    guard !server.isGone else { isRefreshingAll = false; return }
+                    // 3. Drop all On Demand state, INCLUDING this server's
+                    //    stored catalog: its rows, sweep state and lanes, the
+                    //    legacy snapshot and the sweep position files. Only
+                    //    this server's; another playlist's catalog is what
+                    //    makes switching back instant and is never touched.
+                    VODStore.shared.clear()
+                    let name = server.name
+                    await VODStore.shared.deleteCatalog(for: server)
+                    debugLog("[VOD-CAT] refresh everything: catalog cleared for server=\(name), full sweep starting")
+                    guard !server.isGone else { isRefreshingAll = false; return }
+                    // 4. Reload from scratch for the active playlist:
+                    //    channels are re-fetched (newly-added channels
+                    //    appear), the guide is rebuilt and re-cached, and
+                    //    On Demand repopulates. Non-active playlists just
+                    //    keep the cleared state and reload on activation.
+                    if server.isActive {
+                        await ChannelStore.shared.forceRefresh(servers: Array(servers), modelContext: modelContext)
+                        VODStore.shared.refresh(servers: Array(servers))
+                    }
+                    isRefreshingAll = false
+                }
+            }
+        } message: {
+            Text(server.isActive
+                 ? "Clears all cached channels, guide data, and On Demand, then reloads \"\(server.name)\" from scratch. Use this if channels or guide data are missing or stale. May take a few minutes on large playlists."
+                 : "Clears all cached channels, guide data, and On Demand. \"\(server.name)\" reloads automatically the next time you make it active.")
+        }
+    }
+
+    /// iOS / iPadOS body, unchanged: details first, then the actions.
+    private var iosList: some View {
+            List {
+                // tvOS scroll fix (Logan 2026-09-19, "cannot scroll AT ALL"
+                // on the playlist page). tvOS scrolls by MOVING FOCUS, and
+                // a SwiftUI List realizes its cells lazily. Connection
+                // Details plus the new Dispatcharr User Permissions block
+                // are ~14 read-only, deliberately NON-focusable rows, which
+                // is more than one 1080p screen: on push there was no
+                // focusable cell realized anywhere on screen, the focus
+                // engine had nothing to land on, and every D-pad press did
+                // nothing. Putting Actions first puts a real focus stop on
+                // the first screen; the read-only reference blocks follow
+                // and are reached by scrolling past the actions. iOS and
+                // iPadOS keep the details-first order they shipped with.
+                readOnlyInfoSections
+
+                Section {
+                    // Rev 2 canon amendment 1: activation lives on the
+                    // Playlist Detail page on EVERY form factor. The rail
+                    // and sidebar models make focus/selection show the
+                    // detail, so OK-to-activate cannot survive on TV roots;
+                    // this row replaces it one focus-move away. Disabled
+                    // with a checkmark when already active, mirroring the
+                    // old tvOS root action.
+                    Button {
+                        performSetActiveServer(server, servers: Array(servers), modelContext: modelContext)
+                    } label: {
+                        HStack {
+                            Image(systemName: server.isActive ? "checkmark.circle.fill" : "power.circle")
+                                .foregroundColor(server.isActive ? .statusOnline : .accentPrimary)
+                            Text(server.isActive ? "Active Playlist" : "Set Active")
+                                .foregroundColor(server.isActive ? .statusOnline : .accentPrimary)
+                        }
+                    }
+                    .disabled(server.isActive)
+                    .tvActionRowChrome()
+
+
+                    Button {
+                        Task { await testConnection() }
+                    } label: {
+                        HStack {
+                            if isTestingConnection {
+                                ProgressView().tint(.accentPrimary)
+                            } else {
+                                Image(systemName: "network")
+                                    .foregroundColor(.accentPrimary)
+                            }
+                            Text(isTestingConnection ? "Testing..." : "Test Connection")
+                                .foregroundColor(Color.contrastText(.accentPrimary))
+                        }
+                    }
+                    .tvActionRowChrome()
+
+                    if let result = connectionResult {
+                        HStack(spacing: 8) {
+                            Image(systemName: connectionSuccess ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundColor(connectionSuccess ? .statusOnline : .statusLive)
+                            Text(result)
+                                .scaledFont(.bodySmall)
+                                .foregroundColor(connectionSuccess ? .statusOnline : .statusLive)
+                        }
+                        .listRowBackground(Color.cardBackground)
+                    }
+
+                    // Re-fetch channels (and the guide) for the active
+                    // playlist. Parity with Android's "Refresh Playlist"
+                    // action; non-active playlists reload on activation,
+                    // so the row only shows for the active one.
+                    if server.isActive {
+                        Button {
+                            refreshPlaylist()
+                        } label: {
+                            HStack {
+                                if isRefreshingPlaylist {
+                                    ProgressView().tint(.accentPrimary)
+                                } else {
+                                    Image(systemName: playlistRefreshDone ? "checkmark.circle.fill" : "arrow.clockwise")
+                                        .foregroundColor(playlistRefreshDone ? .statusOnline : .accentPrimary)
+                                }
+                                Text(isRefreshingPlaylist ? "Refreshing…"
+                                     : playlistRefreshDone ? "Refreshed"
+                                     : "Refresh Playlist")
+                                    .foregroundColor(isRefreshingPlaylist ? .textSecondary
+                                                     : playlistRefreshDone ? .statusOnline : .accentPrimary)
+                            }
+                        }
+                        .disabled(isRefreshingPlaylist)
+                        .tvActionRowChrome()
+                    }
+
+                    if hasLANConfigured {
+                        Button {
+                            tvLANProbe.probe(servers: Array(servers))
+                        } label: {
+                            HStack(spacing: 8) {
+                                if tvLANProbe.isProbing {
+                                    ProgressView().tint(.accentPrimary).scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: lanRefreshAcked ? "checkmark.circle.fill" : "wifi.circle")
+                                        .foregroundColor(lanRefreshAcked ? .statusOnline : .accentPrimary)
+                                }
+                                Text(tvLANProbe.isProbing ? "Probing…"
+                                     : lanRefreshAcked ? "Up to date"
+                                     : "Refresh LAN Detection")
+                                    .foregroundColor(tvLANProbe.isProbing ? .textSecondary
+                                                     : lanRefreshAcked ? .statusOnline : .accentPrimary)
+                            }
+                        }
+                        .disabled(tvLANProbe.isProbing)
+                        .tvActionRowChrome()
+                        .onChange(of: tvLANProbe.isProbing) { _, nowProbing in
+                            if !nowProbing {
+                                lanRefreshAcked = true
+                                Task {
+                                    try? await Task.sleep(for: .seconds(2))
+                                    lanRefreshAcked = false
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Actions").sectionHeaderStyle()
+                }
+
+                // MARK: EPG Cache (per-playlist)
+                //
+                // Per-playlist "nuke + re-fetch" action. Lives here
+                // (instead of a single global toggle in Appearance)
+                // so users with multiple playlists can scrub one
+                // playlist's corrupted guide data without touching
+                // the others. The SwiftData delete is filtered by
+                // `EPGProgram.serverID == server.id`, and we only
+                // call `ChannelStore.forceRefresh` when the purged
+                // playlist is the active one, purging a non-active
+                // playlist just clears the cache, and the next time
+                // the user activates it the normal load path will
+                // refetch fresh EPG data.
+                Section {
+                    Button(role: .destructive) {
+                        showPurgeConfirmation = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            if isPurgingEPG {
+                                ProgressView().scaleEffect(0.8)
+                                    .frame(width: 14)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .scaledFont(.system(size: 14, weight: .semibold))
+                            }
+                            Text(isPurgingEPG ? "Refreshing EPG Data…" : "Refresh EPG Data")
+                                .scaledFont(.bodyMedium)
+                            Spacer()
+                        }
+                        .foregroundColor(isPurgingEPG ? .textSecondary : .statusWarning)
+                    }
+                    .tvActionRowChrome()
+                    .disabled(isPurgingEPG)
+                } header: {
+                    Text("EPG Cache").sectionHeaderStyle()
+                } footer: {
+                    Text(server.isActive
+                         ? "Clears this playlist's cached guide data and downloads it fresh from the server. Use this if program cells look wrong or are missing. Takes a few minutes on large playlists."
+                         : "Clears this playlist's cached guide data. The fresh fetch will run automatically the next time you make this playlist active.")
+                        .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+                }
+
+                // MARK: Refresh Everything (nuclear)
+                //
+                // The heavier sibling of "Refresh EPG Data". That action only
+                // purges this playlist's EPGProgram rows; if a channel or the
+                // guide gets wedged, stale state can survive in the in-memory
+                // EPGCache actor and the On Demand store. This button clears
+                // ALL of it and reloads from scratch, so a user never has to
+                // resort to force-quitting and clearing cache by hand.
+                Section {
+                    Button(role: .destructive) {
+                        showRefreshAllConfirmation = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            if isRefreshingAll {
+                                ProgressView().scaleEffect(0.8)
+                                    .frame(width: 14)
+                            } else {
+                                Image(systemName: "arrow.clockwise.circle")
+                                    .scaledFont(.system(size: 14, weight: .semibold))
+                            }
+                            Text(isRefreshingAll ? "Refreshing Everything…" : "Refresh Everything")
+                                .scaledFont(.bodyMedium)
+                            Spacer()
+                        }
+                        .foregroundColor(isRefreshingAll ? .textSecondary : .statusWarning)
+                    }
+                    .tvActionRowChrome()
+                    .disabled(isRefreshingAll || isPurgingEPG)
+                } header: {
+                    Text("Full Refresh").sectionHeaderStyle()
+                } footer: {
+                    Text(server.isActive
+                         ? "Clears every cache (channels, guide data, and On Demand) and reloads this playlist from scratch. Use this if newly-added channels, guide data, or movies and shows are missing or stale after changes on the server."
+                         : "Clears every cache (channels, guide data, and On Demand). This playlist reloads automatically the next time you make it active.")
+                        .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+                }
+            
+                // MARK: Danger Zone
+                Section {
+                    Button(role: .destructive) {
+                        showDeleteConfirm = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "trash")
+                                .scaledFont(.system(size: 14, weight: .semibold))
+                            Text("Delete Playlist")
+                                .scaledFont(.bodyMedium)
+                            Spacer()
+                        }
+                        .foregroundColor(.statusLive)
+                    }
+                    .tvActionRowChrome()
+                } header: {
+                    Text("Danger Zone").sectionHeaderStyle()
+                } footer: {
+                    Text("Removes this playlist and its credentials from this device. Your server data will not be affected.")
+                        .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+                }
+
+                // tvOS: the read-only reference blocks come last, after
+                // every focusable action (see the note at the top of this
+                // List). They stay inert - no focus stops are added.
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            // Phase 3 (Logan 2026-09-18): floating tab bar parity -
+            // content runs under the bar, the bar tucks away on scroll,
+            // and the last row clears it.
+            .settingsPhoneTabBarChrome()
+    }
+
+
+    // MARK: - About computed properties
+
+    private var aboutDevice: String { DeviceInfo.modelName }
+
+    private var aboutSystem: String {
+#if canImport(UIKit)
+        return "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
+#else
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return "macOS \(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+#endif
+    }
+
+    private var aboutVersion: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+        let build   = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        return "\(version) (\(build))"
+    }
+
+    private var aboutInstallDate: String { DeviceInfo.firstInstalledText }
+
+    private var aboutUpdateDate: String { DeviceInfo.lastUpdatedText }
+
+    private var aboutCopyText: String {
+        [
+            "AstralTV \(aboutVersion)",
+            "Device: \(aboutDevice)",
+            "System: \(aboutSystem)",
+            "First Installed: \(aboutInstallDate)",
+            "Last Updated: \(aboutUpdateDate)"
+        ].joined(separator: "\n")
+    }
+
+    /// Connection Details URL row: like `infoRow` but with a green
+    /// checkmark marking the route (LAN or WAN) currently in use.
+    private func connectionURLRow(_ label: String, value: String, isActiveRoute: Bool) -> some View {
+        HStack {
+            Text(label)
+                .scaledFont(.bodyMedium.subtext())
+                .foregroundColor(Color.contrastText(.textSecondary))
+            Spacer()
+            if isActiveRoute {
+                Image(systemName: "checkmark.circle.fill")
+                    .scaledFont(.system(size: 13))
+                    .foregroundColor(.statusOnline)
+            }
+            Text(value)
+                .scaledFont(.bodyMedium)
+                .foregroundColor(.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    /// Android-parity "Refresh Playlist": re-fetch channels and the
+    /// guide for the active playlist without purging any caches.
+    private func refreshPlaylist() {
+        guard !isRefreshingPlaylist else { return }
+        isRefreshingPlaylist = true
+        Task {
+            await ChannelStore.shared.forceRefresh(servers: Array(servers), modelContext: modelContext)
+            isRefreshingPlaylist = false
+            playlistRefreshDone = true
+            try? await Task.sleep(for: .seconds(2))
+            playlistRefreshDone = false
+        }
+    }
+
+    /// "Refresh Permissions": run the capability probe now, no throttle.
+    private func refreshPermissions() {
+        guard server.isActive, server.type == .dispatcharrAPI, !isRefreshingPermissions else { return }
+        isRefreshingPermissions = true
+        // The probe re-checks the model after each await and bails when the
+        // playlist is deleted meanwhile.
+        Task {
+            _ = await DispatcharrCapabilityProbe.refresh(server, reason: "manual refresh",
+                                                     waitIfInFlight: true)
+            isRefreshingPermissions = false
+        }
+    }
+
+    // MARK: - Dispatcharr User Permissions (read-only)
+    //
+    // Facts only: everything here is read from the persisted
+    // per-user capability snapshot on this playlist's row
+    // (`/api/accounts/users/me/`, refreshed at connect / launch / foreground
+    // by `DispatcharrCapabilityProbe`, plus a throttled re-read when the
+    // active playlist's page opens) plus the two display-only strings in
+    // `DispatcharrAccountFactsStore`. Shown for Dispatcharr Direct Connect
+    // playlists only (`.dispatcharrAPI`, i.e. API key OR username+password
+    // against the Dispatcharr API). Xtream Codes rows -- including
+    // Dispatcharr's own XC emulation, which the app sees as `.xtreamCodes`
+    // -- and M3U rows have no per-user permission model to show.
+    //
+    // Inactive playlists are NOT probed by design, so when no snapshot has
+    // ever been stored the section says so instead of guessing. A playlist
+    // that WAS active keeps its snapshot in SwiftData, so its last known
+    // values survive relaunch and deactivation.
+    //
+    // tvOS: every row is a plain HStack of Text, exactly like the
+    // Connection Details rows above, so nothing here becomes a focus stop
+    // that the remote can get stuck on.
+    /// Connection Details + Dispatcharr User Permissions, the page's two
+    /// read-only reference blocks. Extracted so the two platforms can
+    /// order them differently: iOS/iPadOS put them first, tvOS puts them
+    /// last so a focusable Actions row is on the first screen (the
+    /// "cannot scroll" fix, Logan 2026-09-19). Content is identical.
+    @ViewBuilder
+    private var readOnlyInfoSections: some View {
+        Section {
+            infoRow("Type", value: server.type.displayName)
+            connectionURLRow("Remote URL", value: server.normalizedBaseURL,
+                             isActiveRoute: !isOnLAN)
+            if hasLANConfigured {
+                connectionURLRow("Local URL", value: server.localURL,
+                                 isActiveRoute: isOnLAN)
+            }
+            if !server.username.isEmpty {
+                infoRow("Username", value: server.username)
+            }
+            infoRow("Status", value: server.isVerified ? "Verified" : "Unverified")
+            if let last = server.lastConnected {
+                infoRow("Last Connected", value: last.formatted(.relative(presentation: .named)))
+            }
+            if server.isActive {
+                infoRow("Channels", value: "\(ChannelStore.shared.channels.count)")
+            }
+            if !server.epgURL.isEmpty {
+                infoRow("EPG", value: server.epgURL, isMonospaced: true)
+            }
+        } header: {
+            Text("Connection Details").sectionHeaderStyle()
+        } footer: {
+            if hasLANConfigured {
+                Text("A checkmark marks the connection in use right now. The local URL is used automatically whenever the server answers on your home network; run Refresh LAN Detection after a network change.")
+                    .scaledFont(.labelSmall.subtext()).foregroundColor(Color.contrastText(.textTertiary))
+            }
+        }
+        .listRowBackground(Color.cardBackground)
+
+        dispatcharrPermissionsSection
+    }
+
+    @ViewBuilder
+    private var dispatcharrPermissionsSection: some View {
+        if server.type == .dispatcharrAPI {
+            let caps = server.dispatcharrCapabilities
+            let facts = DispatcharrAccountFactsStore.load(server.id)
+            Section {
+                if !caps.hasSnapshot {
+                    Text("Make this playlist active to load permissions")
+                        .scaledFont(.bodyMedium.subtext())
+                        .foregroundColor(Color.contrastText(.textSecondary))
+                } else {
+                    let account = facts.username.isEmpty ? server.username : facts.username
+                    if !account.isEmpty {
+                        infoRow("Account", value: account)
+                    }
+                    infoRow("Role", value: roleText(caps))
+                    // Any account that can authenticate can watch live TV;
+                    // Dispatcharr has no per-user live gate.
+                    permissionRow("Live TV", value: "Allowed", allowed: true)
+                    permissionRow("Movies & TV Shows",
+                                  value: vodText(caps),
+                                  allowed: caps.canViewVod.isAllowed || caps.canViewSeries.isAllowed)
+                    permissionRow("DVR", value: dvrText(caps),
+                                  allowed: caps.canViewDvr.isAllowed)
+                    permissionRow("Catch-Up", value: catchupText(caps),
+                                  allowed: caps.canUseCatchup.isAllowed)
+                    infoRow("Channel Profiles", value: profilesText(facts))
+                    // Real, separately-derived flag: the /proxy control
+                    // endpoints (Switch Stream) stay server-side IsAdmin.
+                    permissionRow("Switch Stream",
+                                  value: caps.canSwitchStream.isAllowed ? "Allowed" : "Not Allowed",
+                                  allowed: caps.canSwitchStream.isAllowed)
+                    if let fetched = server.dispatcharrPermissionsFetchedAt,
+                       fetched.timeIntervalSince1970 > 0 {
+                        infoRow("Last Checked",
+                                value: fetched.formatted(.relative(presentation: .named)))
+                    }
+                }
+                // Unthrottled re-read of the user level (Android parity:
+                // PlaylistDetailScreen). Active playlist only (hidden otherwise); the rows
+                // above read the SwiftData row, so they update live.
+                if server.isActive {
+                    Button {
+                        refreshPermissions()
+                    } label: {
+                        HStack {
+                            if isRefreshingPermissions {
+                                ProgressView().tint(.accentPrimary)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .foregroundColor(.accentPrimary)
+                            }
+                            Text(isRefreshingPermissions ? "Refreshing..." : "Refresh Permissions")
+                                .foregroundColor(isRefreshingPermissions ? .textSecondary : .accentPrimary)
+                        }
+                    }
+                    .disabled(isRefreshingPermissions)
+                    .tvActionRowChrome()
+                }
+            } header: {
+                Text("Dispatcharr User Permissions").sectionHeaderStyle()
+            } footer: {
+                Text("Set by your Dispatcharr admin. Permissions also refresh when you open the app or use Refresh Playlist.")
+                    .scaledFont(.labelSmall.subtext())
+                    .foregroundColor(Color.contrastText(.textTertiary))
+            }
+            .listRowBackground(Color.cardBackground)
+        }
+    }
+
+    /// Dispatcharr's own tiers: `user_level` 0 = Streamer, 1 = Standard,
+    /// 10 = Admin. `effectiveUserLevel` promotes a Django staff /
+    /// superuser account to 10 the way the server does.
+    private func roleText(_ caps: DispatcharrCapabilitySet) -> String {
+        let level = caps.effectiveUserLevel
+        if level >= 10 { return "Admin" }
+        if level >= 1 { return "Standard" }
+        return "Streamer"
+    }
+
+    /// One row for two real flags (`vod_movies_enabled`,
+    /// `vod_series_enabled`), so a half-granted account is not misreported.
+    private func vodText(_ caps: DispatcharrCapabilitySet) -> String {
+        switch (caps.canViewVod.isAllowed, caps.canViewSeries.isAllowed) {
+        case (true, true): return "Allowed"
+        case (true, false): return "Movies Only"
+        case (false, true): return "TV Shows Only"
+        case (false, false): return "Not Allowed"
+        }
+    }
+
+    /// `dvr_access` (none / view / manage), admins always "manage".
+    private func dvrText(_ caps: DispatcharrCapabilitySet) -> String {
+        switch caps.dvrAccess {
+        case .manage: return "Allowed"
+        case .view: return "View Only"
+        case .none: return "Not Allowed"
+        }
+    }
+
+    /// Per-user `catchup_enabled` AND the server-wide
+    /// `system_settings.catchup_enabled`; the latter being off is a server
+    /// fact, not a permission, so it gets its own wording.
+    private func catchupText(_ caps: DispatcharrCapabilitySet) -> String {
+        if server.dispatcharrSystemCatchupEnabled == false { return "Not Supported by Server" }
+        return caps.canUseCatchup.isAllowed ? "Allowed" : "Not Allowed"
+    }
+
+    /// Assigned Channel Profile names when known, else the ids, else the
+    /// unrestricted case.
+    private func profilesText(_ facts: DispatcharrAccountFacts) -> String {
+        if !facts.profileNames.isEmpty { return facts.profileNames.joined(separator: ", ") }
+        let ids = server.dispatcharrProfileIDList
+        if ids.isEmpty { return "All Channels" }
+        return ids.map { "#\($0)" }.joined(separator: ", ")
+    }
+
+    /// `infoRow` with the value muted (never red) when the account is not
+    /// allowed, so a denial reads as absence rather than as an error.
+    private func permissionRow(_ label: String, value: String, allowed: Bool) -> some View {
+        HStack {
+            Text(label)
+                .scaledFont(.bodyMedium.subtext())
+                .foregroundColor(Color.contrastText(.textSecondary))
+            Spacer()
+            Text(value)
+                .scaledFont(.bodyMedium)
+                .foregroundColor(allowed ? .textPrimary : Color.contrastText(.textTertiary))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func infoRow(_ label: String, value: String, isMonospaced: Bool = false) -> some View {
+        HStack {
+            Text(label)
+                .scaledFont(.bodyMedium.subtext())
+                .foregroundColor(Color.contrastText(.textSecondary))
+            Spacer()
+            Text(value)
+                .scaledFont(isMonospaced ? .monoSmall : .bodyMedium)
+                .foregroundColor(.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func testConnection() async {
+        isTestingConnection = true
+        connectionResult = nil
+        do {
+            switch server.type {
+            case .xtreamCodes:
+                let api = XtreamCodesAPI(baseURL: server.effectiveBaseURL, username: server.username, password: server.effectivePassword)
+                _ = try await api.verifyConnection()
+            case .dispatcharrAPI:
+                // Re-verify with the persisted auth mode as the
+                // starting hint, verifyConnection auto-falls-back if
+                // the server now wants a different shape (e.g. user
+                // upgraded Dispatcharr to a build with stricter auth).
+                let api = DispatcharrAPI(baseURL: server.effectiveBaseURL,
+                                         auth: .apiKey(server.effectiveApiKey),
+                                         userAgent: server.effectiveUserAgent,
+                                         authMode: server.dispatcharrHeaderMode)
+                let info = try await api.verifyConnection()
+                // Playlist deleted while the request ran (2026-10-14 delete
+                // crash audit): never write to the deleted model.
+                guard !server.isGone else { isTestingConnection = false; return }
+                // v1.6.20: persist the discovered auth shape so
+                // subsequent API calls and stream playback use it.
+                if let mode = info.discoveredAuthMode,
+                   mode.rawValue != server.dispatcharrAuthMode {
+                    server.dispatcharrAuthMode = mode.rawValue
+                    debugLog("SettingsView Test Connection: persisting auth mode .\(mode.rawValue) for \(server.name)")
+                    // Immediate cross-device push so other devices on
+                    // the same iCloud account inherit the working
+                    // shape without waiting for the next debounce.
+                    SyncManager.shared.pushServers(servers, immediate: true)
+                }
+                // v1.7.x: refresh the connected user's permission tier
+                // so the server-side Record / DVR affordances stay
+                // accurate if the account was promoted/demoted in
+                // Dispatcharr since it was first saved. Best-effort: a
+                // failed users/me fetch leaves the stored level
+                // unchanged. Re-fetch with the (possibly newly)
+                // discovered header shape.
+                // Test Connection re-probes the FULL per-user capability
+                // snapshot, not just the level, through the one shared
+                // probe so this path can never drift from the launch /
+                // foreground / 403 paths. A failed probe keeps the last
+                // good snapshot.
+                let probed = await DispatcharrCapabilityProbe.refresh(server, reason: "Test Connection")
+                guard !server.isGone else { isTestingConnection = false; return }
+                if probed {
+                    SyncManager.shared.pushServers(servers.filter { !$0.isGone }, immediate: true)
+                }
+                if let version = info.version, !version.isEmpty {
+                    server.dispatcharrServerVersion = version
+                }
+            case .m3uPlaylist:
+                guard let url = URL(string: server.baseURL) else { throw APIError.invalidURL }
+                let (_, response) = try await URLSession.shared.data(from: url)
+                guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                    throw APIError.serverError((response as? HTTPURLResponse)?.statusCode ?? -1)
+                }
+            }
+            connectionSuccess = true
+            connectionResult = "Connection successful"
+        } catch let error as APIError {
+            connectionSuccess = false
+            connectionResult = error.errorDescription ?? "Unknown error"
+        } catch {
+            connectionSuccess = false
+            connectionResult = error.localizedDescription
+        }
+        isTestingConnection = false
+    }
+}
+
+// MARK: - Playlist List Row
+struct PlaylistListRow: View {
+    let playlist: M3UPlaylist
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.accentPrimary.opacity(0.18))
+                    .frame(width: 36, height: 36)
+                Image(systemName: playlist.sourceType == .url ? "link" : "doc.fill")
+                    .scaledFont(.system(size: 15, weight: .medium))
+                    .foregroundColor(.accentPrimary)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(playlist.name)
+                    .scaledFont(.bodyMedium)
+                    .foregroundColor(.textPrimary)
+                HStack(spacing: 6) {
+                    Text("\(playlist.channelCount) channels")
+                        .scaledFont(.labelSmall.subtext())
+                        .foregroundColor(Color.contrastText(.textSecondary))
+                    if let refreshed = playlist.lastRefreshed {
+                        Text("·")
+                            .foregroundColor(Color.contrastText(.textTertiary))
+                        Text(refreshed, style: .relative)
+                            .scaledFont(.labelSmall.subtext())
+                            .foregroundColor(Color.contrastText(.textTertiary))
+                    }
+                }
+            }
+
+            Spacer()
+
+            Circle()
+                .fill(Color.statusOnline)
+                .frame(width: 8, height: 8)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+// AppearanceSettingsView is defined in AppearanceSettingsView.swift
+
+// MARK: - Edit Playlist Sheet
+struct EditPlaylistSheet: View {
+    @Bindable var playlist: M3UPlaylist
+    @Environment(\.dismiss) private var dismiss
+    /// See SettingsView for rationale.
+    @ObservedObject private var theme = ThemeManager.shared
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.appBackground.ignoresSafeArea()
+                Form {
+                    Section {
+                        TextField("Name", text: $playlist.name)
+                            .listRowBackground(Color.cardBackground)
+                        if playlist.sourceType == .url {
+                            TextField("URL", text: $playlist.urlString)
+                                .keyboardType(.URL)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .listRowBackground(Color.cardBackground)
+                        } else {
+                            HStack {
+                                Text("Source")
+                                    .foregroundColor(Color.contrastText(.textSecondary))
+                                Spacer()
+                                Text("Local file")
+                                    .foregroundColor(Color.contrastText(.textTertiary))
+                            }
+                            .listRowBackground(Color.cardBackground)
+                        }
+                    } header: {
+                        Text("Playlist Details").sectionHeaderStyle()
+                    }
+                }
+                .scrollContentBackground(.hidden)
+            }
+            .navigationTitle("Edit Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color.appBackground, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                        .foregroundColor(.accentPrimary)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") { dismiss() }
+                        .foregroundColor(.accentPrimary)
+                        .fontWeight(.semibold)
+                        .disabled(playlist.name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Edit Server Sheet
+
+
+// MARK: - tvOS action row chrome
+
+private extension View {
+    /// Row chrome for the playlist detail page's ACTION rows.
+    ///
+    /// On tvOS the card is handed to `TVInlineCardRowButtonStyle
+    /// (fillsRow: true)`, which draws the card fill and the focus ring on
+    /// one rounded rectangle. The list must therefore contribute neither a
+    /// background nor insets, or the style's card would sit inset inside a
+    /// second card with a different corner radius (Logan 2026-09-15). The
+    /// style re-applies the 20pt leading inset the list was providing, so
+    /// the icon and label do not move. iOS is untouched.
+    @ViewBuilder
+    func tvActionRowChrome() -> some View {
+        self.listRowBackground(Color.cardBackground)
+    }
+}

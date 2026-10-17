@@ -1,0 +1,22 @@
+#!/bin/zsh
+# Unit tests for the cast HLS proxy's pure logic (PTS ladder, downmix,
+# playlist splices, ring eviction, codec strings). The repo has no
+# unit-test target (AstralTVUITests is UI-only), so these compile the
+# shipping sources directly with swiftc and run on macOS.
+set -e
+cd "$(dirname "$0")"
+SRC=../../Networking/CastHLSProxy
+OUT=$(mktemp -d)
+xcrun swiftc -swift-version 6 -O -o "$OUT/casthls_tests" \
+    main.swift \
+    "$SRC/CastFMP4Remuxer.swift" \
+    "$SRC/CastHLSSegmentStore.swift" \
+    "$SRC/CastAudioFrameParser.swift" \
+    "$SRC/CastAudioTranscoder.swift" \
+    "$SRC/CastVideoTranscoder.swift" \
+    ../../App/TSLANAudioRewriter.swift \
+    ../../App/AudioOnlySampleClock.swift \
+    ../../App/TSHLSPlaylist.swift \
+    ../../App/MultiviewCompositeTS.swift \
+    ../../Features/Multiview/MultiviewGridMath.swift
+"$OUT/casthls_tests"

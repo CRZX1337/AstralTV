@@ -1,0 +1,1390 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1R198FCCDFCE30FD191BF69 /* RemoteSessionNowPlaying.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R3CA8ADBFEF6FAD0DA0510 /* RemoteSessionNowPlaying.swift */; };
+		A1R865DEBFC0015BAB4F022B /* AirPlayTileDelivery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R46F9C5AD64C38F7267B48 /* AirPlayTileDelivery.swift */; };
+		A1R97E4D2C14EFFBDA110A4E /* AudioOnlySampleClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R8AC0C10C4A1B2C3D4E5F6 /* AudioOnlySampleClock.swift */; };
+		A1R97E4D2C14EFFBDA110A4D /* TSLANAudioRewriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R8ABB50566B8495C3C8231 /* TSLANAudioRewriter.swift */; };
+		4EDBB7B772510A4904D83395 /* MultiviewCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D76CB0DDDCB8645B547021D /* MultiviewCompositor.swift */; };
+		35BDAE4FB1BC23EE075FD15E /* MultiviewCompositeTS.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB8D6F1ADC2B9051D70A97F7 /* MultiviewCompositeTS.swift */; };
+		A1R97E4D2C14EFFBDA110B5E /* TSHLSPlaylist.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R8ABB50566B8495C3C8342 /* TSHLSPlaylist.swift */; };
+		A1R8CEDC79EEAEB1C433DB60 /* AudioOnlySampleClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R8AC0C10C4A1B2C3D4E5F6 /* AudioOnlySampleClock.swift */; };
+		A1R8CEDC79EEAEB1C433DB5F /* TSLANAudioRewriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R8ABB50566B8495C3C8231 /* TSLANAudioRewriter.swift */; };
+		A1R8CEDC79EEAEB1C433DC6A /* TSHLSPlaylist.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R8ABB50566B8495C3C8342 /* TSHLSPlaylist.swift */; };
+		A1RF6A0E8715728C27F1F2FB /* AirPlayReceiverResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R3EEB47325934697D79C89 /* AirPlayReceiverResolver.swift */; };
+		A1R58F2EB6D2DBEFDAAB10ED /* AirPlayMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1R11426AB13986BB21FB3FC /* AirPlayMonitor.swift */; };
+		A1RFD0C9647D68F7E2A9043C /* AirPlayAudioMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1RC4579DB2B9BAAA41A1352 /* AirPlayAudioMode.swift */; };
+		A1R9EEF67E03A6539AE3DC4E /* AirPlayAudioMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1RC4579DB2B9BAAA41A1352 /* AirPlayAudioMode.swift */; };
+		000A4A7BFF25A66945137BB3 /* DeviceInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62C0C151EAA6394D32003217 /* DeviceInfo.swift */; };
+		0823BE6E3373A83D3FEBC32F /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D1DD47CBF4B1FE912B0AF08 /* Components.swift */; };
+		0A23BE6E3373A83D3FEBC001 /* ManageGroupsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A1DD47CBF4B1FE912B0A001 /* ManageGroupsSheet.swift */; };
+		10D8764EE31D09E18D0C2CFB /* AddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC1061A736638618318B7F00 /* AddServerView.swift */; };
+		10D8764EE31D09E18D0C2CFC /* ServerSyncView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC1061A736638618318B7F01 /* ServerSyncView.swift */; };
+		11120119C5A64353490041AC /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5806A5B948B604B451A5F5C7 /* Assets.xcassets */; };
+		115F4DEA73DE0C5C49817C04 /* RecordProgramSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DA867EB45CC3896632152B6 /* RecordProgramSheet.swift */; };
+		1AA3C3EA66B1387B7A4D6DD4 /* HeadlessPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8179E2560269773B4D5A0D3A /* HeadlessPlaybackController.swift */; };
+		1B56BE6F7111A4EF6DD7E11B /* DispatcharrDirectConnect.swift in Sources */ = {isa = PBXBuildFile; fileRef = 876ADA5C12D5B9BAC39C9F22 /* DispatcharrDirectConnect.swift */; };
+		2527936283FB11BD5201E1DA /* Pods.xcodeproj in Resources */ = {isa = PBXBuildFile; fileRef = 2AF171D5A7722CF07BDE9B48 /* Pods.xcodeproj */; };
+		2BF99C26CF25FEDC6460A79C /* AboutSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B5E9F08316B8E04572BCA96 /* AboutSettingsView.swift */; };
+		2DD98124C6F98D06EFED419A /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C5D08BD1430E78C26390734 /* SettingsView.swift */; };
+		30FA1CA916C8DDE2001C592F /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875B0901B53C33B024AF597F /* Models.swift */; };
+		3349C24B50E8CC1C902B358F /* XtreamSeriesAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F9F2E0DF2867ED959950125 /* XtreamSeriesAPI.swift */; };
+		349A1C11393E9A07EDE93974 /* ServerConnectionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F356BF2199707EDA1DCD6308 /* ServerConnectionViewModel.swift */; };
+		38A0E8B8ABBD862D5012AB52 /* DVRSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F8881E8167215B8659F5BB1 /* DVRSettingsView.swift */; };
+		38A0E8B8ABBD862D5012AC52 /* SyncCategoriesSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F8881E8167215B8659F5BC1 /* SyncCategoriesSettingsView.swift */; };
+		3A694D00B8E5469ADCD3D120 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5957CC8A6CC0000B14ED47C5 /* HomeView.swift */; };
+		3C4D5E6F70891012ACE70020 /* NWHTTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F70891ACE7000 /* NWHTTPClient.swift */; };
+		3C4D5E6F70891012ACE70021 /* HTTPRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F70891ACE7001 /* HTTPRouter.swift */; };
+		47124970CDB0AF253294C1D7 /* DVRArtResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43C00B0A074DF5B79B493571 /* DVRArtResolver.swift */; };
+		5291397500EE0C386FEAEDA5 /* AstralCastController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75154966450E03A3443CF312 /* AstralCastController.swift */; };
+		5585996EF79BB170CAD2D6F3 /* Podfile.lock in Resources */ = {isa = PBXBuildFile; fileRef = TEMP_EAAD0E1C-0C7B-498B-B3D7-2FBDAAD805A1 /* Podfile.lock */; };
+		58753215820D219D87D24402 /* WelcomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D65D8707C8FA1760DCE6708 /* WelcomeView.swift */; };
+		5E7705A1E430A8350B1D294A /* CategoryColorEditors.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E775331398B45DCE888553D /* CategoryColorEditors.swift */; };
+		5E77169DCEFE3D1DACB4112E /* SettingsRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E77857F44BAC0D4211F7D69 /* SettingsRow.swift */; };
+		5E773CA46CF0A0073940E923 /* SettingsDismissStack.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E77ECBC5F6EB1762A66D576 /* SettingsDismissStack.swift */; };
+		5E776BD28835120B3F9F9FEC /* GeneralSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E776D8BC0A0AEA6CAAC54AC /* GeneralSettingsView.swift */; };
+		5E7788A6AC6F15F4804AC5D7 /* TVSettingsRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E77D250DD29BDCAEAA1E4F3 /* TVSettingsRows.swift */; };
+		5E77AA8EB47EC6574E23FA2F /* ServerDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E77CB834788CB7F421D46C0 /* ServerDetailView.swift */; };
+		5E77ABB81C8F17518EA013C0 /* EditServerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E777A2C7FE24BBFC1EF4FC8 /* EditServerSheet.swift */; };
+		5E783C4A3D74F99510FB9AD5 /* SettingsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E786BF6077FA6A633F43AD7 /* SettingsSection.swift */; };
+		5E78653AC914E3F01DD09F7B /* SettingsMetrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E78541B1A57691D92ACD32B /* SettingsMetrics.swift */; };
+		5E7976A11FAC74DB0DAFF9BA /* SettingsDestination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E791F286A06CD88BBA7B4C9 /* SettingsDestination.swift */; };
+		5EAA00DL1000000000000002 /* SettingsDeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EAA00DL1000000000000001 /* SettingsDeepLink.swift */; };
+		5EAA00DL1000000000000003 /* SettingsDeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EAA00DL1000000000000001 /* SettingsDeepLink.swift */; };
+		5EC13B0FAB0F82A309E38E02 /* GuidePreviewBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33064DC410FCAA08C5AFD943 /* GuidePreviewBanner.swift */; };
+		5FC5F24E2D48E01D39209E78 /* Pods_Astral_iOS.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4A3C566D1C265C5BBE6B35 /* Pods_Astral_iOS.framework */; };
+		60605874B0501017DD6C675F /* SettingsChoicePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4E68D585F224FA9D6F7A6C3 /* SettingsChoicePicker.swift */; };
+		622B003E0D0A155E9FE7D9B7 /* PlaylistParsers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57B139E212EB25D7559B5A0C /* PlaylistParsers.swift */; };
+		65A50DB238B2354D5B81DE09 /* Astral.xcworkspace in Resources */ = {isa = PBXBuildFile; fileRef = TEMP_93A8788A-B3FC-4682-A311-70E1AC4EB5A0 /* Astral.xcworkspace */; };
+		665A7DFCEC12544455827DB3 /* ReminderManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 265A7DFCEC12544455827DB3 /* ReminderManager.swift */; };
+		6A1D3E2F4B5C6D7E8F901A2D /* GuideJumpSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A1D3E2F4B5C6D7E8F901A2B /* GuideJumpSheet.swift */; };
+		6A8B2C3D1E5F607892AA4B5C /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A8B2C3D1E5F607892AA4B5C /* KeychainHelper.swift */; };
+		6B9C3D4E2F6A718903BB5C6D /* SyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B9C3D4E2F6A718903BB5C6D /* SyncManager.swift */; };
+		6B9C3D4E2F6A718903BB5C7D /* SyncFlags.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B9C3D4E2F6A718903BB5C7D /* SyncFlags.swift */; };
+		6BA60E4727C61B8943535F4E /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = E11C8C5B56FBF497EF66CA96 /* Typography.swift */; };
+		737FB562438624E3BF547904 /* Colors.swift in Sources */ = {isa = PBXBuildFile; fileRef = C384E19782307C7D03F8F60B /* Colors.swift */; };
+		76842216BD4822B7380FDF05 /* TVShowsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D833EF1D35443BFAEE1480B5 /* TVShowsView.swift */; };
+		7A11FAB6D3BD7B764BF99C59 /* SwitchStreamView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65319FCB313930453DF8EFCA /* SwitchStreamView.swift */; };
+		7AA2C488BA2252BB6003C40E /* DVRView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1A49B182BABBBD69F564903 /* DVRView.swift */; };
+		7CFFD573C287B60F267445BD /* PlaylistImportViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5CEFA9081ED5FC944CB0895 /* PlaylistImportViews.swift */; };
+		814776352C25C6D44E86A0D2 /* SettingsControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46392B1A3F9F7A8DAB800DC8 /* SettingsControls.swift */; };
+		84338D2727DB3CF6EF963AD3 /* MyRecordingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D60A8F073408CAFD075C499C /* MyRecordingsView.swift */; };
+		84D478A2A84F9A8A2FEE8EA4 /* PlaylistModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA33B18A62A3411B6425B661 /* PlaylistModels.swift */; };
+		853136D0782A7ABB2ED6D735 /* SettingsSubgroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EA416D347F722E14878998A /* SettingsSubgroup.swift */; };
+		85F0D65172F55DFA1D3DA20B /* Pods-Astral_iOS-frameworks.sh in Resources */ = {isa = PBXBuildFile; fileRef = CF54ACE468E89E4259601D31 /* Pods-Astral_iOS-frameworks.sh */; };
+		867C07594A685FB5BDCA5BB3 /* SplashView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5044B9CD69C05A6836588548 /* SplashView.swift */; };
+		8AC25DFB7121C1AEBCE36729 /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E223D01D7BBD84EAD449D43 /* ThemeManager.swift */; };
+		8B904D93666027F576A836E1 /* RecordingCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDDCE00B1213614CFF8EFF4D /* RecordingCoordinator.swift */; };
+		8CF1E8A8912F0A98110ABF07 /* Pods-Astral_iOS-acknowledgements.plist in Resources */ = {isa = PBXBuildFile; fileRef = 5813F2DEADFF09175AADA42D /* Pods-Astral_iOS-acknowledgements.plist */; };
+		8F5A030376AB114E38DAE4AD /* ReminderBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6123CC8F10ADF7063AE0E97 /* ReminderBannerView.swift */; };
+		901047E69DDB4F9633B3CCC3 /* PhoneMediaPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E74BEC0CC7E72B10B46A328 /* PhoneMediaPage.swift */; };
+		97309F3B0C6B3769882EF361 /* VODDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20C769771A1085A303FFC0F0 /* VODDetailView.swift */; };
+		98B0C60D6099DEF55810D175 /* StreamingAPIs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 693A71F4A4429F56337992E6 /* StreamingAPIs.swift */; };
+		9DFF004C5CB18CF95965695D /* SyncSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41CCC6D281470BA7A6B343F8 /* SyncSettingsView.swift */; };
+		9F446FE905EAF6861FF15914 /* SettingsTextField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2319C78BB8AC801A0932DBCE /* SettingsTextField.swift */; };
+		9F9A37C29E5E186E323737C0 /* ChannelListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94C2469FCAE37105952DCC28 /* ChannelListView.swift */; };
+		A133DDDD4444DDDD4444DDDD /* MPMediaItemArtworkShim.m in Sources */ = {isa = PBXBuildFile; fileRef = A111BBBB2222BBBB2222BBBB /* MPMediaItemArtworkShim.m */; };
+		A1B2C3D4E5F678905C1A0002 /* SkipIntervals.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F678905C1A0003 /* SkipIntervals.swift */; };
+		A1B2C3D4E5F67890C0A90002 /* CompanionNowPlaying.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F67890C0A90003 /* CompanionNowPlaying.swift */; };
+		A1B2C3D4E5F67890C10C0002 /* ClockFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F67890C10C0003 /* ClockFormat.swift */; };
+		A1B2C3D4E5F67890C4A10002 /* ChannelNumberEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F67890C4A10003 /* ChannelNumberEntry.swift */; };
+		A1B2C3D4E5F67890D1C00002 /* PlayerInfoCardSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F67890D1C00003 /* PlayerInfoCardSettings.swift */; };
+		A1B2C3D4E5F67890E7A70002 /* EventTimeParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F67890E7A70003 /* EventTimeParser.swift */; };
+		A1B2C3D4E5F67890E9600020 /* EPGText.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F67890E9600030 /* EPGText.swift */; };
+		A1E5E7C0000000000000AA03 /* AppSettleGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1E5E7C0000000000000AA01 /* AppSettleGate.swift */; };
+		A2B3C4D5E6F7A80901CD3456 /* EPGGuideView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A2B3C4D5E6F70890AB1234 /* EPGGuideView.swift */; };
+		AA10CA7A0001000000000003 /* VODCatalogModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA10CA7A0001000000000001 /* VODCatalogModels.swift */; };
+		AA10CA7A0001000000000013 /* VODCatalogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA10CA7A0001000000000011 /* VODCatalogStore.swift */; };
+		AA10CA7A0001000000000023 /* VODSweepActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA10CA7A0001000000000021 /* VODSweepActivity.swift */; };
+		AD422FFDD689840F76B8A238 /* MediaServerAPIs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CCC4F9DC3019E15FB84C5DC /* MediaServerAPIs.swift */; };
+		B0B4EE0F74D4863E74833446 /* LiquidGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 941113ED14A0DAA1CB8B183B /* LiquidGlass.swift */; };
+		B0C3B7E4FC02D61295E8FEA5 /* AppearanceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C791BC8B23CD3EAA3E65BE1 /* AppearanceSettingsView.swift */; };
+		B1AABBCC2DD3EE4FF5006002 /* LiveTVSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1BB2C3D4E5F60789ABCDEF1 /* LiveTVSettingsView.swift */; };
+		B1C2D3E4F5A67890ACE00002 /* AudioSessionRefCount.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00003 /* AudioSessionRefCount.swift */; };
+		B1C2D3E4F5A67890ACE00005 /* IdleTimerRefCount.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00006 /* IdleTimerRefCount.swift */; };
+		B1C2D3E4F5A67890ACE00008 /* PlayerSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00009 /* PlayerSession.swift */; };
+		B1C2D3E4F5A67890ACE0000B /* MultiviewTile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0000C /* MultiviewTile.swift */; };
+		B1C2D3E4F5A67890ACE0000E /* MultiviewStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0000F /* MultiviewStore.swift */; };
+		B1C2D3E4F5A67890ACE00012 /* MultiviewGridMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00013 /* MultiviewGridMath.swift */; };
+		B1C2D3E4F5A67890ACE00015 /* MultiviewLayoutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00016 /* MultiviewLayoutView.swift */; };
+		B1C2D3E4F5A67890ACE00018 /* MultiviewTransportBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00019 /* MultiviewTransportBar.swift */; };
+		B1C2D3E4F5A67890ACE0001B /* MultiviewTileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0001C /* MultiviewTileView.swift */; };
+		B1C2D3E4F5A67890ACE0001E /* MultiviewContainerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0001F /* MultiviewContainerView.swift */; };
+		B1C2D3E4F5A67890ACE00021 /* RecentChannelsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00022 /* RecentChannelsStore.swift */; };
+		B1C2D3E4F5A67890ACE00024 /* CompactChannelRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00025 /* CompactChannelRow.swift */; };
+		B1C2D3E4F5A67890ACE00027 /* AddToMultiviewSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00028 /* AddToMultiviewSheet.swift */; };
+		B1C2D3E4F5A67890ACE0002A /* MultiviewCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0002B /* MultiviewCommands.swift */; };
+		B1C2D3E4F5A67890ACE0002D /* ProcessMetrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0002E /* ProcessMetrics.swift */; };
+		B1C2D3E4F5A67890ACE00030 /* PlaybackDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00031 /* PlaybackDiagnostics.swift */; };
+		B1C2D3E4F5A67890ACE00033 /* PlaybackChromeOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00034 /* PlaybackChromeOverlay.swift */; };
+		B1C2D3E4F5A67890ACE00B02 /* CategoryColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE00B03 /* CategoryColor.swift */; };
+		B1C2D3E4F5A67890ACE0A003 /* RemoteInputLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1C2D3E4F5A67890ACE0A001 /* RemoteInputLogger.swift */; };
+		B2E5D9A83014F26FAF9FD0A0 /* AstralImageDecoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A434E6ED5CFF73E3A9D731 /* AstralImageDecoding.swift */; };
+		B5AE22380A5D13659655A5CD /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00F4EE98C1564A7E3A5DD86B /* SearchView.swift */; };
+		B743C668A35FABC8A1BECB16 /* VODModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B5CE40DD6A5BBCBB943E551 /* VODModels.swift */; };
+		B747D3E4B7695FAF8CD9C557 /* Pods-Astral_iOS-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = 8EEF8CE5358378E2CF3F4012 /* Pods-Astral_iOS-Info.plist */; };
+		B997EA931623455C8A931F29 /* ProgramInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7BA4153D0B047D0BF40ACEE /* ProgramInfoView.swift */; };
+		BDD64B832F76FD240055F82C /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = BDD64B822F76FD240055F82C /* MPVKit */; };
+		BEEFBC48135CF7E02F81D4D4 /* PlayerSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBD7CF084FC76AA3221F862B /* PlayerSettingsView.swift */; };
+		C02E4BB60A5E960696E8839B /* Pods-Astral_iOS-acknowledgements.markdown in Resources */ = {isa = PBXBuildFile; fileRef = 8FEC2B12EB3FCB8C13AD3FD1 /* Pods-Astral_iOS-acknowledgements.markdown */; };
+		C3E892D1A5B2461D966BE39C /* OpenSourceLicensesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5B3F5A632594CCFBF0752AA /* OpenSourceLicensesView.swift */; };
+		C9E28AF097D00D2A282673A5 /* AstralSplash.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 880CEF808ABBA8AD9BC13BEC /* AstralSplash.mp4 */; };
+		C9E919E28B95CE15179BBCBD /* OnDemandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CBF1B5E89BE18F8E73482B9 /* OnDemandView.swift */; };
+		CARPLAYSCENE000000000002 /* CarPlaySceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CARPLAYSCENE000000000001 /* CarPlaySceneDelegate.swift */; };
+		CARPLAYSCENE000000000003 /* CarPlaySceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CARPLAYSCENE000000000001 /* CarPlaySceneDelegate.swift */; };
+		CASTHLSPROXY0000000000A1 /* CastFMP4Remuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F1 /* CastFMP4Remuxer.swift */; };
+		CASTHLSPROXY0000000000A3 /* CastHLSSegmentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F3 /* CastHLSSegmentStore.swift */; };
+		CASTHLSPROXY0000000000A4 /* CastHLSProxyServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F4 /* CastHLSProxyServer.swift */; };
+		CASTHLSPROXY0000000000A5 /* CastHLSProxySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F5 /* CastHLSProxySession.swift */; };
+		CASTHLSPROXY0000000000A6 /* CastAudioFrameParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F6 /* CastAudioFrameParser.swift */; };
+		CASTHLSPROXY0000000000A7 /* CastAudioTranscoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F7 /* CastAudioTranscoder.swift */; };
+		CASTHLSPROXY0000000000A8 /* CastVideoTranscoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F8 /* CastVideoTranscoder.swift */; };
+		CASTHLSPROXY0000000000B1 /* CastFMP4Remuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F1 /* CastFMP4Remuxer.swift */; };
+		CASTHLSPROXY0000000000B3 /* CastHLSSegmentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F3 /* CastHLSSegmentStore.swift */; };
+		CASTHLSPROXY0000000000B4 /* CastHLSProxyServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F4 /* CastHLSProxyServer.swift */; };
+		CASTHLSPROXY0000000000B5 /* CastHLSProxySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F5 /* CastHLSProxySession.swift */; };
+		CASTHLSPROXY0000000000B6 /* CastAudioFrameParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F6 /* CastAudioFrameParser.swift */; };
+		CASTHLSPROXY0000000000B7 /* CastAudioTranscoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F7 /* CastAudioTranscoder.swift */; };
+		CASTHLSPROXY0000000000B8 /* CastVideoTranscoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = CASTHLSPROXY0000000000F8 /* CastVideoTranscoder.swift */; };
+		CBEAA5B478EF33D1AFF1842C /* MoviesTVSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF6885859E2CB3D72D89F4E0 /* MoviesTVSettingsView.swift */; };
+		CF38B25676730E71C9AD497A /* AstralApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08B4D4146C07D85405524861 /* AstralApp.swift */; };
+		D50E5DFBD9787AC5568AD17A /* LocalRecordingSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1124AFB90B57F17E01204AA /* LocalRecordingSession.swift */; };
+		D707545F75A250B3657868F5 /* VODService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C548BC428D32F3966A46C27 /* VODService.swift */; };
+		DA8D78550B95A889171982BC /* MoviesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF6E46AD7A6F742E358FBB43 /* MoviesView.swift */; };
+		DBFAE2F87043F12BE1728B6D /* Manifest.lock in Resources */ = {isa = PBXBuildFile; fileRef = C8918F8C279C6028AA7BC86D /* Manifest.lock */; };
+		DD1234567890ABCDEF123456 /* DebugLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1234567890ABCDEF123456 /* DebugLogger.swift */; };
+		DE1234567890ABCDEF123456 /* NowPlayingBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB1234567890ABCDEF123456 /* NowPlayingBridge.swift */; };
+		E242B7EE7D858C8653991D1D /* RemoteControlStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 344E207916F518E489F82832 /* RemoteControlStore.swift */; };
+		E915CEF210B6996327E6A4B7 /* RemoteControlMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D4994E16D37F74AE4F116EC /* RemoteControlMap.swift */; };
+		EFA00AF67E8EE3B9D8BFC892 /* RecordingActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B49D3D628E066566A26EEA9 /* RecordingActions.swift */; };
+		F00D3696D62D7C9EF6E05244 /* PlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE7BE368EE5FEB9A71732DC5 /* PlayerView.swift */; };
+		F564DDA103FF386C57BADEDE /* SwiftDraw in Frameworks */ = {isa = PBXBuildFile; productRef = 7DA561DBA031A892F41D5EDE /* SwiftDraw */; };
+		F7E00AC7791418818CC81D52 /* RemoteControlHints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7548A26AF128BE1520EA3FFA /* RemoteControlHints.swift */; };
+		FA5005705700000000000003 /* FavoritesStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5005705700000000000001 /* FavoritesStore.swift */; };
+		FF1234567890ABCDEF123456 /* DeveloperSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1234567890ABCDEF123456 /* DeveloperSettingsView.swift */; };
+		LIVEFMP4000000000000000A2 /* LiveFMP4Remuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = LIVEFMP4000000000000000A1 /* LiveFMP4Remuxer.swift */; };
+		LIVEFMP4000000000000000A3 /* LiveFMP4Remuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = LIVEFMP4000000000000000A1 /* LiveFMP4Remuxer.swift */; };
+		MKVFMP40000000000000000B2 /* MKVFMP4Remuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = MKVFMP40000000000000000B1 /* MKVFMP4Remuxer.swift */; };
+		MKVFMP40000000000000000B3 /* MKVFMP4Remuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = MKVFMP40000000000000000B1 /* MKVFMP4Remuxer.swift */; };
+		MPV0000000000000000000002 /* MPVPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = MPV0000000000000000000001 /* MPVPlayerView.swift */; };
+		MPV0000000000000000000003 /* MPVPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = MPV0000000000000000000001 /* MPVPlayerView.swift */; };
+		TSR0000000000000000000002 /* TSHLSRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = TSR0000000000000000000001 /* TSHLSRemuxer.swift */; };
+		TSR0000000000000000000003 /* TSHLSRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = TSR0000000000000000000001 /* TSHLSRemuxer.swift */; };
+		WHATSNEW00000000000ACE001 /* WhatsNew.swift in Sources */ = {isa = PBXBuildFile; fileRef = WHATSNEW00000000000ACE000 /* WhatsNew.swift */; };
+		WHATSNEW00000000000ACE002 /* WhatsNew.swift in Sources */ = {isa = PBXBuildFile; fileRef = WHATSNEW00000000000ACE000 /* WhatsNew.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A1R3CA8ADBFEF6FAD0DA0510 /* RemoteSessionNowPlaying.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSessionNowPlaying.swift; sourceTree = "<group>"; };
+		A1R46F9C5AD64C38F7267B48 /* AirPlayTileDelivery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayTileDelivery.swift; sourceTree = "<group>"; };
+		A1R8AC0C10C4A1B2C3D4E5F6 /* AudioOnlySampleClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioOnlySampleClock.swift; sourceTree = "<group>"; };
+		A1R8ABB50566B8495C3C8231 /* TSLANAudioRewriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSLANAudioRewriter.swift; sourceTree = "<group>"; };
+		9D76CB0DDDCB8645B547021D /* MultiviewCompositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiviewCompositor.swift; sourceTree = "<group>"; };
+		FB8D6F1ADC2B9051D70A97F7 /* MultiviewCompositeTS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiviewCompositeTS.swift; sourceTree = "<group>"; };
+		A1R8ABB50566B8495C3C8342 /* TSHLSPlaylist.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSHLSPlaylist.swift; sourceTree = "<group>"; };
+		A1R3EEB47325934697D79C89 /* AirPlayReceiverResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayReceiverResolver.swift; sourceTree = "<group>"; };
+		A1R11426AB13986BB21FB3FC /* AirPlayMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayMonitor.swift; sourceTree = "<group>"; };
+		A1RC4579DB2B9BAAA41A1352 /* AirPlayAudioMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayAudioMode.swift; sourceTree = "<group>"; };
+		00F4EE98C1564A7E3A5DD86B /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchView.swift; sourceTree = "<group>"; };
+		03AB1BA15FC7FAB4754ECE75 /* Pods-Astral_iOS-frameworks-Debug-output-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "Pods-Astral_iOS-frameworks-Debug-output-files.xcfilelist"; sourceTree = "<group>"; };
+		08B4D4146C07D85405524861 /* AstralApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AstralApp.swift; sourceTree = "<group>"; };
+		0D4994E16D37F74AE4F116EC /* RemoteControlMap.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteControlMap.swift; sourceTree = "<group>"; };
+		0F8881E8167215B8659F5BB1 /* DVRSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DVRSettingsView.swift; sourceTree = "<group>"; };
+		0F8881E8167215B8659F5BC1 /* SyncCategoriesSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncCategoriesSettingsView.swift; sourceTree = "<group>"; };
+		14605A25B0401FBE3A055716 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		1603AF9E4D31DB8BDC708C06 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		1A2B3C4D5E6F70891ACE7000 /* NWHTTPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NWHTTPClient.swift; sourceTree = "<group>"; };
+		1A2B3C4D5E6F70891ACE7001 /* HTTPRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPRouter.swift; sourceTree = "<group>"; };
+		1B49D3D628E066566A26EEA9 /* RecordingActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingActions.swift; sourceTree = "<group>"; };
+		1B5E9F08316B8E04572BCA96 /* AboutSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AboutSettingsView.swift; sourceTree = "<group>"; };
+		20C769771A1085A303FFC0F0 /* VODDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VODDetailView.swift; sourceTree = "<group>"; };
+		2319C78BB8AC801A0932DBCE /* SettingsTextField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsTextField.swift; sourceTree = "<group>"; };
+		265A7DFCEC12544455827DB3 /* ReminderManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReminderManager.swift; sourceTree = "<group>"; };
+		270AC009FD8847D0E2E239BF /* Pods-Astral_iOS.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = "Pods-Astral_iOS.modulemap"; sourceTree = "<group>"; };
+		2AF171D5A7722CF07BDE9B48 /* Pods.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = Pods.xcodeproj; sourceTree = "<group>"; };
+		2B5CE40DD6A5BBCBB943E551 /* VODModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VODModels.swift; sourceTree = "<group>"; };
+		2C791BC8B23CD3EAA3E65BE1 /* AppearanceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceSettingsView.swift; sourceTree = "<group>"; };
+		33064DC410FCAA08C5AFD943 /* GuidePreviewBanner.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GuidePreviewBanner.swift; sourceTree = "<group>"; };
+		337C9ADFE967736F023EB4CD /* MobileVLCKit-xcframeworks.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "MobileVLCKit-xcframeworks.sh"; sourceTree = "<group>"; };
+		344E207916F518E489F82832 /* RemoteControlStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteControlStore.swift; sourceTree = "<group>"; };
+		34855884259C4F1B016CF465 /* Pods-Astral_iOS.debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Pods-Astral_iOS.debug.xcconfig"; sourceTree = "<group>"; };
+		3C4A3C566D1C265C5BBE6B35 /* Pods_Astral_iOS.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Astral_iOS.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		41CCC6D281470BA7A6B343F8 /* SyncSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncSettingsView.swift; sourceTree = "<group>"; };
+		43C00B0A074DF5B79B493571 /* DVRArtResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DVRArtResolver.swift; sourceTree = "<group>"; };
+		46392B1A3F9F7A8DAB800DC8 /* SettingsControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsControls.swift; sourceTree = "<group>"; };
+		46BC9C3B09ACE5A89FC5C0E9 /* Pods-Astral_iOS-dummy.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Pods-Astral_iOS-dummy.m"; sourceTree = "<group>"; };
+		4A8B2C3D1E5F607892AA4B5C /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
+		4B9C3D4E2F6A718903BB5C6D /* SyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncManager.swift; sourceTree = "<group>"; };
+		4B9C3D4E2F6A718903BB5C7D /* SyncFlags.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncFlags.swift; sourceTree = "<group>"; };
+		4C548BC428D32F3966A46C27 /* VODService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VODService.swift; sourceTree = "<group>"; };
+		4D65D8707C8FA1760DCE6708 /* WelcomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeView.swift; sourceTree = "<group>"; };
+		5044B9CD69C05A6836588548 /* SplashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashView.swift; sourceTree = "<group>"; };
+		57682A46B5DF82B13C9A906D /* Pods-Astral_iOS-umbrella.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Pods-Astral_iOS-umbrella.h"; sourceTree = "<group>"; };
+		57B139E212EB25D7559B5A0C /* PlaylistParsers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistParsers.swift; sourceTree = "<group>"; };
+		5806A5B948B604B451A5F5C7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		5813F2DEADFF09175AADA42D /* Pods-Astral_iOS-acknowledgements.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "Pods-Astral_iOS-acknowledgements.plist"; sourceTree = "<group>"; };
+		5957CC8A6CC0000B14ED47C5 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		5E74BEC0CC7E72B10B46A328 /* PhoneMediaPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneMediaPage.swift; sourceTree = "<group>"; };
+		5E775331398B45DCE888553D /* CategoryColorEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CategoryColorEditors.swift; sourceTree = "<group>"; };
+		5E776D8BC0A0AEA6CAAC54AC /* GeneralSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralSettingsView.swift; sourceTree = "<group>"; };
+		5E777A2C7FE24BBFC1EF4FC8 /* EditServerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerSheet.swift; sourceTree = "<group>"; };
+		5E77857F44BAC0D4211F7D69 /* SettingsRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsRow.swift; sourceTree = "<group>"; };
+		5E77CB834788CB7F421D46C0 /* ServerDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerDetailView.swift; sourceTree = "<group>"; };
+		5E77D250DD29BDCAEAA1E4F3 /* TVSettingsRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TVSettingsRows.swift; sourceTree = "<group>"; };
+		5E77ECBC5F6EB1762A66D576 /* SettingsDismissStack.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsDismissStack.swift; sourceTree = "<group>"; };
+		5E78541B1A57691D92ACD32B /* SettingsMetrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsMetrics.swift; sourceTree = "<group>"; };
+		5E786BF6077FA6A633F43AD7 /* SettingsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSection.swift; sourceTree = "<group>"; };
+		5E791F286A06CD88BBA7B4C9 /* SettingsDestination.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsDestination.swift; sourceTree = "<group>"; };
+		5EA416D347F722E14878998A /* SettingsSubgroup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSubgroup.swift; sourceTree = "<group>"; };
+		5EAA00DL1000000000000001 /* SettingsDeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsDeepLink.swift; sourceTree = "<group>"; };
+		62C0C151EAA6394D32003217 /* DeviceInfo.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DeviceInfo.swift; sourceTree = "<group>"; };
+		65319FCB313930453DF8EFCA /* SwitchStreamView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SwitchStreamView.swift; sourceTree = "<group>"; };
+		693A71F4A4429F56337992E6 /* StreamingAPIs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingAPIs.swift; sourceTree = "<group>"; };
+		6A1D3E2F4B5C6D7E8F901A2B /* GuideJumpSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GuideJumpSheet.swift; sourceTree = "<group>"; };
+		6C96AEA17257AA77D4EBE291 /* Pods-Astral_iOS-frameworks-Release-output-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "Pods-Astral_iOS-frameworks-Release-output-files.xcfilelist"; sourceTree = "<group>"; };
+		6E223D01D7BBD84EAD449D43 /* ThemeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeManager.swift; sourceTree = "<group>"; };
+		6F9F2E0DF2867ED959950125 /* XtreamSeriesAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XtreamSeriesAPI.swift; sourceTree = "<group>"; };
+		7427D276A24801276CF5F829 /* Pods-Astral_iOS.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Astral_iOS.debug.xcconfig"; path = "Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS.debug.xcconfig"; sourceTree = "<group>"; };
+		75154966450E03A3443CF312 /* AstralCastController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AstralCastController.swift; sourceTree = "<group>"; };
+		7548A26AF128BE1520EA3FFA /* RemoteControlHints.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteControlHints.swift; sourceTree = "<group>"; };
+		7A1DD47CBF4B1FE912B0A001 /* ManageGroupsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManageGroupsSheet.swift; sourceTree = "<group>"; };
+		7CE1F656E39A506614FF4497 /* MobileVLCKit.debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = MobileVLCKit.debug.xcconfig; sourceTree = "<group>"; };
+		7D1DD47CBF4B1FE912B0AF08 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		7DA867EB45CC3896632152B6 /* RecordProgramSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RecordProgramSheet.swift; sourceTree = "<group>"; };
+		8087BB36936B80A3234428C4 /* COPYING.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING.txt; sourceTree = "<group>"; };
+		8179E2560269773B4D5A0D3A /* HeadlessPlaybackController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = HeadlessPlaybackController.swift; sourceTree = "<group>"; };
+		828A599894F381F7A78BFDF8 /* MobileVLCKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = MobileVLCKit.xcframework; sourceTree = "<group>"; };
+		875B0901B53C33B024AF597F /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		876ADA5C12D5B9BAC39C9F22 /* DispatcharrDirectConnect.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DispatcharrDirectConnect.swift; sourceTree = "<group>"; };
+		880CEF808ABBA8AD9BC13BEC /* AstralSplash.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = AstralSplash.mp4; sourceTree = "<group>"; };
+		8CBF1B5E89BE18F8E73482B9 /* OnDemandView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = OnDemandView.swift; sourceTree = "<group>"; };
+		8EEF8CE5358378E2CF3F4012 /* Pods-Astral_iOS-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "Pods-Astral_iOS-Info.plist"; sourceTree = "<group>"; };
+		8FEC2B12EB3FCB8C13AD3FD1 /* Pods-Astral_iOS-acknowledgements.markdown */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "Pods-Astral_iOS-acknowledgements.markdown"; sourceTree = "<group>"; };
+		93EBE84BDC6A8A492E3AB851 /* MobileVLCKit-xcframeworks-input-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "MobileVLCKit-xcframeworks-input-files.xcfilelist"; sourceTree = "<group>"; };
+		941113ED14A0DAA1CB8B183B /* LiquidGlass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlass.swift; sourceTree = "<group>"; };
+		94C2469FCAE37105952DCC28 /* ChannelListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelListView.swift; sourceTree = "<group>"; };
+		9A045CDB2C13ED9758932EC5 /* Pods-Astral_iOS.dev.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Astral_iOS.dev.xcconfig"; path = "Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS.dev.xcconfig"; sourceTree = "<group>"; };
+		9C5D08BD1430E78C26390734 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		9CCC4F9DC3019E15FB84C5DC /* MediaServerAPIs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaServerAPIs.swift; sourceTree = "<group>"; };
+		9F04B5935392FB0CFA0E58A0 /* MobileVLCKit.release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = MobileVLCKit.release.xcconfig; sourceTree = "<group>"; };
+		A06F3C638088282A3C63BDA9 /* Pods-Astral_iOS.release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Pods-Astral_iOS.release.xcconfig"; sourceTree = "<group>"; };
+		A100AAAA1111AAAA1111AAAA /* MPMediaItemArtworkShim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPMediaItemArtworkShim.h; sourceTree = "<group>"; };
+		A111BBBB2222BBBB2222BBBB /* MPMediaItemArtworkShim.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MPMediaItemArtworkShim.m; sourceTree = "<group>"; };
+		A122CCCC3333CCCC3333CCCC /* Astral-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Astral-Bridging-Header.h"; sourceTree = "<group>"; };
+		A1B2C3D4E5F678905C1A0003 /* SkipIntervals.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SkipIntervals.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F67890C0A90003 /* CompanionNowPlaying.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CompanionNowPlaying.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F67890C10C0003 /* ClockFormat.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ClockFormat.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F67890C4A10003 /* ChannelNumberEntry.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ChannelNumberEntry.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F67890D1C00003 /* PlayerInfoCardSettings.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PlayerInfoCardSettings.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F67890E7A70003 /* EventTimeParser.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EventTimeParser.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F67890E9600030 /* EPGText.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EPGText.swift; sourceTree = "<group>"; };
+		A1BB2C3D4E5F60789ABCDEF1 /* LiveTVSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LiveTVSettingsView.swift; sourceTree = "<group>"; };
+		A1E5E7C0000000000000AA01 /* AppSettleGate.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AppSettleGate.swift; sourceTree = "<group>"; };
+		A1ECC0FF1ED1ABF1ED1ABF11 /* Astral.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Astral.xcconfig; path = Config/Astral.xcconfig; sourceTree = "<group>"; };
+		A2FD31E5C3E95D9CF2F53F4E /* Astral.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Astral.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A3F72C1B8E4D9A6200BC5D91 /* Astral.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Astral.entitlements; sourceTree = "<group>"; };
+		AA10CA7A0001000000000001 /* VODCatalogModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VODCatalogModels.swift; sourceTree = "<group>"; };
+		AA10CA7A0001000000000011 /* VODCatalogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VODCatalogStore.swift; sourceTree = "<group>"; };
+		AA10CA7A0001000000000021 /* VODSweepActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VODSweepActivity.swift; sourceTree = "<group>"; };
+		AA1234567890ABCDEF123456 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
+		AB1234567890ABCDEF123456 /* NowPlayingBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingBridge.swift; sourceTree = "<group>"; };
+		B1124AFB90B57F17E01204AA /* LocalRecordingSession.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalRecordingSession.swift; sourceTree = "<group>"; };
+		B1A49B182BABBBD69F564903 /* DVRView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DVRView.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00003 /* AudioSessionRefCount.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AudioSessionRefCount.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00006 /* IdleTimerRefCount.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IdleTimerRefCount.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00009 /* PlayerSession.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PlayerSession.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0000C /* MultiviewTile.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewTile.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0000F /* MultiviewStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewStore.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00013 /* MultiviewGridMath.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewGridMath.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00016 /* MultiviewLayoutView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewLayoutView.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00019 /* MultiviewTransportBar.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewTransportBar.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0001C /* MultiviewTileView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewTileView.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0001F /* MultiviewContainerView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewContainerView.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00022 /* RecentChannelsStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RecentChannelsStore.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00025 /* CompactChannelRow.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CompactChannelRow.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00028 /* AddToMultiviewSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AddToMultiviewSheet.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0002B /* MultiviewCommands.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiviewCommands.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0002E /* ProcessMetrics.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProcessMetrics.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00031 /* PlaybackDiagnostics.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PlaybackDiagnostics.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00034 /* PlaybackChromeOverlay.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PlaybackChromeOverlay.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE00B03 /* CategoryColor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CategoryColor.swift; sourceTree = "<group>"; };
+		B1C2D3E4F5A67890ACE0A001 /* RemoteInputLogger.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteInputLogger.swift; sourceTree = "<group>"; };
+		B4E68D585F224FA9D6F7A6C3 /* SettingsChoicePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsChoicePicker.swift; sourceTree = "<group>"; };
+		B5CEFA9081ED5FC944CB0895 /* PlaylistImportViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistImportViews.swift; sourceTree = "<group>"; };
+		BB1234567890ABCDEF123456 /* DeveloperSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeveloperSettingsView.swift; sourceTree = "<group>"; };
+		BD9D88342F84B8870005EA3D /* CarPlay.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CarPlay.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.4.sdk/System/Library/Frameworks/CarPlay.framework; sourceTree = DEVELOPER_DIR; };
+		BF6E46AD7A6F742E358FBB43 /* MoviesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MoviesView.swift; sourceTree = "<group>"; };
+		C384E19782307C7D03F8F60B /* Colors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Colors.swift; sourceTree = "<group>"; };
+		C41DDA8474CA1A75D88D9E3C /* MobileVLCKit-xcframeworks-output-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "MobileVLCKit-xcframeworks-output-files.xcfilelist"; sourceTree = "<group>"; };
+		C5B3F5A632594CCFBF0752AA /* OpenSourceLicensesView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = OpenSourceLicensesView.swift; sourceTree = "<group>"; };
+		C8918F8C279C6028AA7BC86D /* Manifest.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = Manifest.lock; sourceTree = "<group>"; };
+		CARPLAYSCENE000000000001 /* CarPlaySceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarPlaySceneDelegate.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F1 /* CastFMP4Remuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastFMP4Remuxer.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F3 /* CastHLSSegmentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastHLSSegmentStore.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F4 /* CastHLSProxyServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastHLSProxyServer.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F5 /* CastHLSProxySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastHLSProxySession.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F6 /* CastAudioFrameParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastAudioFrameParser.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F7 /* CastAudioTranscoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastAudioTranscoder.swift; sourceTree = "<group>"; };
+		CASTHLSPROXY0000000000F8 /* CastVideoTranscoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastVideoTranscoder.swift; sourceTree = "<group>"; };
+		CC1061A736638618318B7F00 /* AddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddServerView.swift; sourceTree = "<group>"; };
+		CC1061A736638618318B7F01 /* ServerSyncView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerSyncView.swift; sourceTree = "<group>"; };
+		CE7BE368EE5FEB9A71732DC5 /* PlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerView.swift; sourceTree = "<group>"; };
+		CF54ACE468E89E4259601D31 /* Pods-Astral_iOS-frameworks.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "Pods-Astral_iOS-frameworks.sh"; sourceTree = "<group>"; };
+		D60A8F073408CAFD075C499C /* MyRecordingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MyRecordingsView.swift; sourceTree = "<group>"; };
+		D833EF1D35443BFAEE1480B5 /* TVShowsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TVShowsView.swift; sourceTree = "<group>"; };
+		E11C8C5B56FBF497EF66CA96 /* Typography.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Typography.swift; sourceTree = "<group>"; };
+		E1A2B3C4D5E6F70890AB1234 /* EPGGuideView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPGGuideView.swift; sourceTree = "<group>"; };
+		E71FA151241E7264059B0E3A /* Pods-Astral_iOS-frameworks-Debug-input-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "Pods-Astral_iOS-frameworks-Debug-input-files.xcfilelist"; sourceTree = "<group>"; };
+		E7BA4153D0B047D0BF40ACEE /* ProgramInfoView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProgramInfoView.swift; sourceTree = "<group>"; };
+		EA33B18A62A3411B6425B661 /* PlaylistModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistModels.swift; sourceTree = "<group>"; };
+		EDDCE00B1213614CFF8EFF4D /* RecordingCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RecordingCoordinator.swift; sourceTree = "<group>"; };
+		EF6885859E2CB3D72D89F4E0 /* MoviesTVSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MoviesTVSettingsView.swift; sourceTree = "<group>"; };
+		F1A434E6ED5CFF73E3A9D731 /* AstralImageDecoding.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AstralImageDecoding.swift; sourceTree = "<group>"; };
+		F249D5C39D90BC11107F3420 /* Pods-Astral_iOS-frameworks-Release-input-files.xcfilelist */ = {isa = PBXFileReference; lastKnownFileType = text.xcfilelist; path = "Pods-Astral_iOS-frameworks-Release-input-files.xcfilelist"; sourceTree = "<group>"; };
+		F356BF2199707EDA1DCD6308 /* ServerConnectionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerConnectionViewModel.swift; sourceTree = "<group>"; };
+		F4F295E7C905ADA24B7D49AB /* Pods-Astral_iOS.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Astral_iOS.release.xcconfig"; path = "Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS.release.xcconfig"; sourceTree = "<group>"; };
+		F6123CC8F10ADF7063AE0E97 /* ReminderBannerView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ReminderBannerView.swift; path = Shared/ReminderBannerView.swift; sourceTree = SOURCE_ROOT; };
+		FA5005705700000000000001 /* FavoritesStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FavoritesStore.swift; sourceTree = "<group>"; };
+		FBD7CF084FC76AA3221F862B /* PlayerSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PlayerSettingsView.swift; sourceTree = "<group>"; };
+		LIVEFMP4000000000000000A1 /* LiveFMP4Remuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveFMP4Remuxer.swift; sourceTree = "<group>"; };
+		MKVFMP40000000000000000B1 /* MKVFMP4Remuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MKVFMP4Remuxer.swift; sourceTree = "<group>"; };
+		MPV0000000000000000000001 /* MPVPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MPVPlayerView.swift; sourceTree = "<group>"; };
+		TEMP_93A8788A-B3FC-4682-A311-70E1AC4EB5A0 /* Astral.xcworkspace */ = {isa = PBXFileReference; lastKnownFileType = wrapper.workspace; path = Astral.xcworkspace; sourceTree = "<group>"; };
+		TEMP_EAAD0E1C-0C7B-498B-B3D7-2FBDAAD805A1 /* Podfile.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = Podfile.lock; sourceTree = "<group>"; };
+		TSR0000000000000000000001 /* TSHLSRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSHLSRemuxer.swift; sourceTree = "<group>"; };
+		WHATSNEW00000000000ACE000 /* WhatsNew.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhatsNew.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F6FC8EF44BA77AB5758D95F1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BDD64B832F76FD240055F82C /* MPVKit in Frameworks */,
+				5FC5F24E2D48E01D39209E78 /* Pods_Astral_iOS.framework in Frameworks */,
+				F564DDA103FF386C57BADEDE /* SwiftDraw in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		11EC69739059FC54CFF03581 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				14605A25B0401FBE3A055716 /* Foundation.framework */,
+			);
+			name = iOS;
+			sourceTree = "<group>";
+		};
+		1D44B2A9B6CE86B60388ED7C /* DVR */ = {
+			isa = PBXGroup;
+			children = (
+				B1A49B182BABBBD69F564903 /* DVRView.swift */,
+				43C00B0A074DF5B79B493571 /* DVRArtResolver.swift */,
+				1B49D3D628E066566A26EEA9 /* RecordingActions.swift */,
+			);
+			path = DVR;
+			sourceTree = "<group>";
+		};
+		2E9487FE5F10365DAD5FCB23 /* LiveTV */ = {
+			isa = PBXGroup;
+			children = (
+				94C2469FCAE37105952DCC28 /* ChannelListView.swift */,
+				E1A2B3C4D5E6F70890AB1234 /* EPGGuideView.swift */,
+				E7BA4153D0B047D0BF40ACEE /* ProgramInfoView.swift */,
+				7DA867EB45CC3896632152B6 /* RecordProgramSheet.swift */,
+				65319FCB313930453DF8EFCA /* SwitchStreamView.swift */,
+				33064DC410FCAA08C5AFD943 /* GuidePreviewBanner.swift */,
+				6A1D3E2F4B5C6D7E8F901A2B /* GuideJumpSheet.swift */,
+			);
+			path = LiveTV;
+			sourceTree = "<group>";
+		};
+		3B7A0F9489A406AEC4BB302B /* Networking */ = {
+			isa = PBXGroup;
+			children = (
+				CASTHLSPROXY0000000000G0 /* CastHLSProxy */,
+				9CCC4F9DC3019E15FB84C5DC /* MediaServerAPIs.swift */,
+				57B139E212EB25D7559B5A0C /* PlaylistParsers.swift */,
+				4C548BC428D32F3966A46C27 /* VODService.swift */,
+				693A71F4A4429F56337992E6 /* StreamingAPIs.swift */,
+				6F9F2E0DF2867ED959950125 /* XtreamSeriesAPI.swift */,
+				1A2B3C4D5E6F70891ACE7000 /* NWHTTPClient.swift */,
+				1A2B3C4D5E6F70891ACE7001 /* HTTPRouter.swift */,
+				876ADA5C12D5B9BAC39C9F22 /* DispatcharrDirectConnect.swift */,
+			);
+			path = Networking;
+			sourceTree = "<group>";
+		};
+		3B8E08FB104E1A3DD7A78196 /* Player */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Player;
+			sourceTree = "<group>";
+		};
+		4432D1DEAD99D32286CFADCA /* Features */ = {
+			isa = PBXGroup;
+			children = (
+				1D44B2A9B6CE86B60388ED7C /* DVR */,
+				D790E242FC19FAB9A2C4F61C /* Home */,
+				2E9487FE5F10365DAD5FCB23 /* LiveTV */,
+				B1C2D3E4F5A67890ACE00010 /* Multiview */,
+				57D7DAFC5BB3E2B9267A64B6 /* Onboarding */,
+				9F48CE336638568BB86DBFEA /* Search */,
+				C649153244EE1ED5FDBD86C0 /* Settings */,
+				C7AB555D4575EAB521484607 /* VOD */,
+				3B8E08FB104E1A3DD7A78196 /* Player */,
+			);
+			path = Features;
+			sourceTree = "<group>";
+		};
+		4D5B125286008EFD60915C8C = {
+			isa = PBXGroup;
+			children = (
+				A1ECC0FF1ED1ABF1ED1ABF11 /* Astral.xcconfig */,
+				EBE4735039B8168FF0CF3C56 /* App */,
+				61108F185BCC5513CF9CA164 /* Design */,
+				4432D1DEAD99D32286CFADCA /* Features */,
+				8F51395EA21012A33DC70238 /* Models */,
+				3B7A0F9489A406AEC4BB302B /* Networking */,
+				66DFFF6DB517C88633B97992 /* Pods */,
+				FF2BFAF9459BFB3B8F20DCC8 /* Shared */,
+				CEF9D73F9EB0F0D4192A7CEB /* SupportingFiles */,
+				D35434453E2FAF35DC5DD5BE /* Products */,
+				6EDC76ED96C2A9C1F65C68BF /* Frameworks */,
+				BD5262EA2F6792080036371D /* Recovered References */,
+			);
+			sourceTree = "<group>";
+		};
+		57D7DAFC5BB3E2B9267A64B6 /* Onboarding */ = {
+			isa = PBXGroup;
+			children = (
+				CC1061A736638618318B7F00 /* AddServerView.swift */,
+				B5CEFA9081ED5FC944CB0895 /* PlaylistImportViews.swift */,
+				CC1061A736638618318B7F01 /* ServerSyncView.swift */,
+				4D65D8707C8FA1760DCE6708 /* WelcomeView.swift */,
+			);
+			path = Onboarding;
+			sourceTree = "<group>";
+		};
+		5E7754FE5E34995DE10F87DF /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				5E786BF6077FA6A633F43AD7 /* SettingsSection.swift */,
+				5E78541B1A57691D92ACD32B /* SettingsMetrics.swift */,
+				5EA416D347F722E14878998A /* SettingsSubgroup.swift */,
+				B4E68D585F224FA9D6F7A6C3 /* SettingsChoicePicker.swift */,
+				2319C78BB8AC801A0932DBCE /* SettingsTextField.swift */,
+				5E77D250DD29BDCAEAA1E4F3 /* TVSettingsRows.swift */,
+				5E77857F44BAC0D4211F7D69 /* SettingsRow.swift */,
+				46392B1A3F9F7A8DAB800DC8 /* SettingsControls.swift */,
+				5E77ECBC5F6EB1762A66D576 /* SettingsDismissStack.swift */,
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		61108F185BCC5513CF9CA164 /* Design */ = {
+			isa = PBXGroup;
+			children = (
+				C384E19782307C7D03F8F60B /* Colors.swift */,
+				941113ED14A0DAA1CB8B183B /* LiquidGlass.swift */,
+				6E223D01D7BBD84EAD449D43 /* ThemeManager.swift */,
+				E11C8C5B56FBF497EF66CA96 /* Typography.swift */,
+				AB79E18D174F276F5183F063 /* Components */,
+			);
+			path = Design;
+			sourceTree = "<group>";
+		};
+		66DFFF6DB517C88633B97992 /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				C8918F8C279C6028AA7BC86D /* Manifest.lock */,
+				2AF171D5A7722CF07BDE9B48 /* Pods.xcodeproj */,
+				CB1BBB07B37F0658C83DB709 /* Headers */,
+				C79313608AD62EA61EBB298A /* Local Podspecs */,
+				6EC677A78FCBBE0DB3E4D425 /* MobileVLCKit */,
+				BDAE6827A50D95C7A27E2721 /* Target Support Files */,
+				7427D276A24801276CF5F829 /* Pods-Astral_iOS.debug.xcconfig */,
+				F4F295E7C905ADA24B7D49AB /* Pods-Astral_iOS.release.xcconfig */,
+				9A045CDB2C13ED9758932EC5 /* Pods-Astral_iOS.dev.xcconfig */,
+			);
+			path = Pods;
+			sourceTree = "<group>";
+		};
+		68C828711A3654526E9E9D04 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				F356BF2199707EDA1DCD6308 /* ServerConnectionViewModel.swift */,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		6EC677A78FCBBE0DB3E4D425 /* MobileVLCKit */ = {
+			isa = PBXGroup;
+			children = (
+				8087BB36936B80A3234428C4 /* COPYING.txt */,
+				828A599894F381F7A78BFDF8 /* MobileVLCKit.xcframework */,
+			);
+			path = MobileVLCKit;
+			sourceTree = "<group>";
+		};
+		6EDC76ED96C2A9C1F65C68BF /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				BD9D88342F84B8870005EA3D /* CarPlay.framework */,
+				11EC69739059FC54CFF03581 /* iOS */,
+				3C4A3C566D1C265C5BBE6B35 /* Pods_Astral_iOS.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		74C4CF9C6BF2027D79310B64 /* MobileVLCKit */ = {
+			isa = PBXGroup;
+			children = (
+				93EBE84BDC6A8A492E3AB851 /* MobileVLCKit-xcframeworks-input-files.xcfilelist */,
+				C41DDA8474CA1A75D88D9E3C /* MobileVLCKit-xcframeworks-output-files.xcfilelist */,
+				337C9ADFE967736F023EB4CD /* MobileVLCKit-xcframeworks.sh */,
+				7CE1F656E39A506614FF4497 /* MobileVLCKit.debug.xcconfig */,
+				9F04B5935392FB0CFA0E58A0 /* MobileVLCKit.release.xcconfig */,
+			);
+			path = MobileVLCKit;
+			sourceTree = "<group>";
+		};
+		8903B1A0B6C8347812B763A3 /* Pods-Astral_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				8FEC2B12EB3FCB8C13AD3FD1 /* Pods-Astral_iOS-acknowledgements.markdown */,
+				5813F2DEADFF09175AADA42D /* Pods-Astral_iOS-acknowledgements.plist */,
+				46BC9C3B09ACE5A89FC5C0E9 /* Pods-Astral_iOS-dummy.m */,
+				E71FA151241E7264059B0E3A /* Pods-Astral_iOS-frameworks-Debug-input-files.xcfilelist */,
+				03AB1BA15FC7FAB4754ECE75 /* Pods-Astral_iOS-frameworks-Debug-output-files.xcfilelist */,
+				F249D5C39D90BC11107F3420 /* Pods-Astral_iOS-frameworks-Release-input-files.xcfilelist */,
+				6C96AEA17257AA77D4EBE291 /* Pods-Astral_iOS-frameworks-Release-output-files.xcfilelist */,
+				CF54ACE468E89E4259601D31 /* Pods-Astral_iOS-frameworks.sh */,
+				8EEF8CE5358378E2CF3F4012 /* Pods-Astral_iOS-Info.plist */,
+				57682A46B5DF82B13C9A906D /* Pods-Astral_iOS-umbrella.h */,
+				34855884259C4F1B016CF465 /* Pods-Astral_iOS.debug.xcconfig */,
+				270AC009FD8847D0E2E239BF /* Pods-Astral_iOS.modulemap */,
+				A06F3C638088282A3C63BDA9 /* Pods-Astral_iOS.release.xcconfig */,
+			);
+			path = "Pods-Astral_iOS";
+			sourceTree = "<group>";
+		};
+		8F51395EA21012A33DC70238 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				875B0901B53C33B024AF597F /* Models.swift */,
+				EA33B18A62A3411B6425B661 /* PlaylistModels.swift */,
+				2B5CE40DD6A5BBCBB943E551 /* VODModels.swift */,
+				AA10CA7A0001000000000001 /* VODCatalogModels.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		9F48CE336638568BB86DBFEA /* Search */ = {
+			isa = PBXGroup;
+			children = (
+				00F4EE98C1564A7E3A5DD86B /* SearchView.swift */,
+			);
+			path = Search;
+			sourceTree = "<group>";
+		};
+		A144EEEE5555EEEE5555EEEE /* AstralObjC */ = {
+			isa = PBXGroup;
+			children = (
+				A100AAAA1111AAAA1111AAAA /* MPMediaItemArtworkShim.h */,
+				A111BBBB2222BBBB2222BBBB /* MPMediaItemArtworkShim.m */,
+				A122CCCC3333CCCC3333CCCC /* Astral-Bridging-Header.h */,
+			);
+			path = AstralObjC;
+			sourceTree = "<group>";
+		};
+		AB79E18D174F276F5183F063 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				7D1DD47CBF4B1FE912B0AF08 /* Components.swift */,
+				7A1DD47CBF4B1FE912B0A001 /* ManageGroupsSheet.swift */,
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		B1C2D3E4F5A67890ACE00010 /* Multiview */ = {
+			isa = PBXGroup;
+			children = (
+				B1C2D3E4F5A67890ACE0000C /* MultiviewTile.swift */,
+				B1C2D3E4F5A67890ACE0000F /* MultiviewStore.swift */,
+				B1C2D3E4F5A67890ACE00013 /* MultiviewGridMath.swift */,
+				B1C2D3E4F5A67890ACE00016 /* MultiviewLayoutView.swift */,
+				B1C2D3E4F5A67890ACE00019 /* MultiviewTransportBar.swift */,
+				B1C2D3E4F5A67890ACE0001C /* MultiviewTileView.swift */,
+				B1C2D3E4F5A67890ACE0001F /* MultiviewContainerView.swift */,
+				B1C2D3E4F5A67890ACE00025 /* CompactChannelRow.swift */,
+				B1C2D3E4F5A67890ACE00028 /* AddToMultiviewSheet.swift */,
+				B1C2D3E4F5A67890ACE0002B /* MultiviewCommands.swift */,
+				B1C2D3E4F5A67890ACE00034 /* PlaybackChromeOverlay.swift */,
+			);
+			path = Multiview;
+			sourceTree = "<group>";
+		};
+		BD5262EA2F6792080036371D /* Recovered References */ = {
+			isa = PBXGroup;
+			children = (
+				TEMP_93A8788A-B3FC-4682-A311-70E1AC4EB5A0 /* Astral.xcworkspace */,
+				TEMP_EAAD0E1C-0C7B-498B-B3D7-2FBDAAD805A1 /* Podfile.lock */,
+			);
+			name = "Recovered References";
+			sourceTree = "<group>";
+		};
+		BD5262EB2F6792080036371D /* Products */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		BDAE6827A50D95C7A27E2721 /* Target Support Files */ = {
+			isa = PBXGroup;
+			children = (
+				74C4CF9C6BF2027D79310B64 /* MobileVLCKit */,
+				8903B1A0B6C8347812B763A3 /* Pods-Astral_iOS */,
+			);
+			path = "Target Support Files";
+			sourceTree = "<group>";
+		};
+		C649153244EE1ED5FDBD86C0 /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				2C791BC8B23CD3EAA3E65BE1 /* AppearanceSettingsView.swift */,
+				5E791F286A06CD88BBA7B4C9 /* SettingsDestination.swift */,
+				5EAA00DL1000000000000001 /* SettingsDeepLink.swift */,
+				5E7754FE5E34995DE10F87DF /* Components */,
+				5E77CB834788CB7F421D46C0 /* ServerDetailView.swift */,
+				5E777A2C7FE24BBFC1EF4FC8 /* EditServerSheet.swift */,
+				5E776D8BC0A0AEA6CAAC54AC /* GeneralSettingsView.swift */,
+				5E775331398B45DCE888553D /* CategoryColorEditors.swift */,
+				BB1234567890ABCDEF123456 /* DeveloperSettingsView.swift */,
+				9C5D08BD1430E78C26390734 /* SettingsView.swift */,
+				0F8881E8167215B8659F5BB1 /* DVRSettingsView.swift */,
+				0F8881E8167215B8659F5BC1 /* SyncCategoriesSettingsView.swift */,
+				D60A8F073408CAFD075C499C /* MyRecordingsView.swift */,
+				C5B3F5A632594CCFBF0752AA /* OpenSourceLicensesView.swift */,
+				A1BB2C3D4E5F60789ABCDEF1 /* LiveTVSettingsView.swift */,
+				FBD7CF084FC76AA3221F862B /* PlayerSettingsView.swift */,
+				1B5E9F08316B8E04572BCA96 /* AboutSettingsView.swift */,
+				41CCC6D281470BA7A6B343F8 /* SyncSettingsView.swift */,
+				EF6885859E2CB3D72D89F4E0 /* MoviesTVSettingsView.swift */,
+			);
+			path = Settings;
+			sourceTree = "<group>";
+		};
+		C79313608AD62EA61EBB298A /* Local Podspecs */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = "Local Podspecs";
+			sourceTree = "<group>";
+		};
+		C7AB555D4575EAB521484607 /* VOD */ = {
+			isa = PBXGroup;
+			children = (
+				BF6E46AD7A6F742E358FBB43 /* MoviesView.swift */,
+				5E74BEC0CC7E72B10B46A328 /* PhoneMediaPage.swift */,
+				D833EF1D35443BFAEE1480B5 /* TVShowsView.swift */,
+				20C769771A1085A303FFC0F0 /* VODDetailView.swift */,
+				8CBF1B5E89BE18F8E73482B9 /* OnDemandView.swift */,
+			);
+			path = VOD;
+			sourceTree = "<group>";
+		};
+		CASTHLSPROXY0000000000G0 /* CastHLSProxy */ = {
+			isa = PBXGroup;
+			children = (
+				CASTHLSPROXY0000000000F1 /* CastFMP4Remuxer.swift */,
+				CASTHLSPROXY0000000000F3 /* CastHLSSegmentStore.swift */,
+				CASTHLSPROXY0000000000F6 /* CastAudioFrameParser.swift */,
+				CASTHLSPROXY0000000000F7 /* CastAudioTranscoder.swift */,
+				CASTHLSPROXY0000000000F8 /* CastVideoTranscoder.swift */,
+				CASTHLSPROXY0000000000F4 /* CastHLSProxyServer.swift */,
+				CASTHLSPROXY0000000000F5 /* CastHLSProxySession.swift */,
+			);
+			path = CastHLSProxy;
+			sourceTree = "<group>";
+		};
+		CB1BBB07B37F0658C83DB709 /* Headers */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Headers;
+			sourceTree = "<group>";
+		};
+		CEF9D73F9EB0F0D4192A7CEB /* SupportingFiles */ = {
+			isa = PBXGroup;
+			children = (
+				5806A5B948B604B451A5F5C7 /* Assets.xcassets */,
+				1603AF9E4D31DB8BDC708C06 /* Info.plist */,
+				A3F72C1B8E4D9A6200BC5D91 /* Astral.entitlements */,
+			);
+			path = SupportingFiles;
+			sourceTree = "<group>";
+		};
+		D35434453E2FAF35DC5DD5BE /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A2FD31E5C3E95D9CF2F53F4E /* Astral.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D790E242FC19FAB9A2C4F61C /* Home */ = {
+			isa = PBXGroup;
+			children = (
+				5957CC8A6CC0000B14ED47C5 /* HomeView.swift */,
+				FA5005705700000000000001 /* FavoritesStore.swift */,
+			);
+			path = Home;
+			sourceTree = "<group>";
+		};
+		EBE4735039B8168FF0CF3C56 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				AA1234567890ABCDEF123456 /* DebugLogger.swift */,
+				AB1234567890ABCDEF123456 /* NowPlayingBridge.swift */,
+				CARPLAYSCENE000000000001 /* CarPlaySceneDelegate.swift */,
+				MPV0000000000000000000001 /* MPVPlayerView.swift */,
+				TSR0000000000000000000001 /* TSHLSRemuxer.swift */,
+				LIVEFMP4000000000000000A1 /* LiveFMP4Remuxer.swift */,
+				MKVFMP40000000000000000B1 /* MKVFMP4Remuxer.swift */,
+				08B4D4146C07D85405524861 /* AstralApp.swift */,
+				880CEF808ABBA8AD9BC13BEC /* AstralSplash.mp4 */,
+				CE7BE368EE5FEB9A71732DC5 /* PlayerView.swift */,
+				5044B9CD69C05A6836588548 /* SplashView.swift */,
+				WHATSNEW00000000000ACE000 /* WhatsNew.swift */,
+				8179E2560269773B4D5A0D3A /* HeadlessPlaybackController.swift */,
+				75154966450E03A3443CF312 /* AstralCastController.swift */,
+				A1R3CA8ADBFEF6FAD0DA0510 /* RemoteSessionNowPlaying.swift */,
+				A1R46F9C5AD64C38F7267B48 /* AirPlayTileDelivery.swift */,
+				A1R8AC0C10C4A1B2C3D4E5F6 /* AudioOnlySampleClock.swift */,
+				A1R8ABB50566B8495C3C8231 /* TSLANAudioRewriter.swift */,
+				9D76CB0DDDCB8645B547021D /* MultiviewCompositor.swift */,
+				FB8D6F1ADC2B9051D70A97F7 /* MultiviewCompositeTS.swift */,
+				A1R8ABB50566B8495C3C8342 /* TSHLSPlaylist.swift */,
+				A1R3EEB47325934697D79C89 /* AirPlayReceiverResolver.swift */,
+				A1R11426AB13986BB21FB3FC /* AirPlayMonitor.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		FF2BFAF9459BFB3B8F20DCC8 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				68C828711A3654526E9E9D04 /* ViewModels */,
+				A144EEEE5555EEEE5555EEEE /* AstralObjC */,
+				4A8B2C3D1E5F607892AA4B5C /* KeychainHelper.swift */,
+				265A7DFCEC12544455827DB3 /* ReminderManager.swift */,
+				4B9C3D4E2F6A718903BB5C6D /* SyncManager.swift */,
+				AA10CA7A0001000000000011 /* VODCatalogStore.swift */,
+				AA10CA7A0001000000000021 /* VODSweepActivity.swift */,
+				4B9C3D4E2F6A718903BB5C7D /* SyncFlags.swift */,
+				F6123CC8F10ADF7063AE0E97 /* ReminderBannerView.swift */,
+				62C0C151EAA6394D32003217 /* DeviceInfo.swift */,
+				B1124AFB90B57F17E01204AA /* LocalRecordingSession.swift */,
+				EDDCE00B1213614CFF8EFF4D /* RecordingCoordinator.swift */,
+				A1E5E7C0000000000000AA01 /* AppSettleGate.swift */,
+				A1B2C3D4E5F67890C10C0003 /* ClockFormat.swift */,
+				A1B2C3D4E5F678905C1A0003 /* SkipIntervals.swift */,
+				A1B2C3D4E5F67890D1C00003 /* PlayerInfoCardSettings.swift */,
+				A1B2C3D4E5F67890E7A70003 /* EventTimeParser.swift */,
+				A1B2C3D4E5F67890C0A90003 /* CompanionNowPlaying.swift */,
+				A1B2C3D4E5F67890C4A10003 /* ChannelNumberEntry.swift */,
+				A1B2C3D4E5F67890E9600030 /* EPGText.swift */,
+				B1C2D3E4F5A67890ACE00003 /* AudioSessionRefCount.swift */,
+				A1RC4579DB2B9BAAA41A1352 /* AirPlayAudioMode.swift */,
+				B1C2D3E4F5A67890ACE00006 /* IdleTimerRefCount.swift */,
+				B1C2D3E4F5A67890ACE00009 /* PlayerSession.swift */,
+				B1C2D3E4F5A67890ACE00022 /* RecentChannelsStore.swift */,
+				B1C2D3E4F5A67890ACE0002E /* ProcessMetrics.swift */,
+				B1C2D3E4F5A67890ACE00031 /* PlaybackDiagnostics.swift */,
+				B1C2D3E4F5A67890ACE0A001 /* RemoteInputLogger.swift */,
+				B1C2D3E4F5A67890ACE00B03 /* CategoryColor.swift */,
+				0D4994E16D37F74AE4F116EC /* RemoteControlMap.swift */,
+				344E207916F518E489F82832 /* RemoteControlStore.swift */,
+				7548A26AF128BE1520EA3FFA /* RemoteControlHints.swift */,
+				F1A434E6ED5CFF73E3A9D731 /* AstralImageDecoding.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		353CF1DD804CE1FDC2F4E294 /* Astral_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 53EE43EF2A156AB0859B4923 /* Build configuration list for PBXNativeTarget "Astral_iOS" */;
+			buildPhases = (
+				CD3DAA36F5727FF15ED44D85 /* [CP] Check Pods Manifest.lock */,
+				97A79060C6920CBAAF74938C /* Sources */,
+				AE6E191FB75EA241ACC75ACB /* Resources */,
+				F6FC8EF44BA77AB5758D95F1 /* Frameworks */,
+				0649000525DC23AB98EBF042 /* [CP] Embed Pods Frameworks */,
+				F3EEE8E62C5A2F1F714C934F /* [CP] Copy Pods Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Astral_iOS;
+			packageProductDependencies = (
+				7DA561DBA031A892F41D5EDE /* SwiftDraw */,
+			);
+			productName = Astral_iOS;
+			productReference = A2FD31E5C3E95D9CF2F53F4E /* Astral.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FF7071163D6291891DEC5B95 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = E14095500FDB469BC6E1027E /* Build configuration list for PBXProject "Astral" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 4D5B125286008EFD60915C8C;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				BDD64B7F2F76FD240055F82C /* XCRemoteSwiftPackageReference "MPVKit" */,
+				F14B1CE1620BA3F5A29FABEB /* XCRemoteSwiftPackageReference "SwiftDraw" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = D35434453E2FAF35DC5DD5BE /* Products */;
+			projectDirPath = "";
+			projectReferences = (
+				{
+					ProductGroup = BD5262EB2F6792080036371D /* Products */;
+					ProjectRef = 2AF171D5A7722CF07BDE9B48 /* Pods.xcodeproj */;
+				},
+			);
+			projectRoot = "";
+			targets = (
+				353CF1DD804CE1FDC2F4E294 /* Astral_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AE6E191FB75EA241ACC75ACB /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				11120119C5A64353490041AC /* Assets.xcassets in Resources */,
+				65A50DB238B2354D5B81DE09 /* Astral.xcworkspace in Resources */,
+				C9E28AF097D00D2A282673A5 /* AstralSplash.mp4 in Resources */,
+				DBFAE2F87043F12BE1728B6D /* Manifest.lock in Resources */,
+				5585996EF79BB170CAD2D6F3 /* Podfile.lock in Resources */,
+				B747D3E4B7695FAF8CD9C557 /* Pods-Astral_iOS-Info.plist in Resources */,
+				C02E4BB60A5E960696E8839B /* Pods-Astral_iOS-acknowledgements.markdown in Resources */,
+				8CF1E8A8912F0A98110ABF07 /* Pods-Astral_iOS-acknowledgements.plist in Resources */,
+				85F0D65172F55DFA1D3DA20B /* Pods-Astral_iOS-frameworks.sh in Resources */,
+				2527936283FB11BD5201E1DA /* Pods.xcodeproj in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0649000525DC23AB98EBF042 /* [CP] Embed Pods Frameworks */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS-frameworks-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Embed Pods Frameworks";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		CD3DAA36F5727FF15ED44D85 /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-Astral_iOS-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		F3EEE8E62C5A2F1F714C934F /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Astral_iOS/Pods-Astral_iOS-resources.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		97A79060C6920CBAAF74938C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1R198FCCDFCE30FD191BF69 /* RemoteSessionNowPlaying.swift in Sources */,
+				A1R865DEBFC0015BAB4F022B /* AirPlayTileDelivery.swift in Sources */,
+				A1R97E4D2C14EFFBDA110A4E /* AudioOnlySampleClock.swift in Sources */,
+				A1R97E4D2C14EFFBDA110A4D /* TSLANAudioRewriter.swift in Sources */,
+				4EDBB7B772510A4904D83395 /* MultiviewCompositor.swift in Sources */,
+				35BDAE4FB1BC23EE075FD15E /* MultiviewCompositeTS.swift in Sources */,
+				A1R97E4D2C14EFFBDA110B5E /* TSHLSPlaylist.swift in Sources */,
+				A1RF6A0E8715728C27F1F2FB /* AirPlayReceiverResolver.swift in Sources */,
+				A1R58F2EB6D2DBEFDAAB10ED /* AirPlayMonitor.swift in Sources */,
+				A1RFD0C9647D68F7E2A9043C /* AirPlayAudioMode.swift in Sources */,
+				A133DDDD4444DDDD4444DDDD /* MPMediaItemArtworkShim.m in Sources */,
+				10D8764EE31D09E18D0C2CFB /* AddServerView.swift in Sources */,
+				10D8764EE31D09E18D0C2CFC /* ServerSyncView.swift in Sources */,
+				B0C3B7E4FC02D61295E8FEA5 /* AppearanceSettingsView.swift in Sources */,
+				9F9A37C29E5E186E323737C0 /* ChannelListView.swift in Sources */,
+				A2B3C4D5E6F7A80901CD3456 /* EPGGuideView.swift in Sources */,
+				737FB562438624E3BF547904 /* Colors.swift in Sources */,
+				0823BE6E3373A83D3FEBC32F /* Components.swift in Sources */,
+				0A23BE6E3373A83D3FEBC001 /* ManageGroupsSheet.swift in Sources */,
+				DD1234567890ABCDEF123456 /* DebugLogger.swift in Sources */,
+				DE1234567890ABCDEF123456 /* NowPlayingBridge.swift in Sources */,
+				CARPLAYSCENE000000000003 /* CarPlaySceneDelegate.swift in Sources */,
+				MPV0000000000000000000003 /* MPVPlayerView.swift in Sources */,
+				TSR0000000000000000000003 /* TSHLSRemuxer.swift in Sources */,
+				LIVEFMP4000000000000000A3 /* LiveFMP4Remuxer.swift in Sources */,
+				MKVFMP40000000000000000B3 /* MKVFMP4Remuxer.swift in Sources */,
+				CASTHLSPROXY0000000000B1 /* CastFMP4Remuxer.swift in Sources */,
+				CASTHLSPROXY0000000000B3 /* CastHLSSegmentStore.swift in Sources */,
+				CASTHLSPROXY0000000000B6 /* CastAudioFrameParser.swift in Sources */,
+				CASTHLSPROXY0000000000B7 /* CastAudioTranscoder.swift in Sources */,
+				CASTHLSPROXY0000000000B8 /* CastVideoTranscoder.swift in Sources */,
+				CASTHLSPROXY0000000000B4 /* CastHLSProxyServer.swift in Sources */,
+				CASTHLSPROXY0000000000B5 /* CastHLSProxySession.swift in Sources */,
+				FF1234567890ABCDEF123456 /* DeveloperSettingsView.swift in Sources */,
+				CF38B25676730E71C9AD497A /* AstralApp.swift in Sources */,
+				3A694D00B8E5469ADCD3D120 /* HomeView.swift in Sources */,
+				FA5005705700000000000003 /* FavoritesStore.swift in Sources */,
+				B0B4EE0F74D4863E74833446 /* LiquidGlass.swift in Sources */,
+				AD422FFDD689840F76B8A238 /* MediaServerAPIs.swift in Sources */,
+				30FA1CA916C8DDE2001C592F /* Models.swift in Sources */,
+				DA8D78550B95A889171982BC /* MoviesView.swift in Sources */,
+				901047E69DDB4F9633B3CCC3 /* PhoneMediaPage.swift in Sources */,
+				7AA2C488BA2252BB6003C40E /* DVRView.swift in Sources */,
+				47124970CDB0AF253294C1D7 /* DVRArtResolver.swift in Sources */,
+				EFA00AF67E8EE3B9D8BFC892 /* RecordingActions.swift in Sources */,
+				F00D3696D62D7C9EF6E05244 /* PlayerView.swift in Sources */,
+				7CFFD573C287B60F267445BD /* PlaylistImportViews.swift in Sources */,
+				84D478A2A84F9A8A2FEE8EA4 /* PlaylistModels.swift in Sources */,
+				622B003E0D0A155E9FE7D9B7 /* PlaylistParsers.swift in Sources */,
+				B5AE22380A5D13659655A5CD /* SearchView.swift in Sources */,
+				349A1C11393E9A07EDE93974 /* ServerConnectionViewModel.swift in Sources */,
+				6A8B2C3D1E5F607892AA4B5C /* KeychainHelper.swift in Sources */,
+				665A7DFCEC12544455827DB3 /* ReminderManager.swift in Sources */,
+				6B9C3D4E2F6A718903BB5C6D /* SyncManager.swift in Sources */,
+				6B9C3D4E2F6A718903BB5C7D /* SyncFlags.swift in Sources */,
+				2DD98124C6F98D06EFED419A /* SettingsView.swift in Sources */,
+				5E7976A11FAC74DB0DAFF9BA /* SettingsDestination.swift in Sources */,
+				5EAA00DL1000000000000003 /* SettingsDeepLink.swift in Sources */,
+				5E783C4A3D74F99510FB9AD5 /* SettingsSection.swift in Sources */,
+				5E78653AC914E3F01DD09F7B /* SettingsMetrics.swift in Sources */,
+				853136D0782A7ABB2ED6D735 /* SettingsSubgroup.swift in Sources */,
+				60605874B0501017DD6C675F /* SettingsChoicePicker.swift in Sources */,
+				9F446FE905EAF6861FF15914 /* SettingsTextField.swift in Sources */,
+				5E7788A6AC6F15F4804AC5D7 /* TVSettingsRows.swift in Sources */,
+				5E77169DCEFE3D1DACB4112E /* SettingsRow.swift in Sources */,
+				814776352C25C6D44E86A0D2 /* SettingsControls.swift in Sources */,
+				5E773CA46CF0A0073940E923 /* SettingsDismissStack.swift in Sources */,
+				5E77AA8EB47EC6574E23FA2F /* ServerDetailView.swift in Sources */,
+				5E77ABB81C8F17518EA013C0 /* EditServerSheet.swift in Sources */,
+				5E776BD28835120B3F9F9FEC /* GeneralSettingsView.swift in Sources */,
+				5E7705A1E430A8350B1D294A /* CategoryColorEditors.swift in Sources */,
+				867C07594A685FB5BDCA5BB3 /* SplashView.swift in Sources */,
+				76842216BD4822B7380FDF05 /* TVShowsView.swift in Sources */,
+				8AC25DFB7121C1AEBCE36729 /* ThemeManager.swift in Sources */,
+				6BA60E4727C61B8943535F4E /* Typography.swift in Sources */,
+				97309F3B0C6B3769882EF361 /* VODDetailView.swift in Sources */,
+				B743C668A35FABC8A1BECB16 /* VODModels.swift in Sources */,
+				AA10CA7A0001000000000013 /* VODCatalogStore.swift in Sources */,
+				AA10CA7A0001000000000023 /* VODSweepActivity.swift in Sources */,
+				AA10CA7A0001000000000003 /* VODCatalogModels.swift in Sources */,
+				D707545F75A250B3657868F5 /* VODService.swift in Sources */,
+				58753215820D219D87D24402 /* WelcomeView.swift in Sources */,
+				98B0C60D6099DEF55810D175 /* StreamingAPIs.swift in Sources */,
+				3C4D5E6F70891012ACE70020 /* NWHTTPClient.swift in Sources */,
+				3C4D5E6F70891012ACE70021 /* HTTPRouter.swift in Sources */,
+				3349C24B50E8CC1C902B358F /* XtreamSeriesAPI.swift in Sources */,
+				8F5A030376AB114E38DAE4AD /* ReminderBannerView.swift in Sources */,
+				000A4A7BFF25A66945137BB3 /* DeviceInfo.swift in Sources */,
+				D50E5DFBD9787AC5568AD17A /* LocalRecordingSession.swift in Sources */,
+				8B904D93666027F576A836E1 /* RecordingCoordinator.swift in Sources */,
+				A1E5E7C0000000000000AA03 /* AppSettleGate.swift in Sources */,
+				A1B2C3D4E5F67890C10C0002 /* ClockFormat.swift in Sources */,
+				A1B2C3D4E5F678905C1A0002 /* SkipIntervals.swift in Sources */,
+				A1B2C3D4E5F67890D1C00002 /* PlayerInfoCardSettings.swift in Sources */,
+				A1B2C3D4E5F67890E7A70002 /* EventTimeParser.swift in Sources */,
+				A1B2C3D4E5F67890C0A90002 /* CompanionNowPlaying.swift in Sources */,
+				A1B2C3D4E5F67890C4A10002 /* ChannelNumberEntry.swift in Sources */,
+				A1B2C3D4E5F67890E9600020 /* EPGText.swift in Sources */,
+				B1C2D3E4F5A67890ACE00002 /* AudioSessionRefCount.swift in Sources */,
+				B1C2D3E4F5A67890ACE0A003 /* RemoteInputLogger.swift in Sources */,
+				B1C2D3E4F5A67890ACE00005 /* IdleTimerRefCount.swift in Sources */,
+				B1C2D3E4F5A67890ACE00008 /* PlayerSession.swift in Sources */,
+				B1C2D3E4F5A67890ACE0000B /* MultiviewTile.swift in Sources */,
+				B1C2D3E4F5A67890ACE0000E /* MultiviewStore.swift in Sources */,
+				B1C2D3E4F5A67890ACE00012 /* MultiviewGridMath.swift in Sources */,
+				B1C2D3E4F5A67890ACE00015 /* MultiviewLayoutView.swift in Sources */,
+				B1C2D3E4F5A67890ACE00018 /* MultiviewTransportBar.swift in Sources */,
+				B1C2D3E4F5A67890ACE0001B /* MultiviewTileView.swift in Sources */,
+				B1C2D3E4F5A67890ACE0001E /* MultiviewContainerView.swift in Sources */,
+				B1C2D3E4F5A67890ACE00021 /* RecentChannelsStore.swift in Sources */,
+				B1C2D3E4F5A67890ACE00024 /* CompactChannelRow.swift in Sources */,
+				WHATSNEW00000000000ACE002 /* WhatsNew.swift in Sources */,
+				B1C2D3E4F5A67890ACE00027 /* AddToMultiviewSheet.swift in Sources */,
+				B1C2D3E4F5A67890ACE0002A /* MultiviewCommands.swift in Sources */,
+				B1C2D3E4F5A67890ACE0002D /* ProcessMetrics.swift in Sources */,
+				B1C2D3E4F5A67890ACE00030 /* PlaybackDiagnostics.swift in Sources */,
+				B1C2D3E4F5A67890ACE00033 /* PlaybackChromeOverlay.swift in Sources */,
+				B1C2D3E4F5A67890ACE00B02 /* CategoryColor.swift in Sources */,
+				38A0E8B8ABBD862D5012AB52 /* DVRSettingsView.swift in Sources */,
+				38A0E8B8ABBD862D5012AC52 /* SyncCategoriesSettingsView.swift in Sources */,
+				B1AABBCC2DD3EE4FF5006002 /* LiveTVSettingsView.swift in Sources */,
+				84338D2727DB3CF6EF963AD3 /* MyRecordingsView.swift in Sources */,
+				C3E892D1A5B2461D966BE39C /* OpenSourceLicensesView.swift in Sources */,
+				115F4DEA73DE0C5C49817C04 /* RecordProgramSheet.swift in Sources */,
+				B997EA931623455C8A931F29 /* ProgramInfoView.swift in Sources */,
+				C9E919E28B95CE15179BBCBD /* OnDemandView.swift in Sources */,
+				1B56BE6F7111A4EF6DD7E11B /* DispatcharrDirectConnect.swift in Sources */,
+				BEEFBC48135CF7E02F81D4D4 /* PlayerSettingsView.swift in Sources */,
+				2BF99C26CF25FEDC6460A79C /* AboutSettingsView.swift in Sources */,
+				9DFF004C5CB18CF95965695D /* SyncSettingsView.swift in Sources */,
+				CBEAA5B478EF33D1AFF1842C /* MoviesTVSettingsView.swift in Sources */,
+				7A11FAB6D3BD7B764BF99C59 /* SwitchStreamView.swift in Sources */,
+				1AA3C3EA66B1387B7A4D6DD4 /* HeadlessPlaybackController.swift in Sources */,
+				5291397500EE0C386FEAEDA5 /* AstralCastController.swift in Sources */,
+				E915CEF210B6996327E6A4B7 /* RemoteControlMap.swift in Sources */,
+				E242B7EE7D858C8653991D1D /* RemoteControlStore.swift in Sources */,
+				F7E00AC7791418818CC81D52 /* RemoteControlHints.swift in Sources */,
+				5EC13B0FAB0F82A309E38E02 /* GuidePreviewBanner.swift in Sources */,
+				6A1D3E2F4B5C6D7E8F901A2D /* GuideJumpSheet.swift in Sources */,
+				B2E5D9A83014F26FAF9FD0A0 /* AstralImageDecoding.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0FEC2E21180118A37C2B6E86 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 7427D276A24801276CF5F829 /* Pods-Astral_iOS.debug.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION = YES;
+				CODE_SIGN_ENTITLEMENTS = SupportingFiles/Astral.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 47DTJ3Q67T;
+				INFOPLIST_FILE = SupportingFiles/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = AstralTV;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(BUNDLE_ID_PREFIX).astral";
+				PRODUCT_NAME = Astral;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/AstralObjC/Astral-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		58770CA2B53D8AA283368438 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A1ECC0FF1ED1ABF1ED1ABF11 /* Astral.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 47DTJ3Q67T;
+				ENABLE_BITCODE = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"GLES_SILENCE_DEPRECATION=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTS_MACCATALYST = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Release;
+		};
+		591F6D6387ED7CB4ED5CF6EA /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F4F295E7C905ADA24B7D49AB /* Pods-Astral_iOS.release.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION = YES;
+				CODE_SIGN_ENTITLEMENTS = SupportingFiles/Astral.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 47DTJ3Q67T;
+				INFOPLIST_FILE = SupportingFiles/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = AstralTV;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(BUNDLE_ID_PREFIX).astral";
+				PRODUCT_NAME = Astral;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/AstralObjC/Astral-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		748263AE0CAA260641A4DC36 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A1ECC0FF1ED1ABF1ED1ABF11 /* Astral.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 47DTJ3Q67T;
+				ENABLE_BITCODE = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+					"GLES_SILENCE_DEPRECATION=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTS_MACCATALYST = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		53EE43EF2A156AB0859B4923 /* Build configuration list for PBXNativeTarget "Astral_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0FEC2E21180118A37C2B6E86 /* Debug */,
+				591F6D6387ED7CB4ED5CF6EA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		E14095500FDB469BC6E1027E /* Build configuration list for PBXProject "Astral" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				748263AE0CAA260641A4DC36 /* Debug */,
+				58770CA2B53D8AA283368438 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		BDD64B7F2F76FD240055F82C /* XCRemoteSwiftPackageReference "MPVKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mpvkit/MPVKit.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
+		F14B1CE1620BA3F5A29FABEB /* XCRemoteSwiftPackageReference "SwiftDraw" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/swhitty/SwiftDraw";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.18.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		7DA561DBA031A892F41D5EDE /* SwiftDraw */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F14B1CE1620BA3F5A29FABEB /* XCRemoteSwiftPackageReference "SwiftDraw" */;
+			productName = SwiftDraw;
+		};
+		BDD64B822F76FD240055F82C /* MPVKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDD64B7F2F76FD240055F82C /* XCRemoteSwiftPackageReference "MPVKit" */;
+			productName = MPVKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = FF7071163D6291891DEC5B95 /* Project object */;
+}
