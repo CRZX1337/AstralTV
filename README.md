@@ -5,11 +5,10 @@ AstralTV is an IPTV player for iPhone. It plays live channels, an electronic pro
 ## Screenshots
 
 <p align="center">
-  <img src="docs/screenshots/iphone/01.jpg" width="200" alt="AstralTV screenshot 1">
   <img src="docs/screenshots/iphone/02.jpg" width="200" alt="AstralTV screenshot 2">
   <img src="docs/screenshots/iphone/03.jpg" width="200" alt="AstralTV screenshot 3">
-  <br>
   <img src="docs/screenshots/iphone/04.jpg" width="200" alt="AstralTV screenshot 4">
+  <br>
   <img src="docs/screenshots/iphone/05.jpg" width="200" alt="AstralTV screenshot 5">
   <img src="docs/screenshots/iphone/06.jpg" width="200" alt="AstralTV screenshot 6">
 </p>
