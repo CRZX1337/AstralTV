@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="AstralTV banner" width="100%">
+</p>
+
 # AstralTV
 
 AstralTV is an IPTV player for iPhone. It plays live channels, an electronic program guide, recordings, and on-demand movies and series from media sources you provide.
