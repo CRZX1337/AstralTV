@@ -322,6 +322,35 @@
     }
   };
 
+  // Latest build on main, shown as a status pill in the hero.
+  const loadBuildStatus = async () => {
+    const badge = document.getElementById("buildStatus");
+    const value = document.getElementById("buildStatusText");
+    if (!badge || !value) return;
+    try {
+      const data = await getJSON(
+        `${API}/actions/workflows/build-ipa.yml/runs?branch=main&per_page=1`
+      );
+      const run = (data.workflow_runs || [])[0];
+      if (!run) return;
+      const state =
+        run.status !== "completed"
+          ? "running"
+          : run.conclusion === "success"
+            ? "success"
+            : "failure";
+      const label = { running: "building", success: "passing", failure: "failed" }[state];
+      badge.dataset.state = state;
+      value.textContent = `${label} \u00b7 ${run.head_sha.slice(0, 7)}`;
+      badge.href = run.html_url;
+      badge.title = `Latest beta build ${label}, run #${run.run_number}`;
+      badge.hidden = false;
+    } catch {
+      // Leave the badge hidden if the API is unavailable.
+    }
+  };
+
   loadRelease();
   loadBeta();
+  loadBuildStatus();
 })();
