@@ -301,27 +301,27 @@
     }
   };
 
-  const loadBuild = async () => {
+  // The beta button always points at the rolling pre-release asset. Only the
+  // commit and date come from the API, so a failed request never breaks the link.
+  const loadBeta = async () => {
     const version = document.getElementById("betaVersion");
     const date = document.getElementById("betaDate");
-    const link = document.getElementById("betaLink");
     const card = document.getElementById("betaCard");
     try {
-      const data = await getJSON(
-        `${API}/actions/workflows/build-ipa.yml/runs?per_page=8`
+      const release = await getJSON(`${API}/releases/tags/beta-latest`);
+      const asset = (release.assets || []).find(
+        (item) => item.name === "AstralTV-beta-latest.ipa"
       );
-      const run = (data.workflow_runs || []).find((r) => r.conclusion === "success");
-      if (!run) throw new Error("no successful run");
-      version.textContent = `Run #${run.run_number} · ${run.head_sha.slice(0, 7)}`;
-      date.textContent = `Built ${formatDate(run.updated_at)}`;
-      link.href = run.html_url;
+      if (!asset) throw new Error("beta asset missing");
+      version.textContent = release.name || "Beta build";
+      date.textContent = `Updated ${formatDate(release.updated_at || release.published_at)}`;
     } catch {
       card.classList.add("is-fallback");
-      version.textContent = "Build details unavailable";
-      date.textContent = "The workflow page lists every build.";
+      version.textContent = "Beta release not ready";
+      date.textContent = "The next push to main publishes it.";
     }
   };
 
   loadRelease();
-  loadBuild();
+  loadBeta();
 })();

@@ -4,8 +4,12 @@ name: Build unsigned Astral IPA
 # into a Payload IPA designed to be signed later on-device with Feather
 # (or esign / AltStore). No Apple developer account is needed to build.
 #
-# Trigger manually from the Actions tab (upload_method picks where the IPA
-# lands), or automatically on version tags (artifacts always).
+# Triggers:
+#   - Manual dispatch from the Actions tab (upload_method picks where the
+#     IPA lands). Unchanged.
+#   - Push to main: builds automatically and publishes the result as the
+#     rolling "beta-latest" pre-release.
+#   - Version tags: build only, so stable releases keep their own assets.
 
 on:
   workflow_dispatch:
@@ -20,7 +24,11 @@ on:
         default: latest-stable
         type: string
   push:
+    branches: [main]
     tags: ["v*"]
+
+permissions:
+  contents: read
 
 concurrency:
   group: build-ipa-${{ github.ref }}
@@ -137,3 +145,180 @@ jobs:
             "https://filebin.net/$BIN/${IPA_NAME}" >/dev/null
           echo "- https://filebin.net/$BIN/$IPA_NAME" >> "$GITHUB_STEP_SUMMARY"
           echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"
+
+  # Every push to main refreshes one rolling pre-release instead of stacking
+  # new releases. The tag, release, and asset name never change, so the
+  # website can link to a single stable URL.
+  publish-beta:
+    name: Publish beta-latest pre-release
+    needs: build
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # Serialize publishes so two runs can never write the asset at once.
+    concurrency:
+      group: beta-release
+      cancel-in-progress: false
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Astral-unsigned
+          path: dist-src
+
+      - name: Package beta asset
+        run: |
+          set -euo pipefail
+          src=$(find dist-src -type f -name '*.ipa' -print -quit)
+          test -n "${src:-}" || { echo "::error::No IPA found in the build artifact"; exit 1; }
+          mkdir -p dist
+          cp "$src" dist/AstralTV-beta-latest.ipa
+          test -s dist/AstralTV-beta-latest.ipa
+
+      - name: Publish beta pre-release
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/$REPO"
+          TAG="beta-latest"
+          ASSET="AstralTV-beta-latest.ipa"
+          TEMP="AstralTV-beta-latest.upload.ipa"
+          IPA="dist/$ASSET"
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          api() { curl -sS --fail-with-body "${AUTH[@]}" "$@"; }
+
+          test -s "$IPA"
+
+          # 200 means the rolling release exists; 404 means this is the first build.
+          code=$(curl -sS "${AUTH[@]}" -o release.json -w '%{http_code}' "$API/releases/tags/$TAG")
+          case "$code" in
+            200) echo "Updating the existing $TAG pre-release." ;;
+            404) echo "Creating the $TAG pre-release." ;;
+            *) cat release.json; echo "::error::Could not read release $TAG (HTTP $code)"; exit 1 ;;
+          esac
+
+          if [ "$code" = "200" ]; then
+            release_id=$(jq -r '.id' release.json)
+            if [ "$(jq -r '.prerelease' release.json)" != "true" ]; then
+              echo "::error::Release $TAG exists but is not a pre-release. Refusing to modify it."
+              exit 1
+            fi
+
+            # Older builds must never overwrite a newer beta. The run number of
+            # the published build is stored in a hidden HTML comment in the body.
+            published_run=$(jq -r '.body // ""' release.json | sed -n 's/.*beta-run:\([0-9][0-9]*\).*/\1/p' | head -n 1)
+            if [ -n "${published_run:-}" ] && [ "$published_run" -ge "$RUN_NUMBER" ]; then
+              echo "Run $published_run is already published; this older run (${RUN_NUMBER}) will not overwrite it."
+              {
+                echo "### Beta release left untouched"
+                echo "Run $published_run is already published, so this older run (${RUN_NUMBER}) did not replace it."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+
+          short_sha=${SHA:0:7}
+          release_name="Beta build · $short_sha"
+          release_body=$(printf 'Automated unsigned build from `main`.\n\n- Commit: `%s`\n- Workflow run: [#%s](%s)\n- Asset: `%s`\n\nDownload: https://github.com/%s/releases/download/%s/%s\n\n<!-- beta-run:%s -->' \
+            "$short_sha" "$RUN_NUMBER" "$RUN_URL" "$ASSET" "$REPO" "$TAG" "$ASSET" "$RUN_NUMBER")
+
+          if [ "$code" = "200" ]; then
+            if ! api -X PATCH -H "Content-Type: application/json" "$API/releases/$release_id" \
+                 -d "$(jq -n --arg name "$release_name" --arg body "$release_body" \
+                   '{name: $name, body: $body, prerelease: true, make_latest: "false"}')" > release.json; then
+              cat release.json
+              echo "::error::Could not update the $TAG release."
+              exit 1
+            fi
+          else
+            if ! api -X POST -H "Content-Type: application/json" "$API/releases" \
+                 -d "$(jq -n --arg tag "$TAG" --arg sha "$SHA" --arg name "$release_name" --arg body "$release_body" \
+                   '{tag_name: $tag, target_commitish: $sha, name: $name, body: $body, prerelease: true, draft: false, make_latest: "false"}')" > release.json; then
+              cat release.json
+              echo "::error::Could not create the $TAG release."
+              exit 1
+            fi
+            release_id=$(jq -r '.id' release.json)
+          fi
+          if [ -z "${release_id:-}" ] || [ "$release_id" = "null" ]; then
+            echo "::error::The $TAG release has no id after publishing."
+            exit 1
+          fi
+
+          # Remove a partial upload left behind by an interrupted run.
+          for stale in $(jq -r --arg n "$TEMP" '.assets[]? | select(.name == $n) | .id' release.json); do
+            api -X DELETE "$API/releases/assets/$stale" > /dev/null
+          done
+
+          # Upload under a temporary name first so the current download keeps
+          # working until the new IPA is fully on GitHub.
+          echo "Uploading $(du -h "$IPA" | cut -f1) as $TEMP."
+          if ! api -X POST -H "Content-Type: application/octet-stream" \
+               --data-binary "@$IPA" \
+               "https://uploads.github.com/repos/$REPO/releases/$release_id/assets?name=$TEMP" > upload.json; then
+            cat upload.json
+            echo "::error::Uploading the beta IPA failed."
+            exit 1
+          fi
+
+          uploaded_id=$(jq -r '.id // empty' upload.json)
+          uploaded_size=$(jq -r '.size // 0' upload.json)
+          local_size=$(stat -c%s "$IPA")
+          if [ -z "$uploaded_id" ] || [ "$uploaded_size" != "$local_size" ]; then
+            echo "::error::Uploaded asset is incomplete (id=${uploaded_id:-none}, size=$uploaded_size, expected $local_size)."
+            exit 1
+          fi
+
+          # Swap the fixed asset name over to the new upload.
+          for old in $(jq -r --arg n "$ASSET" '.assets[]? | select(.name == $n) | .id' release.json); do
+            api -X DELETE "$API/releases/assets/$old" > /dev/null
+          done
+          api -X PATCH -H "Content-Type: application/json" "$API/releases/assets/$uploaded_id" \
+            -d "$(jq -n --arg n "$ASSET" '{name: $n}')" > /dev/null
+
+          # Keep the rolling tag on the built commit. Version tags are never touched.
+          if ! api -X PATCH -H "Content-Type: application/json" "$API/git/refs/tags/$TAG" \
+               -d "$(jq -n --arg sha "$SHA" '{sha: $sha, force: true}')" > /dev/null; then
+            echo "::warning::Could not move the $TAG tag to $SHA; the release asset was still replaced."
+          fi
+
+          # Verify the release, the asset, and the public download URL.
+          api "$API/releases/tags/$TAG" > release.json
+          if ! jq -e '.prerelease == true and .tag_name == "beta-latest"' release.json > /dev/null; then
+            cat release.json
+            echo "::error::$TAG is missing or is not a pre-release after publishing."
+            exit 1
+          fi
+
+          asset_size=$(jq -r --arg n "$ASSET" '[.assets[]? | select(.name == $n) | .size][0] // empty' release.json)
+          if [ -z "${asset_size:-}" ] || [ "${asset_size:-0}" -le 0 ]; then
+            echo "::error::$ASSET is missing from the $TAG release."
+            exit 1
+          fi
+          if [ "$asset_size" != "$local_size" ]; then
+            echo "::error::$ASSET is $asset_size bytes on GitHub, expected $local_size."
+            exit 1
+          fi
+
+          download_url="https://github.com/$REPO/releases/download/$TAG/$ASSET"
+          download_code=$(curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' "$download_url")
+          case "$download_code" in
+            200|206) echo "Download URL responds with HTTP $download_code." ;;
+            *) echo "::error::$download_url responds with HTTP $download_code."; exit 1 ;;
+          esac
+
+          {
+            echo "### Beta pre-release updated"
+            echo "- Release: https://github.com/$REPO/releases/tag/$TAG"
+            echo "- Download: $download_url"
+            echo "- Commit: \`$short_sha\` (run #$RUN_NUMBER)"
+            echo "- Asset size: $local_size bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
