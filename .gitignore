@@ -1,6 +1,8 @@
 # Dependencies
 Pods/
 Carthage/
+.freebuff/
+.agents/
 
 # Xcode
 build/
@@ -39,4 +41,3 @@ Thumbs.db
 # Local-only UITest harness (see file header: heat/regression, not committed)
 AstralUITests/
 
-.freebuff/
