@@ -45,6 +45,9 @@ body {
   color: var(--ink);
   font: 16px/1.65 var(--font-body);
   overflow-x: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 img { max-width: 100%; height: auto; display: block; }
@@ -136,13 +139,14 @@ code {
   --ry: 0deg;
   transform: perspective(1000px) rotateX(var(--rx)) rotateY(var(--ry));
   transition: transform .35s ease;
+  border-radius: var(--r-lg);
 }
 .tilt::after {
   content: "";
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  background: radial-gradient(340px circle at var(--mx) var(--my), rgba(26, 196, 216, .16), transparent 62%);
+  background: radial-gradient(190px circle at var(--mx) var(--my), rgba(26, 196, 216, .14), rgba(26, 196, 216, 0) 100%);
   opacity: 0;
   transition: opacity .35s ease;
   pointer-events: none;
@@ -373,6 +377,7 @@ section { scroll-margin-top: 96px; }
 .device {
   position: relative;
   width: clamp(238px, 25vw, 300px);
+  border-radius: 48px;
 }
 
 .device-frame {
@@ -557,14 +562,17 @@ section { scroll-margin-top: 96px; }
 
 .features { padding-bottom: clamp(56px, 10vh, 120px); }
 
+/* Eight cards, so the grid stays even at every breakpoint: 4x2, 2x4, 1x8. */
 .feature-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 18px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
 }
 
 .feature {
-  padding: 26px 26px 28px;
+  display: flex;
+  flex-direction: column;
+  padding: 22px 22px 24px;
   border-radius: 22px;
   transition: transform .35s ease, border-color .35s ease, box-shadow .35s ease;
 }
@@ -573,24 +581,24 @@ section { scroll-margin-top: 96px; }
   border-color: rgba(26, 196, 216, .32);
   box-shadow: 0 30px 70px rgba(2, 8, 18, .55), inset 0 1px 0 rgba(242, 247, 250, .14);
 }
-.feature h3 { font-size: 1.22rem; margin-bottom: 8px; }
-.feature p { color: var(--ink-2); font-size: 15.5px; }
+.feature h3 { font-size: 1.1rem; margin-bottom: 8px; min-height: 2.24em; }
+.feature p { color: var(--ink-2); font-size: 14.5px; line-height: 1.55; }
 
 .feature-icon {
   display: inline-flex;
-  width: 46px;
-  height: 46px;
+  width: 42px;
+  height: 42px;
   align-items: center;
   justify-content: center;
-  border-radius: 15px;
-  margin-bottom: 18px;
+  border-radius: 14px;
+  margin-bottom: 16px;
   color: var(--accent);
   background: rgba(26, 196, 216, .10);
   border: 1px solid var(--stroke);
 }
 .feature-icon svg {
-  width: 23px;
-  height: 23px;
+  width: 21px;
+  height: 21px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.6;
@@ -598,76 +606,182 @@ section { scroll-margin-top: 96px; }
   stroke-linejoin: round;
 }
 
-.feature-wide { grid-column: span 2; }
+@media (max-width: 1120px) {
+  .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .feature { padding: 26px 26px 28px; }
+  .feature h3 { font-size: 1.22rem; min-height: 0; }
+  .feature p { font-size: 15.5px; }
+}
 
 @media (max-width: 640px) {
-  .feature-wide { grid-column: auto; }
+  .feature-grid { grid-template-columns: 1fr; }
 }
 
 /* ---------- screenshot rail ---------- */
 
 .screens { padding-bottom: clamp(56px, 10vh, 120px); }
 
-.rail-wrap {
-  margin: 0 -24px;
-  padding: 0 24px;
-}
+.rail-shell { position: relative; }
+
 .rail {
   list-style: none;
   display: flex;
-  gap: 20px;
-  margin: 0;
-  padding: 6px 2px 28px;
+  gap: 18px;
+  margin: 0 -24px;
+  padding: 10px 24px 22px;
   overflow-x: auto;
-  scroll-snap-type: x proximity;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(26, 196, 216, .45) transparent;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-padding-inline: 24px;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
   cursor: grab;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 20px, #000 calc(100% - 20px), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 20px, #000 calc(100% - 20px), transparent 100%);
+}
+.rail::-webkit-scrollbar { display: none; }
+/* Keyboard focus only. The edge mask would clip the ring, so it lifts while focused. */
+.rail.is-keyboard {
+  -webkit-mask-image: none;
+  mask-image: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 6px;
+  border-radius: 18px;
 }
 .rail.is-dragging {
   cursor: grabbing;
   scroll-snap-type: none;
   user-select: none;
 }
-.rail::-webkit-scrollbar { height: 6px; }
-.rail::-webkit-scrollbar-thumb {
-  background: rgba(26, 196, 216, .35);
-  border-radius: 999px;
-}
 
 .shot {
   flex: none;
-  width: clamp(180px, 20vw, 232px);
-  padding: 9px;
-  border-radius: 26px;
-  scroll-snap-align: center;
-  transition: transform .35s ease, border-color .35s ease;
+  width: clamp(172px, 18vw, 228px);
+  scroll-snap-align: start;
 }
-.shot:hover {
+
+.shot-card {
+  position: relative;
+  margin: 0;
+  padding: 11px 11px 0;
+  border-radius: 30px;
+  background:
+    linear-gradient(158deg, rgba(242, 247, 250, .13) 0%, rgba(13, 30, 53, .38) 46%, rgba(6, 13, 25, .58) 100%);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  border: 1px solid rgba(242, 247, 250, .13);
+  box-shadow:
+    0 26px 60px rgba(2, 8, 18, .5),
+    inset 0 1px 0 rgba(242, 247, 250, .22),
+    inset 0 -1px 0 rgba(2, 8, 18, .55);
+  transition: transform .45s cubic-bezier(.2, .7, .2, 1), border-color .35s ease, box-shadow .45s ease;
+}
+.shot-card:hover {
   transform: translateY(-6px);
   border-color: rgba(26, 196, 216, .34);
-}
-.shot-cap {
-  margin: 12px 4px 10px;
-  font-size: 11px;
-  letter-spacing: .18em;
-  text-transform: uppercase;
-  color: var(--ink-3);
+  box-shadow:
+    0 34px 70px rgba(2, 8, 18, .55),
+    0 0 0 1px rgba(26, 196, 216, .12),
+    inset 0 1px 0 rgba(242, 247, 250, .26);
 }
 
-.shot img {
-  border-radius: 19px;
-  aspect-ratio: 0.487;
-  height: auto;
-  object-fit: cover;
+.shot-media {
+  position: relative;
+  border-radius: 20px;
+  overflow: hidden;
+  background: var(--bg-2);
+}
+.shot-media img {
   width: 100%;
+  height: auto;
+  aspect-ratio: 620 / 1280;
+  object-fit: cover;
+  object-position: center top;
 }
 
-.rail-hint {
-  color: var(--ink-3);
-  font-size: 13.5px;
-  text-align: center;
+.shot-glare {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(118deg, rgba(255, 255, 255, .13) 0%, rgba(255, 255, 255, .02) 22%, rgba(255, 255, 255, 0) 38%);
+  opacity: .28;
+  transition: opacity .45s ease;
+}
+.shot-card:hover .shot-glare { opacity: .55; }
+
+.shot-cap {
   margin: 0;
+  padding: 14px 5px 15px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.rail-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.rail-track {
+  position: relative;
+  flex: 1;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(242, 247, 250, .10);
+  overflow: hidden;
+}
+.rail-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 20%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(26, 143, 168, .9), var(--accent));
+  box-shadow: 0 0 12px rgba(26, 196, 216, .55);
+  transition: left .18s ease-out, width .18s ease-out;
+}
+
+.rail-btn {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--stroke-soft);
+  background: rgba(242, 247, 250, .05);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: color .2s ease, background .2s ease, border-color .2s ease, transform .2s ease, opacity .2s ease;
+}
+.rail-btn svg { width: 16px; height: 16px; }
+.rail-btn:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--accent-soft);
+  border-color: rgba(26, 196, 216, .42);
+  transform: translateY(-1px);
+}
+.rail-btn:disabled {
+  opacity: .28;
+  cursor: default;
+}
+
+@media (max-width: 720px) {
+  .rail { padding-inline: 24px; scroll-padding-inline: 24px; margin-inline: -24px; }
+  .shot { width: clamp(154px, 44vw, 196px); }
+  .shot-card { border-radius: 26px; padding: 9px 9px 0; }
+  .shot-media { border-radius: 18px; }
+  .shot-cap { padding: 11px 3px 13px; font-size: 10px; letter-spacing: .13em; }
+  .rail-btn { width: 34px; height: 34px; }
+  .rail-bar { gap: 10px; }
 }
 
 /* ---------- install ---------- */
@@ -849,12 +963,19 @@ html.js .reveal.in {
 
   .tour-grid { grid-template-columns: 1fr; gap: 26px; }
   .tour-sticky {
-    top: 96px;
+    top: 88px;
     z-index: 3;
-    padding: 14px 0;
-    background: linear-gradient(180deg, rgba(7, 16, 34, .9) 62%, transparent);
+    width: fit-content;
+    margin: 0 auto;
+    padding: 15px;
+    border-radius: 36px;
+    background: linear-gradient(168deg, rgba(242, 247, 250, .12), rgba(13, 30, 53, .74) 46%, rgba(7, 16, 34, .88));
+    border: 1px solid rgba(242, 247, 250, .12);
+    box-shadow: 0 26px 60px rgba(2, 8, 18, .55), inset 0 1px 0 rgba(242, 247, 250, .18);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
   }
-  .device-tour { width: 172px; }
+  .device-tour { width: 168px; }
   .panel { min-height: 0; }
 }
 
@@ -871,7 +992,6 @@ html.js .reveal.in {
   .hero-badge.hero-badge-2 { top: auto; bottom: 8%; right: 0; }
 
   .dl-cards { grid-template-columns: 1fr; }
-  .feature-wide { grid-column: auto; }
 
   .step { padding: 22px 0 22px 62px; }
   .step::before {

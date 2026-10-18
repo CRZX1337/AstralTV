@@ -6,6 +6,9 @@
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   const coarsePointer = window.matchMedia("(pointer: coarse)");
 
+  /* ---------- app-like input: no context menu ---------- */
+  document.addEventListener("contextmenu", (event) => event.preventDefault());
+
   /* ---------- hero load sequence ---------- */
   requestAnimationFrame(() => document.body.classList.add("ready"));
 
@@ -62,8 +65,8 @@
           const y = (event.clientY - rect.top) / rect.height;
           el.style.setProperty("--mx", `${(x * 100).toFixed(1)}%`);
           el.style.setProperty("--my", `${(y * 100).toFixed(1)}%`);
-          el.style.setProperty("--ry", `${((x - 0.5) * 6).toFixed(2)}deg`);
-          el.style.setProperty("--rx", `${((0.5 - y) * 6).toFixed(2)}deg`);
+          el.style.setProperty("--ry", `${((x - 0.5) * 4).toFixed(2)}deg`);
+          el.style.setProperty("--rx", `${((0.5 - y) * 4).toFixed(2)}deg`);
         });
       });
       el.addEventListener("pointerleave", () => {
@@ -73,32 +76,94 @@
     });
   }
 
-  /* ---------- screenshot rail: drag to scroll on desktop ---------- */
-  const rail = document.querySelector(".rail");
-  if (rail && !coarsePointer.matches) {
-    let dragging = false;
-    let startX = 0;
-    let startLeft = 0;
+  /* ---------- screenshot rail: arrows, progress, threshold drag ---------- */
+  const rail = document.getElementById("shotRail");
+  if (rail) {
+    const fill = document.getElementById("railFill");
+    const buttons = Array.from(document.querySelectorAll("[data-rail]"));
+    const GAP = 18;
+
+    const sync = () => {
+      const max = Math.max(1, rail.scrollWidth - rail.clientWidth);
+      const x = Math.min(Math.max(rail.scrollLeft, 0), max);
+      if (fill) {
+        const visible = Math.min(1, rail.clientWidth / rail.scrollWidth);
+        const width = visible * 100;
+        fill.style.width = `${width.toFixed(2)}%`;
+        fill.style.left = `${((x / max) * (100 - width)).toFixed(2)}%`;
+      }
+      for (const button of buttons) {
+        const dir = Number(button.dataset.rail);
+        button.disabled = dir < 0 ? x <= 2 : x >= max - 2;
+      }
+    };
+
+    const stepBy = (dir) => {
+      const card = rail.querySelector(".shot");
+      const distance = card ? card.getBoundingClientRect().width + GAP : rail.clientWidth * 0.8;
+      rail.scrollBy({ left: dir * distance, behavior: reduceMotion.matches ? "auto" : "smooth" });
+    };
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => stepBy(Number(button.dataset.rail) || 1));
+    });
+
+    let queued = false;
+    const queueSync = () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => {
+        queued = false;
+        sync();
+      });
+    };
+    rail.addEventListener("scroll", queueSync, { passive: true });
+    window.addEventListener("resize", queueSync);
+    rail.addEventListener("keydown", (event) => {
+      rail.classList.add("is-keyboard");
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      stepBy(event.key === "ArrowRight" ? 1 : -1);
+    });
+    rail.addEventListener("blur", () => rail.classList.remove("is-keyboard"));
+    rail.addEventListener("pointerdown", () => rail.classList.remove("is-keyboard"));
+
+    // Mouse drag only; touch keeps the browser's native momentum scrolling.
+    let drag = null;
     rail.addEventListener("pointerdown", (event) => {
-      dragging = true;
-      startX = event.clientX;
-      startLeft = rail.scrollLeft;
-      rail.classList.add("is-dragging");
-      rail.setPointerCapture(event.pointerId);
+      if (event.pointerType !== "mouse" || event.button !== 0) return;
+      drag = { id: event.pointerId, x: event.clientX, left: rail.scrollLeft, moved: false };
     });
     rail.addEventListener("pointermove", (event) => {
-      if (!dragging) return;
-      rail.scrollLeft = startLeft - (event.clientX - startX);
+      if (!drag || event.pointerId !== drag.id) return;
+      const dx = event.clientX - drag.x;
+      if (!drag.moved) {
+        if (Math.abs(dx) < 7) return;
+        drag.moved = true;
+        rail.classList.add("is-dragging");
+        try {
+          rail.setPointerCapture(event.pointerId);
+        } catch {
+          // The pointer can already be gone on a fast flick; dragging still works.
+        }
+      }
+      rail.scrollLeft = drag.left - dx;
     });
-    const stop = () => {
-      dragging = false;
-      rail.classList.remove("is-dragging");
+    const endDrag = (event) => {
+      if (!drag) return;
+      if (drag.moved) {
+        if (rail.hasPointerCapture(drag.id)) rail.releasePointerCapture(drag.id);
+        rail.classList.remove("is-dragging");
+        queueSync();
+      }
+      drag = null;
     };
-    rail.addEventListener("pointerup", stop);
-    rail.addEventListener("pointercancel", stop);
-    rail.addEventListener("click", (event) => {
-      if (Math.abs(rail.scrollLeft - startLeft) > 6) event.preventDefault();
-    }, true);
+    rail.addEventListener("pointerup", endDrag);
+    rail.addEventListener("pointercancel", endDrag);
+    rail.addEventListener("dragstart", (event) => event.preventDefault());
+
+    sync();
+    window.addEventListener("load", queueSync);
   }
 
   /* ---------- ambient night sky ---------- */
