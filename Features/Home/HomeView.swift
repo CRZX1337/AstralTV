@@ -4278,6 +4278,7 @@ enum AppTab: String, CaseIterable {
     // selection from an older build decodes to nil and falls back to Live TV.
     case movies    = "movies"
     case tvShows   = "tvshows"
+    case browser   = "browser"
     case settings  = "settings"
 
     /// Tabs a user can pick as the default. Favorites is a channel group now.
@@ -4290,6 +4291,7 @@ enum AppTab: String, CaseIterable {
         case .dvr:       return "DVR"
         case .movies:    return "Movies"
         case .tvShows:   return "TV Shows"
+        case .browser:   return "Browser"
         case .settings:  return "Settings"
         }
     }
@@ -4303,6 +4305,7 @@ enum AppTab: String, CaseIterable {
         // "tv" has a separate screen layer that keeps its own colour in the
         // selected pill (Logan 2026-09-05); the filled glyph is one layer.
         case .tvShows:   return "tv.fill"
+        case .browser:   return "safari"
         case .settings:  return "gearshape.fill"
         }
     }
@@ -6385,7 +6388,7 @@ struct MainTabView: View {
     /// persisted default tab at launch).
     private func isTabVisible(_ tab: AppTab) -> Bool {
         switch tab {
-        case .liveTV, .settings: return true
+        case .liveTV, .browser, .settings: return true
         case .favorites:         return false
         case .dvr:               return showRecordingsTab
         case .movies:            return showMoviesTab
@@ -6502,6 +6505,10 @@ struct MainTabView: View {
                 .tabItem { Label(AppTab.liveTV.title, systemImage: AppTab.liveTV.icon) }
                 .tag(AppTab.liveTV)
 
+            BrowserView()
+                .astralPadHidesSystemTabBar()
+                .tabItem { Label(AppTab.browser.title, systemImage: AppTab.browser.icon) }
+                .tag(AppTab.browser)
 
             // Favorites is a pinned channel group inside Live TV now
             // (Logan 2026-09-05); the tab is gone. `AppTab.favorites` stays

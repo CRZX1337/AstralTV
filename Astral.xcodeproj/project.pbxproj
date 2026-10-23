@@ -39,6 +39,7 @@
 		38A0E8B8ABBD862D5012AB52 /* DVRSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F8881E8167215B8659F5BB1 /* DVRSettingsView.swift */; };
 		38A0E8B8ABBD862D5012AC52 /* SyncCategoriesSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F8881E8167215B8659F5BC1 /* SyncCategoriesSettingsView.swift */; };
 		3A694D00B8E5469ADCD3D120 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5957CC8A6CC0000B14ED47C5 /* HomeView.swift */; };
+		B0A500000000000000000001 /* BrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0A500000000000000000002 /* BrowserView.swift */; };
 		3C4D5E6F70891012ACE70020 /* NWHTTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F70891ACE7000 /* NWHTTPClient.swift */; };
 		3C4D5E6F70891012ACE70021 /* HTTPRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F70891ACE7001 /* HTTPRouter.swift */; };
 		47124970CDB0AF253294C1D7 /* DVRArtResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43C00B0A074DF5B79B493571 /* DVRArtResolver.swift */; };
@@ -236,6 +237,7 @@
 		5806A5B948B604B451A5F5C7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5813F2DEADFF09175AADA42D /* Pods-Astral_iOS-acknowledgements.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "Pods-Astral_iOS-acknowledgements.plist"; sourceTree = "<group>"; };
 		5957CC8A6CC0000B14ED47C5 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		B0A500000000000000000002 /* BrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserView.swift; sourceTree = "<group>"; };
 		5E74BEC0CC7E72B10B46A328 /* PhoneMediaPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneMediaPage.swift; sourceTree = "<group>"; };
 		5E775331398B45DCE888553D /* CategoryColorEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CategoryColorEditors.swift; sourceTree = "<group>"; };
 		5E776D8BC0A0AEA6CAAC54AC /* GeneralSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralSettingsView.swift; sourceTree = "<group>"; };
@@ -439,6 +441,7 @@
 		4432D1DEAD99D32286CFADCA /* Features */ = {
 			isa = PBXGroup;
 			children = (
+				B0A500000000000000000003 /* Browser */,
 				1D44B2A9B6CE86B60388ED7C /* DVR */,
 				D790E242FC19FAB9A2C4F61C /* Home */,
 				2E9487FE5F10365DAD5FCB23 /* LiveTV */,
@@ -450,6 +453,14 @@
 				3B8E08FB104E1A3DD7A78196 /* Player */,
 			);
 			path = Features;
+			sourceTree = "<group>";
+		};
+		B0A500000000000000000003 /* Browser */ = {
+			isa = PBXGroup;
+			children = (
+				B0A500000000000000000002 /* BrowserView.swift */,
+			);
+			path = Browser;
 			sourceTree = "<group>";
 		};
 		4D5B125286008EFD60915C8C = {
@@ -1014,6 +1025,7 @@
 				FF1234567890ABCDEF123456 /* DeveloperSettingsView.swift in Sources */,
 				CF38B25676730E71C9AD497A /* AstralApp.swift in Sources */,
 				3A694D00B8E5469ADCD3D120 /* HomeView.swift in Sources */,
+				B0A500000000000000000001 /* BrowserView.swift in Sources */,
 				FA5005705700000000000003 /* FavoritesStore.swift in Sources */,
 				B0B4EE0F74D4863E74833446 /* LiquidGlass.swift in Sources */,
 				AD422FFDD689840F76B8A238 /* MediaServerAPIs.swift in Sources */,
